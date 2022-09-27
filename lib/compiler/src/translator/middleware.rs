@@ -22,10 +22,10 @@ pub trait ModuleMiddleware: Debug + Send + Sync + MemoryUsage {
     fn generate_function_middleware<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Box<dyn FunctionMiddleware<'a> + 'a>;
+    ) -> Result<Box<dyn FunctionMiddleware<'a> + 'a>, MiddlewareError>;
 
     /// Transforms a `ModuleInfo` struct in-place. This is called before application on functions begins.
-    fn transform_module_info(&self, _: &mut ModuleInfo) {}
+    fn transform_module_info(&self, _: &mut ModuleInfo) -> Result<(), MiddlewareError> { Ok(()) }
 }
 
 /// A function middleware specialized for a single function.
@@ -76,10 +76,10 @@ pub trait ModuleMiddlewareChain {
     fn generate_function_middleware_chain<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Vec<Box<dyn FunctionMiddleware<'a> + 'a>>;
+    ) -> Result<Vec<Box<dyn FunctionMiddleware<'a> + 'a>>, MiddlewareError>;
 
     /// Applies the chain on a `ModuleInfo` struct.
-    fn apply_on_module_info(&self, module_info: &mut ModuleInfo);
+    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) -> Result<(), MiddlewareError>;
 }
 
 impl<T: Deref<Target = dyn ModuleMiddleware>> ModuleMiddlewareChain for [T] {
@@ -87,17 +87,18 @@ impl<T: Deref<Target = dyn ModuleMiddleware>> ModuleMiddlewareChain for [T] {
     fn generate_function_middleware_chain<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Vec<Box<dyn FunctionMiddleware<'a> + 'a>> {
+    ) -> Result<Vec<Box<dyn FunctionMiddleware<'a> + 'a>>, MiddlewareError> {
         self.iter()
             .map(|x| x.generate_function_middleware(local_function_index))
-            .collect()
+            .collect::<Result<Vec<_>, MiddlewareError>>()
     }
 
     /// Applies the chain on a `ModuleInfo` struct.
-    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) {
+    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) -> Result<(), MiddlewareError> {
         for item in self {
-            item.transform_module_info(module_info);
+            item.transform_module_info(module_info)?;
         }
+        Ok(())
     }
 }
 

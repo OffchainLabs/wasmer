@@ -152,7 +152,7 @@ impl Compiler for SinglepassCompiler {
                 let middleware_chain = self
                     .config
                     .middlewares
-                    .generate_function_middleware_chain(i);
+                    .generate_function_middleware_chain(i)?;
                 let mut reader =
                     MiddlewareBinaryReader::new_with_offset(input.data, input.module_offset);
                 reader.set_middleware_chain(middleware_chain);

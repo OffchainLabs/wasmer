@@ -126,7 +126,7 @@ impl StaticlibArtifact {
         // We try to apply the middleware first
         let mut module = translation.module;
         let middlewares = compiler.get_middlewares();
-        middlewares.apply_on_module_info(&mut module);
+        middlewares.apply_on_module_info(&mut module)?;
 
         let memory_styles: PrimaryMap<MemoryIndex, MemoryStyle> = module
             .memories
@@ -218,7 +218,7 @@ impl StaticlibArtifact {
 
         let mut module = (*compile_info.module).clone();
         let middlewares = compiler.get_middlewares();
-        middlewares.apply_on_module_info(&mut module);
+        middlewares.apply_on_module_info(&mut module)?;
         compile_info.module = Arc::new(module);
 
         let maybe_obj_bytes = compiler.experimental_native_compile_module(

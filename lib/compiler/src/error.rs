@@ -116,6 +116,12 @@ impl From<MiddlewareError> for WasmError {
     }
 }
 
+impl From<MiddlewareError> for CompileError {
+    fn from(original: MiddlewareError) -> Self {
+        WasmError::Middleware(original).into()
+    }
+}
+
 /// The error that can happen while parsing a `str`
 /// to retrieve a [`CpuFeature`](crate::target::CpuFeature).
 #[derive(Debug)]

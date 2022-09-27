@@ -137,7 +137,7 @@ impl Compiler for CraneliftCompiler {
                 reader.set_middleware_chain(
                     self.config
                         .middlewares
-                        .generate_function_middleware_chain(i),
+                        .generate_function_middleware_chain(i)?,
                 );
 
                 func_translator.translate(
@@ -238,7 +238,7 @@ impl Compiler for CraneliftCompiler {
                 reader.set_middleware_chain(
                     self.config
                         .middlewares
-                        .generate_function_middleware_chain(*i),
+                        .generate_function_middleware_chain(*i)?
                 );
 
                 func_translator.translate(

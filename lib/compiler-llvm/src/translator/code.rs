@@ -139,7 +139,7 @@ impl FuncTranslator {
         reader.set_middleware_chain(
             config
                 .middlewares
-                .generate_function_middleware_chain(*local_func_index),
+                .generate_function_middleware_chain(*local_func_index)?,
         );
 
         let mut params = vec![];
