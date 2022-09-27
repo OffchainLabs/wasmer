@@ -142,15 +142,15 @@ impl<'a> MiddlewareBinaryReader<'a> {
 
 impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
     fn read_local_count(&mut self) -> WasmResult<u32> {
-        let count = self.state.inner.read_var_u32()?;
+        let count = self.state.inner.read_var_u32().map_err(from_binaryreadererror_wasmerror)?;
         self.state.locals_count = Some(count as usize);
         self.state.locals.reserve(count as usize);
         Ok(count)
     }
 
     fn read_local_decl(&mut self) -> WasmResult<(u32, Type)> {
-        let count = self.state.inner.read_var_u32()?;
-        let ty = self.state.inner.read_type()?;
+        let count = self.state.inner.read_var_u32().map_err(from_binaryreadererror_wasmerror)?;
+        let ty = self.state.inner.read_type().map_err(from_binaryreadererror_wasmerror)?;
         for _ in 0..count {
             self.state.locals.push(ty);
         }
