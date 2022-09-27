@@ -16,7 +16,10 @@ struct Add2Mul {
 }
 
 impl ModuleMiddleware for Add2MulGen {
-    fn generate_function_middleware<'a>(&self, _: LocalFunctionIndex) -> Box<dyn FunctionMiddleware<'a>> {
+    fn generate_function_middleware<'a>(
+        &self,
+        _: LocalFunctionIndex,
+    ) -> Box<dyn FunctionMiddleware<'a>> {
         Box::new(Add2Mul {
             value_off: self.value_off,
         })
@@ -56,7 +59,10 @@ struct Fusion {
 }
 
 impl ModuleMiddleware for FusionGen {
-    fn generate_function_middleware<'a>(&self, _: LocalFunctionIndex) -> Box<dyn FunctionMiddleware<'a>> {
+    fn generate_function_middleware<'a>(
+        &self,
+        _: LocalFunctionIndex,
+    ) -> Box<dyn FunctionMiddleware<'a>> {
         Box::new(Fusion { state: 0 })
     }
 }
