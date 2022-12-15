@@ -56,7 +56,7 @@ impl ArtifactBuild {
         // We try to apply the middleware first
         let mut module = translation.module;
         let middlewares = compiler.get_middlewares();
-        middlewares.apply_on_module_info(&mut module);
+        middlewares.apply_on_module_info(&mut module)?;
 
         let compile_info = CompileModuleInfo {
             module,
