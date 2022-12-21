@@ -24,11 +24,16 @@ pub trait ModuleMiddleware: Debug + Send + Sync {
     ) -> Box<dyn FunctionMiddleware<'a> + 'a>;
 
     /// Transforms a `ModuleInfo` struct in-place. This is called before application on functions begins.
-    fn transform_module_info(&self, _: &mut ModuleInfo) -> Result<(), MiddlewareError> { Ok(()) }
+    fn transform_module_info(&self, _: &mut ModuleInfo) -> Result<(), MiddlewareError> {
+        Ok(())
+    }
 }
 
 /// A function middleware specialized for a single function.
 pub trait FunctionMiddleware<'a>: Debug {
+    /// Provide info on the function's locals. This is called before feed.
+    fn locals_info(&mut self, _locals: &[Type]) {}
+
     /// Processes the given operator.
     fn feed(
         &mut self,
@@ -58,6 +63,12 @@ pub struct MiddlewareReaderState<'a> {
 
     /// The pending operations added by the middleware.
     pending_operations: VecDeque<Operator<'a>>,
+
+    /// Number of locals that will ever be read, if known.
+    locals_count: Option<usize>,
+
+    /// Locals read so far.
+    locals: Vec<Type>,
 }
 
 /// Trait for generating middleware chains from "prototype" (generator) chains.
@@ -119,6 +130,8 @@ impl<'a> MiddlewareBinaryReader<'a> {
             state: MiddlewareReaderState {
                 inner,
                 pending_operations: VecDeque::new(),
+                locals_count: None,
+                locals: vec![],
             },
             chain: vec![],
         }
@@ -128,27 +141,38 @@ impl<'a> MiddlewareBinaryReader<'a> {
     pub fn set_middleware_chain(&mut self, stages: Vec<Box<dyn FunctionMiddleware<'a> + 'a>>) {
         self.chain = stages;
     }
+
+    /// Pass info about the locals of a function to all middlewares
+    fn emit_locals_info(&mut self) {
+        for middleware in &mut self.chain {
+            middleware.locals_info(&self.state.locals)
+        }
+    }
 }
 
 impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
     fn read_local_count(&mut self) -> WasmResult<u32> {
-        self.state
-            .inner
-            .read_var_u32()
-            .map_err(from_binaryreadererror_wasmerror)
+        let total = self.state.inner.read_var_u32();
+        let total = total.map_err(from_binaryreadererror_wasmerror)?;
+        self.state.locals_count = Some(total as usize);
+        self.state.locals.reserve(total as usize);
+        if total == 0 {
+            self.emit_locals_info();
+        }
+        Ok(total)
     }
 
     fn read_local_decl(&mut self) -> WasmResult<(u32, Type)> {
-        let count = self
-            .state
-            .inner
-            .read_var_u32()
-            .map_err(from_binaryreadererror_wasmerror)?;
-        let ty = self
-            .state
-            .inner
-            .read_type()
-            .map_err(from_binaryreadererror_wasmerror)?;
+        let count = self.state.inner.read_var_u32();
+        let count = count.map_err(from_binaryreadererror_wasmerror)?;
+        let ty = self.state.inner.read_type();
+        let ty = ty.map_err(from_binaryreadererror_wasmerror)?;
+        for _ in 0..count {
+            self.state.locals.push(ty);
+        }
+        if self.state.locals.len() == self.state.locals_count.unwrap() {
+            self.emit_locals_info();
+        }
         Ok((count, ty))
     }
 
