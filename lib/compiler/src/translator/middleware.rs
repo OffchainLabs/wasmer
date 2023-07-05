@@ -18,19 +18,19 @@ pub trait ModuleMiddleware: Debug + Send + Sync {
     /// Here we generate a separate object for each function instead of executing directly on per-function operators,
     /// in order to enable concurrent middleware application. Takes immutable `&self` because this function can be called
     /// concurrently from multiple compilation threads.
-    fn generate_function_middleware(
+    fn generate_function_middleware<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Box<dyn FunctionMiddleware>;
+    ) -> Box<dyn FunctionMiddleware<'a> + 'a>;
 
     /// Transforms a `ModuleInfo` struct in-place. This is called before application on functions begins.
-    fn transform_module_info(&self, _: &mut ModuleInfo) {}
+    fn transform_module_info(&self, _: &mut ModuleInfo) -> Result<(), MiddlewareError> { Ok(()) }
 }
 
 /// A function middleware specialized for a single function.
-pub trait FunctionMiddleware: Debug {
+pub trait FunctionMiddleware<'a>: Debug {
     /// Processes the given operator.
-    fn feed<'a>(
+    fn feed(
         &mut self,
         operator: Operator<'a>,
         state: &mut MiddlewareReaderState<'a>,
@@ -47,7 +47,7 @@ pub struct MiddlewareBinaryReader<'a> {
     state: MiddlewareReaderState<'a>,
 
     /// The backing middleware chain for this reader.
-    chain: Vec<Box<dyn FunctionMiddleware>>,
+    chain: Vec<Box<dyn FunctionMiddleware<'a> + 'a>>,
 }
 
 /// The state of the binary reader. Exposed to middlewares to push their outputs.
@@ -63,31 +63,32 @@ pub struct MiddlewareReaderState<'a> {
 /// Trait for generating middleware chains from "prototype" (generator) chains.
 pub trait ModuleMiddlewareChain {
     /// Generates a function middleware chain.
-    fn generate_function_middleware_chain(
+    fn generate_function_middleware_chain<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Vec<Box<dyn FunctionMiddleware>>;
+    ) -> Vec<Box<dyn FunctionMiddleware<'a> + 'a>>;
 
     /// Applies the chain on a `ModuleInfo` struct.
-    fn apply_on_module_info(&self, module_info: &mut ModuleInfo);
+    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) -> Result<(), MiddlewareError>;
 }
 
 impl<T: Deref<Target = dyn ModuleMiddleware>> ModuleMiddlewareChain for [T] {
     /// Generates a function middleware chain.
-    fn generate_function_middleware_chain(
+    fn generate_function_middleware_chain<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Vec<Box<dyn FunctionMiddleware>> {
+    ) -> Vec<Box<dyn FunctionMiddleware<'a> + 'a>> {
         self.iter()
             .map(|x| x.generate_function_middleware(local_function_index))
             .collect()
     }
 
     /// Applies the chain on a `ModuleInfo` struct.
-    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) {
+    fn apply_on_module_info(&self, module_info: &mut ModuleInfo) -> Result<(), MiddlewareError> {
         for item in self {
-            item.transform_module_info(module_info);
+            item.transform_module_info(module_info)?;
         }
+        Ok(())
     }
 }
 
@@ -124,7 +125,7 @@ impl<'a> MiddlewareBinaryReader<'a> {
     }
 
     /// Replaces the middleware chain with a new one.
-    pub fn set_middleware_chain(&mut self, stages: Vec<Box<dyn FunctionMiddleware>>) {
+    pub fn set_middleware_chain(&mut self, stages: Vec<Box<dyn FunctionMiddleware<'a> + 'a>>) {
         self.chain = stages;
     }
 }
