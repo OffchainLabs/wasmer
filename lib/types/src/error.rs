@@ -47,6 +47,7 @@ pub enum DeserializeError {
 
 /// Error type describing things that can go wrong when operating on Wasm Memories.
 #[derive(Error, Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MemoryError {
     /// Low level error with mmap.
     #[error("Error when allocating memory: {0}")]
@@ -60,7 +61,7 @@ pub enum MemoryError {
         /// The attempted amount to grow by in pages.
         attempted_delta: Pages,
     },
-    /// The operation would cause the size of the memory size exceed the maximum.
+    /// Invalid memory was provided.
     #[error("The memory is invalid because {}", reason)]
     InvalidMemory {
         /// The reason why the provided memory is invalid.
@@ -82,6 +83,9 @@ pub enum MemoryError {
         /// The number of pages requested as the maximum amount of memory.
         max_allowed: Pages,
     },
+    /// Returned when a shared memory is required, but the given memory is not shared.
+    #[error("The memory is not shared")]
+    MemoryNotShared,
     /// A user defined error value, used for error cases not listed above.
     #[error("A user-defined error occurred: {0}")]
     Generic(String),
@@ -152,7 +156,10 @@ pub enum CompileError {
 
     /// The compiler cannot compile for the given target.
     /// This can refer to the OS, the chipset or any other aspect of the target system.
-    #[cfg_attr(feature = "std", error("The target {0} is not yet supported (see https://docs.wasmer.io/ecosystem/wasmer/wasmer-features)"))]
+    #[cfg_attr(
+        feature = "std",
+        error("The target {0} is not yet supported (see https://docs.wasmer.io/runtime/features)")
+    )]
     UnsupportedTarget(String),
 
     /// Insufficient resources available for execution.
@@ -241,7 +248,7 @@ impl From<MiddlewareError> for WasmError {
 }
 
 /// The error that can happen while parsing a `str`
-/// to retrieve a [`CpuFeature`](crate::target::CpuFeature).
+/// to retrieve a [`CpuFeature`](crate::CpuFeature).
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum ParseCpuFeatureError {

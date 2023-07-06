@@ -3,8 +3,7 @@
 use crate::Features;
 use enumset::EnumSet;
 use std::any::Any;
-use std::fs;
-use std::path::Path;
+use std::sync::Arc;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::SerializeError;
 use wasmer_types::{
@@ -19,7 +18,13 @@ use wasmer_types::{
 /// module at runtime, such as [`ModuleInfo`] and [`Features`].
 pub trait ArtifactCreate: Send + Sync + Upcastable {
     /// Create a `ModuleInfo` for instantiation
-    fn create_module_info(&self) -> ModuleInfo;
+    fn create_module_info(&self) -> Arc<ModuleInfo>;
+
+    /// Sets the `ModuleInfo` name
+    fn set_module_info_name(&mut self, name: String) -> bool;
+
+    /// Returns the `ModuleInfo` for instantiation
+    fn module_info(&self) -> &ModuleInfo;
 
     /// Returns the features for this Artifact
     fn features(&self) -> &Features;
@@ -33,18 +38,11 @@ pub trait ArtifactCreate: Send + Sync + Upcastable {
     /// Returns the table plans associated with this `Artifact`.
     fn table_styles(&self) -> &PrimaryMap<TableIndex, TableStyle>;
 
-    /// Returns data initializers to pass to `InstanceHandle::initialize`
+    /// Returns data initializers to pass to `VMInstance::initialize`
     fn data_initializers(&self) -> &[OwnedDataInitializer];
 
     /// Serializes an artifact into bytes
     fn serialize(&self) -> Result<Vec<u8>, SerializeError>;
-
-    /// Serializes an artifact into a file path
-    fn serialize_to_file(&self, path: &Path) -> Result<(), SerializeError> {
-        let serialized = self.serialize()?;
-        fs::write(&path, serialized)?;
-        Ok(())
-    }
 }
 
 // Implementation of `Upcastable` taken from https://users.rust-lang.org/t/why-does-downcasting-not-work-for-subtraits/33286/7 .

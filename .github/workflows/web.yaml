@@ -1,0 +1,50 @@
+# Separate workflow for the wasmer-web crate.
+#
+
+# Automatically cancel previous workflow runs when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+name: Wasmer Web
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  web:
+    name: Build and Test (wasmer-web)
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        rust: [nightly-2023-05-25]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+
+    - name: Show Rust version
+      run: |
+        rustc --version
+
+    - name: Check formatting
+      shell: bash
+      run: |
+        cd lib/wasi-web
+        rustup override set nightly-2023-05-25
+        rustup component add rustfmt
+        cargo fmt --check
+
+    - name: Check
+      continue-on-error: true
+      env:
+        CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      run: |
+        cd lib/wasi-web
+        cargo check
