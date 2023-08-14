@@ -432,7 +432,7 @@ impl Module {
     /// # }
     /// ```
     pub fn set_name(&mut self, name: &str) -> bool {
-        Arc::get_mut(&mut self.module_info).map_or(false, |mut module_info| {
+        Arc::get_mut(&mut self.module_info).map_or(false, |module_info| {
             module_info.name = Some(name.to_string());
             true
         })
