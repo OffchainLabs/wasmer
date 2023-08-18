@@ -1,10 +1,12 @@
+use std::ptr::NonNull;
+
 use crate::errors::RuntimeError;
 use crate::store::{AsStoreMut, AsStoreRef};
 use crate::value::Value;
 use crate::vm::VMExternGlobal;
 use crate::GlobalType;
 use crate::Mutability;
-use wasmer_vm::{StoreHandle, VMExtern, VMGlobal};
+use wasmer_vm::{StoreHandle, VMExtern, VMGlobal, VMGlobalDefinition};
 
 #[derive(Debug, Clone)]
 pub struct Global {
@@ -40,13 +42,9 @@ impl Global {
 
     pub fn get(&self, store: &mut impl AsStoreMut) -> Value {
         unsafe {
-            let raw = self
-                .handle
-                .get(store.as_store_ref().objects())
-                .vmglobal()
-                .as_ref()
-                .val;
-            let ty = self.handle.get(store.as_store_ref().objects()).ty().ty;
+            let global = self.handle.get(store.as_store_ref().objects());
+            let raw = global.vmglobal().as_ref().val;
+            let ty = global.ty().ty;
             Value::from_raw(store, ty, raw)
         }
     }
@@ -55,22 +53,20 @@ impl Global {
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
-        if self.ty(store).mutability != Mutability::Var {
+        let global = self.handle.get_mut(store.objects_mut());
+        if global.ty().mutability != Mutability::Var {
             return Err(RuntimeError::new("Attempted to set an immutable global"));
         }
-        if val.ty() != self.ty(store).ty {
+        if val.ty() != global.ty().ty {
             return Err(RuntimeError::new(format!(
                 "Attempted to operate on a global of type {expected} as a global of type {found}",
-                expected = self.ty(store).ty,
+                expected = global.ty().ty,
                 found = val.ty(),
             )));
         }
         unsafe {
-            self.handle
-                .get_mut(store.objects_mut())
-                .vmglobal()
-                .as_mut()
-                .val = val.as_raw(store);
+            let mut dest = global.vmglobal();
+            dest.as_mut().val = val.as_raw(store);
         }
         Ok(())
     }
@@ -89,6 +85,11 @@ impl Global {
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
         VMExtern::Global(self.handle.internal_handle())
+    }
+
+    /// Gets the underlying VM pointer
+    pub unsafe fn vmglobal(&self, store: &mut impl AsStoreMut) -> NonNull<VMGlobalDefinition> {
+        self.handle.get_mut(store.objects_mut()).vmglobal()
     }
 }
 
