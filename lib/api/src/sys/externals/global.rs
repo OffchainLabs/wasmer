@@ -1,4 +1,3 @@
-use std::ptr::NonNull;
 
 use crate::errors::RuntimeError;
 use crate::store::{AsStoreMut, AsStoreRef};
@@ -6,7 +5,7 @@ use crate::value::Value;
 use crate::vm::VMExternGlobal;
 use crate::GlobalType;
 use crate::Mutability;
-use wasmer_vm::{StoreHandle, VMExtern, VMGlobal, VMGlobalDefinition};
+use wasmer_vm::{StoreHandle, VMExtern, VMGlobal};
 
 #[derive(Debug, Clone)]
 pub struct Global {
