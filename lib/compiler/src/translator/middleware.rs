@@ -188,7 +188,7 @@ impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
         }
         Ok((count, ty))
     }
-        
+
     fn read_operator(&mut self) -> WasmResult<Operator<'a>> {
         if self.chain.is_empty() {
             // We short-circuit in case no chain is used

@@ -86,11 +86,6 @@ impl Global {
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
         VMExtern::Global(self.handle.internal_handle())
     }
-
-    /// Gets the underlying VM pointer
-    pub unsafe fn vmglobal(&self, store: &mut impl AsStoreMut) -> NonNull<VMGlobalDefinition> {
-        self.handle.get_mut(store.objects_mut()).vmglobal()
-    }
 }
 
 impl std::cmp::PartialEq for Global {
