@@ -62,6 +62,8 @@ mod libcalls;
 mod memory;
 mod module;
 mod serialize;
+mod stack;
+mod store_id;
 mod table;
 mod trapcode;
 mod types;
@@ -105,7 +107,8 @@ pub use value::{RawValue, ValueType};
 pub use crate::libcalls::LibCall;
 pub use crate::memory::MemoryStyle;
 pub use crate::table::TableStyle;
-pub use crate::trapcode::TrapCode;
+// TODO: OnCalledAction is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
+pub use crate::trapcode::{OnCalledAction, TrapCode};
 pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMBuiltinFunctionIndex, VMOffsets};
 
 pub use crate::utils::is_wasm;
@@ -123,10 +126,11 @@ pub use crate::compilation::function::{
     Functions,
 };
 pub use crate::compilation::module::CompileModuleInfo;
-pub use crate::compilation::sourceloc::SourceLoc;
 pub use crate::compilation::symbols::{Symbol, SymbolRegistry};
-pub use crate::compilation::trap::TrapInformation;
 pub use crate::compilation::unwind::CompiledFunctionUnwindInfo;
+
+pub use crate::stack::{FrameInfo, SourceLoc, TrapInformation};
+pub use crate::store_id::StoreId;
 
 /// Offset in bytes from the beginning of the function.
 pub type CodeOffset = u32;
@@ -165,12 +169,22 @@ mod native {
         const WASM_TYPE: Type;
     }
 
+    impl NativeWasmType for u32 {
+        const WASM_TYPE: Type = Type::I32;
+        type Abi = Self;
+    }
+
     impl NativeWasmType for i32 {
         const WASM_TYPE: Type = Type::I32;
         type Abi = Self;
     }
 
     impl NativeWasmType for i64 {
+        const WASM_TYPE: Type = Type::I64;
+        type Abi = Self;
+    }
+
+    impl NativeWasmType for u64 {
         const WASM_TYPE: Type = Type::I64;
         type Abi = Self;
     }

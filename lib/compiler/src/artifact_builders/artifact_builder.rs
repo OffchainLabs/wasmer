@@ -8,12 +8,10 @@ use crate::EngineInner;
 use crate::Features;
 use crate::{ModuleEnvironment, ModuleMiddlewareChain};
 use enumset::EnumSet;
-use std::mem;
+use std::sync::Arc;
 use wasmer_types::entity::PrimaryMap;
 #[cfg(feature = "compiler")]
 use wasmer_types::CompileModuleInfo;
-use wasmer_types::MetadataHeader;
-use wasmer_types::SerializeError;
 use wasmer_types::{
     CompileError, CpuFeature, CustomSection, Dwarf, FunctionIndex, LocalFunctionIndex, MemoryIndex,
     MemoryStyle, ModuleInfo, OwnedDataInitializer, Relocation, SectionIndex, SignatureIndex,
@@ -22,6 +20,7 @@ use wasmer_types::{
 use wasmer_types::{
     CompiledFunctionFrameInfo, FunctionBody, SerializableCompilation, SerializableModule,
 };
+use wasmer_types::{MetadataHeader, SerializeError};
 
 /// A compiled wasm module, ready to be instantiated.
 pub struct ArtifactBuild {
@@ -59,7 +58,7 @@ impl ArtifactBuild {
         middlewares.apply_on_module_info(&mut module)?;
 
         let compile_info = CompileModuleInfo {
-            module,
+            module: Arc::new(module),
             features,
             memory_styles,
             table_styles,
@@ -197,8 +196,19 @@ impl ArtifactBuild {
 }
 
 impl ArtifactCreate for ArtifactBuild {
-    fn create_module_info(&self) -> ModuleInfo {
+    fn create_module_info(&self) -> Arc<ModuleInfo> {
         self.serializable.compile_info.module.clone()
+    }
+
+    fn set_module_info_name(&mut self, name: String) -> bool {
+        Arc::get_mut(&mut self.serializable.compile_info.module).map_or(false, |mut module_info| {
+            module_info.name = Some(name.to_string());
+            true
+        })
+    }
+
+    fn module_info(&self) -> &ModuleInfo {
+        &self.serializable.compile_info.module
     }
 
     fn features(&self) -> &Features {
@@ -223,7 +233,7 @@ impl ArtifactCreate for ArtifactBuild {
 
     fn serialize(&self) -> Result<Vec<u8>, SerializeError> {
         let serialized_data = self.serializable.serialize()?;
-        assert!(mem::align_of::<SerializableModule>() <= MetadataHeader::ALIGN);
+        assert!(std::mem::align_of::<SerializableModule>() <= MetadataHeader::ALIGN);
 
         let mut metadata_binary = vec![];
         metadata_binary.extend(Self::MAGIC_HEADER);

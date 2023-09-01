@@ -1,9 +1,9 @@
 //! Basic tests for the `run` subcommand
 
-use anyhow::{bail, Context};
+use assert_cmd::Command;
+use predicates::str::contains;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use wasmer_integration_tests_cli::{get_repo_root_path, get_wasmer_path, ASSET_PATH, C_ASSET_PATH};
+use wasmer_integration_tests_cli::{get_wasmer_path, ASSET_PATH, C_ASSET_PATH};
 
 fn wasi_test_python_path() -> PathBuf {
     Path::new(C_ASSET_PATH).join("python-0.1.0.wasmer")
@@ -21,16 +21,99 @@ fn test_no_start_wat_path() -> PathBuf {
     Path::new(ASSET_PATH).join("no_start.wat")
 }
 
+/// Ignored on Windows because running vendored packages does not work
+/// since Windows does not allow `::` characters in filenames (every other OS does)
+///
+/// The syntax for vendored package atoms has to be reworked for this to be fixed, see
+/// https://github.com/wasmerio/wasmer/issues/3535
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
+#[ignore]
 #[test]
-fn test_cross_compile_python_windows() -> anyhow::Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
+fn test_run_customlambda() {
+    let assert = Command::new(get_wasmer_path())
+        .arg("config")
+        .arg("--bindir")
+        .assert()
+        .success();
+    let bindir = std::str::from_utf8(&assert.get_output().stdout)
+        .expect("wasmer config --bindir stdout failed");
 
+    // /Users/fs/.wasmer/bin
+    let checkouts_path = Path::new(bindir.trim())
+        .parent()
+        .expect("--bindir: no parent")
+        .join("checkouts");
+    println!("checkouts path: {}", checkouts_path.display());
+    let _ = std::fs::remove_dir_all(&checkouts_path);
+
+    let assert = Command::new(get_wasmer_path())
+        .arg("run")
+        .arg("https://wapm.io/ciuser/customlambda")
+        // TODO: this argument should not be necessary later
+        // see https://github.com/wasmerio/wasmer/issues/3514
+        .arg("customlambda.py")
+        .arg("55")
+        .assert()
+        .success();
+    assert.stdout("139583862445\n");
+
+    // Run again to verify the caching
+    let assert = Command::new(get_wasmer_path())
+        .arg("run")
+        .arg("https://wapm.io/ciuser/customlambda")
+        // TODO: this argument should not be necessary later
+        // see https://github.com/wasmerio/wasmer/issues/3514
+        .arg("customlambda.py")
+        .arg("55")
+        .assert()
+        .success();
+    assert.stdout("139583862445\n");
+}
+
+#[allow(dead_code)]
+fn assert_tarball_is_present_local(target: &str) -> Result<PathBuf, anyhow::Error> {
+    let wasmer_dir = std::env::var("WASMER_DIR").expect("no WASMER_DIR set");
+    let directory = match target {
+        "aarch64-darwin" => "wasmer-darwin-arm64.tar.gz",
+        "x86_64-darwin" => "wasmer-darwin-amd64.tar.gz",
+        "x86_64-linux-gnu" => "wasmer-linux-amd64.tar.gz",
+        "aarch64-linux-gnu" => "wasmer-linux-aarch64.tar.gz",
+        "x86_64-windows-gnu" => "wasmer-windows-gnu64.tar.gz",
+        _ => return Err(anyhow::anyhow!("unknown target {target}")),
+    };
+    let libwasmer_cache_path = Path::new(&wasmer_dir).join("cache").join(directory);
+    if !libwasmer_cache_path.exists() {
+        return Err(anyhow::anyhow!(
+            "targz {} does not exist",
+            libwasmer_cache_path.display()
+        ));
+    }
+    println!("using targz {}", libwasmer_cache_path.display());
+    Ok(libwasmer_cache_path)
+}
+
+// FIXME: Fix and re-enable this test
+// See https://github.com/wasmerio/wasmer/issues/3615
+// #[test]
+#[allow(dead_code)]
+fn test_cross_compile_python_windows() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+
+    #[cfg(not(windows))]
     let targets = &[
         "aarch64-darwin",
         "x86_64-darwin",
         "x86_64-linux-gnu",
         "aarch64-linux-gnu",
         "x86_64-windows-gnu",
+    ];
+
+    #[cfg(windows)]
+    let targets = &[
+        "aarch64-darwin",
+        "x86_64-darwin",
+        "x86_64-linux-gnu",
+        "aarch64-linux-gnu",
     ];
 
     // MUSL has no support for LLVM in C-API
@@ -57,176 +140,114 @@ fn test_cross_compile_python_windows() -> anyhow::Result<()> {
             println!("{t} target {c}");
             let python_wasmer_path = temp_dir.path().join(format!("{t}-python"));
 
-            let mut output = Command::new(get_wasmer_path());
+            let tarball = match std::env::var("GITHUB_TOKEN") {
+                Ok(_) => Some(assert_tarball_is_present_local(t).unwrap()),
+                Err(_) => None,
+            };
+            let mut cmd = Command::new(get_wasmer_path());
 
-            output.arg("create-exe");
-            output.arg(wasi_test_python_path());
-            output.arg("--target");
-            output.arg(t);
-            output.arg("-o");
-            output.arg(python_wasmer_path.clone());
-            output.arg(format!("--{c}"));
+            cmd.arg("create-exe");
+            cmd.arg(wasi_test_python_path());
+            cmd.arg("--target");
+            cmd.arg(t);
+            cmd.arg("-o");
+            cmd.arg(python_wasmer_path.clone());
+            cmd.arg(format!("--{c}"));
+            if std::env::var("GITHUB_TOKEN").is_ok() {
+                cmd.arg("--debug-dir");
+                cmd.arg(format!("{t}-{c}"));
+            }
 
             if t.contains("x86_64") && *c == "singlepass" {
-                output.arg("-m");
-                output.arg("avx");
+                cmd.arg("-m");
+                cmd.arg("avx");
             }
 
-            let output = output.output()?;
-
-            let stdout = std::str::from_utf8(&output.stdout)
-                .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-            let stderr = std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes");
-
-            if !output.status.success() {
-                bail!("linking failed with: stdout: {stdout}\n\nstderr: {stderr}");
+            if let Some(t) = tarball {
+                cmd.arg("--tarball");
+                cmd.arg(t);
             }
 
-            println!("stdout: {stdout}");
-            println!("stderr: {stderr}");
+            let assert = cmd.assert().success();
 
             if !python_wasmer_path.exists() {
                 let p = std::fs::read_dir(temp_dir.path())
                     .unwrap()
                     .filter_map(|e| Some(e.ok()?.path()))
                     .collect::<Vec<_>>();
-                panic!(
-                    "target {t} was not compiled correctly {stdout} {stderr}, tempdir: {:#?}",
-                    p
-                );
+                let output = assert.get_output();
+                panic!("target {t} was not compiled correctly tempdir: {p:#?}, {output:?}",);
             }
         }
     }
-
-    Ok(())
 }
 
 #[test]
-fn run_whoami_works() -> anyhow::Result<()> {
+fn run_whoami_works() {
     // running test locally: should always pass since
     // developers don't have access to WAPM_DEV_TOKEN
     if std::env::var("GITHUB_TOKEN").is_err() {
-        return Ok(());
+        return;
     }
 
     let ciuser_token = std::env::var("WAPM_DEV_TOKEN").expect("no CIUSER / WAPM_DEV_TOKEN token");
+    // Special case: GitHub secrets aren't visible to outside collaborators
+    if ciuser_token.is_empty() {
+        return;
+    }
 
-    let output = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg("login")
         .arg("--registry")
         .arg("wapm.dev")
         .arg(ciuser_token)
-        .output()?;
+        .assert()
+        .success();
 
-    if !output.status.success() {
-        bail!(
-            "wasmer login failed with: stdout: {}\n\nstderr: {}",
-            std::str::from_utf8(&output.stdout)
-                .expect("stdout is not utf8! need to handle arbitrary bytes"),
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("whoami")
         .arg("--registry")
         .arg("wapm.dev")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if !output.status.success() {
-        bail!(
-            "linking failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    assert_eq!(
-        stdout,
-        "logged into registry \"https://registry.wapm.dev/graphql\" as user \"ciuser\"\n"
-    );
-
-    Ok(())
+    assert
+        .stdout("logged into registry \"https://registry.wapm.dev/graphql\" as user \"ciuser\"\n");
 }
 
 #[test]
-fn run_wasi_works() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+fn run_wasi_works() {
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(wasi_test_wasm_path())
         .arg("--")
         .arg("-e")
         .arg("print(3 * (4 + 5))")
-        .output()?;
+        .assert()
+        .success();
 
-    if !output.status.success() {
-        bail!(
-            "linking failed with: stdout: {}\n\nstderr: {}",
-            std::str::from_utf8(&output.stdout)
-                .expect("stdout is not utf8! need to handle arbitrary bytes"),
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    let stdout_output = std::str::from_utf8(&output.stdout).unwrap();
-    assert_eq!(stdout_output, "27\n");
-
-    Ok(())
-}
-
-#[cfg(feature = "webc_runner")]
-fn package_directory(in_dir: &PathBuf, out: &PathBuf) {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::fs::File;
-    let tar = File::create(out).unwrap();
-    let enc = GzEncoder::new(tar, Compression::none());
-    let mut a = tar::Builder::new(enc);
-    a.append_dir_all("bin", in_dir.join("bin")).unwrap();
-    a.append_dir_all("lib", in_dir.join("lib")).unwrap();
-    a.append_dir_all("include", in_dir.join("include")).unwrap();
-    a.finish().unwrap();
+    assert.stdout("27\n");
 }
 
 /// TODO: on linux-musl, the packaging of libwasmer.a doesn't work properly
 /// Tracked in https://github.com/wasmerio/wasmer/issues/3271
-#[cfg(not(target_env = "musl"))]
-#[cfg(feature = "webc_runner")]
+#[cfg_attr(any(target_env = "musl", target_os = "windows"), ignore)]
 #[test]
-fn test_wasmer_create_exe_pirita_works() -> anyhow::Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
-    let python_wasmer_path = temp_dir.path().join("python.wasmer");
-    std::fs::copy(wasi_test_python_path(), &python_wasmer_path)?;
-    let python_exe_output_path = temp_dir.path().join("python");
+fn test_wasmer_create_exe_pirita_works() {
+    // let temp_dir = Path::new("debug");
+    // std::fs::create_dir_all(&temp_dir);
+
+    use wasmer_integration_tests_cli::get_repo_root_path;
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = temp_dir.path().to_path_buf();
+    let python_wasmer_path = temp_dir.join("python.wasmer");
+    std::fs::copy(wasi_test_python_path(), &python_wasmer_path).unwrap();
+    let python_exe_output_path = temp_dir.join("python");
 
     let native_target = target_lexicon::HOST;
-    let root_path = get_repo_root_path().unwrap();
-    let package_path = root_path.join("package");
-    if !package_path.exists() {
-        panic!("package path {} does not exist", package_path.display());
-    }
-    let tmp_targz_path = tempfile::TempDir::new()?;
-    let tmp_targz_path = tmp_targz_path.path().join("link.tar.gz");
+    let tmp_targz_path = get_repo_root_path().unwrap().join("link.tar.gz");
+
     println!("compiling to target {native_target}");
-    println!(
-        "packaging /package to .tar.gz: {}",
-        tmp_targz_path.display()
-    );
-    package_directory(&package_path, &tmp_targz_path);
-    println!("packaging done");
-    println!(
-        "tmp tar gz path: {} - exists: {:?}",
-        tmp_targz_path.display(),
-        tmp_targz_path.exists()
-    );
 
     let mut cmd = Command::new(get_wasmer_path());
     cmd.arg("create-exe");
@@ -237,31 +258,21 @@ fn test_wasmer_create_exe_pirita_works() -> anyhow::Result<()> {
     cmd.arg(format!("{native_target}"));
     cmd.arg("-o");
     cmd.arg(&python_exe_output_path);
+    // change temp_dir to a local path and run this test again
+    // to output the compilation files into a debug folder
+    //
+    // cmd.arg("--debug-dir");
+    // cmd.arg(&temp_dir);
 
-    println!("running: {cmd:?}");
-
-    let output = cmd.output()?;
-
-    if !output.status.success() {
-        let stdout = std::str::from_utf8(&output.stdout)
-            .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-        bail!(
-            "running wasmer create-exe {} failed with: stdout: {}\n\nstderr: {}",
-            python_wasmer_path.display(),
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
+    cmd.assert().success();
 
     println!("compilation ok!");
 
     if !python_exe_output_path.exists() {
-        return Err(anyhow::anyhow!(
+        panic!(
             "python_exe_output_path {} does not exist",
             python_exe_output_path.display()
-        ));
+        );
     }
 
     println!("invoking command...");
@@ -270,180 +281,103 @@ fn test_wasmer_create_exe_pirita_works() -> anyhow::Result<()> {
     command.arg("-c");
     command.arg("print(\"hello\")");
 
-    let output = command
-        .output()
-        .map_err(|e| anyhow::anyhow!("{e}: {command:?}"))?;
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "1 running python.wasmer failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+    command.assert().success().stdout("hello\n");
 }
 
-#[cfg(feature = "webc_runner")]
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
 #[test]
-fn test_wasmer_run_pirita_works() -> anyhow::Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
+#[ignore]
+fn test_wasmer_run_pirita_works() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
     let python_wasmer_path = temp_dir.path().join("python.wasmer");
-    std::fs::copy(wasi_test_python_path(), &python_wasmer_path)?;
+    std::fs::copy(wasi_test_python_path(), &python_wasmer_path).unwrap();
 
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(python_wasmer_path)
         .arg("--")
         .arg("-c")
         .arg("print(\"hello\")")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "1 running python.wasmer failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+    assert.stdout("hello\n");
 }
 
-#[cfg(feature = "webc_runner")]
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
 #[test]
-fn test_wasmer_run_pirita_url_works() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+#[ignore]
+fn test_wasmer_run_pirita_url_works() {
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg("https://wapm.dev/syrusakbary/python")
         .arg("--")
         .arg("-c")
         .arg("print(\"hello\")")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "1 running python.wasmer failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+    assert.stdout("hello\n");
 }
 
 #[test]
-fn test_wasmer_run_works_with_dir() -> anyhow::Result<()> {
-    let temp_dir = tempfile::TempDir::new()?;
+fn test_wasmer_run_works_with_dir() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
     let qjs_path = temp_dir.path().join("qjs.wasm");
 
-    std::fs::copy(wasi_test_wasm_path(), &qjs_path)?;
+    std::fs::copy(wasi_test_wasm_path(), &qjs_path).unwrap();
     std::fs::copy(
-        format!("{}/{}", C_ASSET_PATH, "qjs-wapm.toml"),
-        temp_dir.path().join("wapm.toml"),
-    )?;
+        format!("{}/{}", C_ASSET_PATH, "qjs-wasmer.toml"),
+        temp_dir.path().join("wasmer.toml"),
+    )
+    .unwrap();
 
     assert!(temp_dir.path().exists());
-    assert!(temp_dir.path().join("wapm.toml").exists());
+    assert!(temp_dir.path().join("wasmer.toml").exists());
     assert!(temp_dir.path().join("qjs.wasm").exists());
 
     // test with "wasmer qjs.wasm"
-    let output = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg(temp_dir.path())
         .arg("--")
         .arg("--quit")
-        .output()?;
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if !output.status.success() {
-        bail!(
-            "running {} failed with: stdout: {}\n\nstderr: {}",
-            qjs_path.display(),
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
+        .assert()
+        .success();
 
     // test again with "wasmer run qjs.wasm"
-    let output = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg("run")
         .arg(temp_dir.path())
         .arg("--")
         .arg("--quit")
-        .output()?;
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if !output.status.success() {
-        bail!(
-            "running {} failed with: stdout: {}\n\nstderr: {}",
-            qjs_path.display(),
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+        .assert()
+        .success();
 }
 
-#[cfg(not(target_env = "musl"))]
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
+#[ignore]
+#[cfg_attr(target_env = "musl", ignore)]
 #[test]
-fn test_wasmer_run_works() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+fn test_wasmer_run_works() {
+    let assert = Command::new(get_wasmer_path())
         .arg("https://wapm.io/python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "1 running python/python failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
+    assert.stdout("hello\n");
 
     // same test again, but this time with "wasmer run ..."
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg("https://wapm.io/python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "2 running python/python failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
+    assert.stdout("hello\n");
 
     // set wapm.io as the current registry
     let _ = Command::new(get_wasmer_path())
@@ -452,202 +386,169 @@ fn test_wasmer_run_works() -> anyhow::Result<()> {
         .arg("wapm.io")
         // will fail, but set wapm.io as the current registry regardless
         .arg("öladkfjasöldfkjasdölfkj")
-        .output()?;
+        .assert()
+        .success();
 
     // same test again, but this time without specifying the registry
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg("python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "3 running python/python failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
+    assert.stdout("hello\n");
 
     // same test again, but this time with only the command "python" (should be looked up locally)
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg("_/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    let stdout = std::str::from_utf8(&output.stdout)
-        .expect("stdout is not utf8! need to handle arbitrary bytes");
-
-    if stdout != "hello\n" {
-        bail!(
-            "4 running python/python failed with: stdout: {}\n\nstderr: {}",
-            stdout,
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+    assert.stdout("hello\n");
 }
 
 #[test]
-fn run_no_imports_wasm_works() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+fn run_no_imports_wasm_works() {
+    Command::new(get_wasmer_path())
         .arg("run")
         .arg(test_no_imports_wat_path())
-        .output()?;
-
-    if !output.status.success() {
-        bail!(
-            "linking failed with: stdout: {}\n\nstderr: {}",
-            std::str::from_utf8(&output.stdout)
-                .expect("stdout is not utf8! need to handle arbitrary bytes"),
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+        .assert()
+        .success();
 }
 
 #[test]
 fn run_wasi_works_non_existent() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("does/not/exist")
-        .output()?;
+        .arg("does-not/exist")
+        .assert()
+        .failure();
 
-    let stderr = std::str::from_utf8(&output.stderr).unwrap();
-
-    let stderr_lines = stderr.lines().map(|s| s.to_string()).collect::<Vec<_>>();
-
-    assert_eq!(
-        stderr_lines,
-        vec!["error: invalid package name, could not find file does/not/exist".to_string()]
-    );
+    assert
+        .stderr(contains(
+            "Unable to find \"does-not/exist\" in the registry",
+        ))
+        .stderr(contains("1: Not found"));
 
     Ok(())
 }
 
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
+#[ignore]
 #[test]
-fn run_test_caching_works_for_packages() -> anyhow::Result<()> {
+fn run_test_caching_works_for_packages() {
     // set wapm.io as the current registry
-    let _ = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg("login")
         .arg("--registry")
         .arg("wapm.io")
         // will fail, but set wapm.io as the current registry regardless
         .arg("öladkfjasöldfkjasdölfkj")
-        .output()?;
+        .assert()
+        .success();
 
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the first time");
-    }
+    assert.stdout("hello\n");
 
     let time = std::time::Instant::now();
 
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the second time");
-    }
+    assert.stdout("hello\n");
 
     // package should be cached
     assert!(std::time::Instant::now() - time < std::time::Duration::from_secs(1));
-
-    Ok(())
 }
 
 #[test]
-fn run_test_caching_works_for_packages_with_versions() -> anyhow::Result<()> {
+fn run_test_caching_works_for_packages_with_versions() {
     // set wapm.io as the current registry
-    let _ = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg("login")
         .arg("--registry")
         .arg("wapm.io")
         // will fail, but set wapm.io as the current registry regardless
         .arg("öladkfjasöldfkjasdölfkj")
-        .output()?;
+        .assert()
+        .success();
 
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=.:{}", ASSET_PATH))
-        .arg("test.py")
-        .output()?;
+        .arg(format!("--mapdir=/app:{}", ASSET_PATH))
+        .arg("/app/test.py")
+        .assert()
+        .success();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the first time");
-    }
+    assert.stdout("hello\n");
 
-    let time = std::time::Instant::now();
-
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=.:{}", ASSET_PATH))
-        .arg("test.py")
-        .output()?;
+        .arg(format!("--mapdir=/app:{}", ASSET_PATH))
+        .arg("/app/test.py")
+        .env(
+            "RUST_LOG",
+            "wasmer_wasix::runtime::package_loader::builtin_loader=debug",
+        )
+        .assert();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the second time");
-    }
-
-    // package should be cached
-    assert!(std::time::Instant::now() - time < std::time::Duration::from_secs(1));
-
-    Ok(())
+    assert
+        .success()
+        // it should have ran like normal
+        .stdout("hello\n")
+        // we hit the cache while fetching the package
+        .stderr(contains(
+            "builtin_loader: Cache hit! pkg.name=\"python\" pkg.version=0.1.0",
+        ));
 }
 
+// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
+#[ignore]
 #[test]
-fn run_test_caching_works_for_urls() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+fn run_test_caching_works_for_urls() {
+    let assert = Command::new(get_wasmer_path())
         .arg("https://wapm.io/python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the first time");
-    }
+    assert.stdout("hello\n");
 
     let time = std::time::Instant::now();
 
-    let output = Command::new(get_wasmer_path())
+    let assert = Command::new(get_wasmer_path())
         .arg("https://wapm.io/python/python")
         .arg(format!("--mapdir=.:{}", ASSET_PATH))
         .arg("test.py")
-        .output()?;
+        .assert()
+        .success();
 
-    if output.stdout != b"hello\n".to_vec() {
-        panic!("failed to run https://wapm.io/python/python for the second time");
-    }
+    assert.stdout("hello\n");
 
     // package should be cached
     assert!(std::time::Instant::now() - time < std::time::Duration::from_secs(1));
-
-    Ok(())
 }
 
 // This test verifies that "wasmer run --invoke _start module.wat"
 // works the same as "wasmer run module.wat" (without --invoke).
 #[test]
-fn run_invoke_works_with_nomain_wasi() -> anyhow::Result<()> {
+fn run_invoke_works_with_nomain_wasi() {
     // In this example the function "wasi_unstable.arg_sizes_get"
     // is a function that is imported from the WASI env.
     let wasi_wat = "
@@ -662,54 +563,40 @@ fn run_invoke_works_with_nomain_wasi() -> anyhow::Result<()> {
     ";
 
     let random = rand::random::<u64>();
-    let module_file = std::env::temp_dir().join(&format!("{random}.wat"));
+    let module_file = std::env::temp_dir().join(format!("{random}.wat"));
     std::fs::write(&module_file, wasi_wat.as_bytes()).unwrap();
-    let output = Command::new(get_wasmer_path())
+
+    Command::new(get_wasmer_path())
         .arg("run")
         .arg(&module_file)
-        .output()?;
+        .assert()
+        .success();
 
-    let stderr = std::str::from_utf8(&output.stderr).unwrap().to_string();
-    let success = output.status.success();
-    if !success {
-        println!("ERROR in 'wasmer run [module.wat]':\r\n{stderr}");
-        panic!();
-    }
-
-    let output = Command::new(get_wasmer_path())
+    Command::new(get_wasmer_path())
         .arg("run")
         .arg("--invoke")
         .arg("_start")
         .arg(&module_file)
-        .output()?;
-
-    let stderr = std::str::from_utf8(&output.stderr).unwrap().to_string();
-    let success = output.status.success();
-    if !success {
-        println!("ERROR in 'wasmer run --invoke _start [module.wat]':\r\n{stderr}");
-        panic!();
-    }
+        .assert()
+        .success();
 
     std::fs::remove_file(&module_file).unwrap();
-    Ok(())
 }
 
 #[test]
-fn run_no_start_wasm_report_error() -> anyhow::Result<()> {
-    let output = Command::new(get_wasmer_path())
+fn run_no_start_wasm_report_error() {
+    let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(test_no_start_wat_path())
-        .output()?;
+        .assert()
+        .failure();
 
-    assert_eq!(output.status.success(), false);
-    let result = std::str::from_utf8(&output.stderr).unwrap().to_string();
-    assert_eq!(result.contains("Can not find any export functions."), true);
-    Ok(())
+    assert.stderr(contains("The module doesn't contain a \"_start\" function"));
 }
 
 // Test that wasmer can run a complex path
 #[test]
-fn test_wasmer_run_complex_url() -> anyhow::Result<()> {
+fn test_wasmer_run_complex_url() {
     let wasm_test_path = wasi_test_wasm_path();
     let wasm_test_path = wasm_test_path.canonicalize().unwrap_or(wasm_test_path);
     let mut wasm_test_path = format!("{}", wasm_test_path.display());
@@ -729,29 +616,11 @@ fn test_wasmer_run_complex_url() -> anyhow::Result<()> {
         );
     }
 
-    let mut cmd = Command::new(get_wasmer_path());
-    cmd.arg("run");
-    cmd.arg(wasm_test_path);
-    cmd.arg("--");
-    cmd.arg("-q");
-
-    let cmd_str = format!("{cmd:?}");
-    let output = cmd.output().with_context(|| {
-        anyhow::anyhow!(
-            "failed to run {cmd_str} with {}",
-            get_wasmer_path().display()
-        )
-    })?;
-
-    if !output.status.success() {
-        bail!(
-            "wasmer run qjs.wasm failed with: stdout: {}\n\nstderr: {}",
-            std::str::from_utf8(&output.stdout)
-                .expect("stdout is not utf8! need to handle arbitrary bytes"),
-            std::str::from_utf8(&output.stderr)
-                .expect("stderr is not utf8! need to handle arbitrary bytes")
-        );
-    }
-
-    Ok(())
+    Command::new(get_wasmer_path())
+        .arg("run")
+        .arg(wasm_test_path)
+        .arg("--")
+        .arg("-q")
+        .assert()
+        .success();
 }

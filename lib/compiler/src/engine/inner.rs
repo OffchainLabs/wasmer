@@ -7,8 +7,6 @@ use crate::Artifact;
 use crate::BaseTunables;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::CodeMemory;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{AsEngineRef, EngineRef};
 #[cfg(feature = "compiler")]
 use crate::{Compiler, CompilerConfig};
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,9 +20,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer_types::{
     entity::PrimaryMap, DeserializeError, FunctionBody, FunctionIndex, FunctionType,
-    LocalFunctionIndex, ModuleInfo, SignatureIndex,
+    LocalFunctionIndex, SignatureIndex,
 };
-use wasmer_types::{CompileError, Features, Target};
+use wasmer_types::{CompileError, Features, ModuleInfo, Target};
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer_types::{CustomSection, CustomSectionProtection, SectionIndex};
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,6 +40,7 @@ pub struct Engine {
     engine_id: EngineId,
     #[cfg(not(target_arch = "wasm32"))]
     tunables: Arc<dyn Tunables + Send + Sync>,
+    name: String,
 }
 
 impl Engine {
@@ -54,9 +53,11 @@ impl Engine {
     ) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let tunables = BaseTunables::for_target(&target);
+        let compiler = compiler_config.compiler();
+        let name = format!("engine-{}", compiler.name());
         Self {
             inner: Arc::new(Mutex::new(EngineInner {
-                compiler: Some(compiler_config.compiler()),
+                compiler: Some(compiler),
                 features,
                 #[cfg(not(target_arch = "wasm32"))]
                 code_memory: vec![],
@@ -67,7 +68,31 @@ impl Engine {
             engine_id: EngineId::default(),
             #[cfg(not(target_arch = "wasm32"))]
             tunables: Arc::new(tunables),
+            name,
         }
+    }
+
+    #[cfg(not(feature = "compiler"))]
+    pub fn new(
+        compiler_config: Box<dyn CompilerConfig>,
+        target: Target,
+        features: Features,
+    ) -> Self {
+        panic!("The engine is not compiled with any compiler support")
+    }
+
+    /// Returns the name of this engine
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Returns the deterministic id of this engine
+    pub fn deterministic_id(&self) -> &str {
+        // TODO: add a `deterministic_id` to the Compiler, so two
+        // compilers can actually serialize into a different deterministic_id
+        // if their configuration is different (eg. LLVM with optimizations vs LLVM
+        // without optimizations)
+        self.name.as_str()
     }
 
     /// Create a headless `Engine`
@@ -102,6 +127,7 @@ impl Engine {
             engine_id: EngineId::default(),
             #[cfg(not(target_arch = "wasm32"))]
             tunables: Arc::new(tunables),
+            name: "engine-headless".to_string(),
         }
     }
 
@@ -165,28 +191,56 @@ impl Engine {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// Deserializes a WebAssembly module
+    /// Deserializes a WebAssembly module which was previously serialized with
+    /// [`Module::serialize`].
     ///
     /// # Safety
     ///
-    /// The serialized content must represent a serialized WebAssembly module.
+    /// See [`Artifact::deserialize_unchecked`].
+    pub unsafe fn deserialize_unchecked(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Arc<Artifact>, DeserializeError> {
+        Ok(Arc::new(Artifact::deserialize_unchecked(self, bytes)?))
+    }
+
+    /// Deserializes a WebAssembly module which was previously serialized with
+    /// [`Module::serialize`].
+    ///
+    /// # Safety
+    ///
+    /// See [`Artifact::deserialize`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn deserialize(&self, bytes: &[u8]) -> Result<Arc<Artifact>, DeserializeError> {
         Ok(Arc::new(Artifact::deserialize(self, bytes)?))
     }
 
+    /// Deserializes a WebAssembly module from a path.
+    ///
+    /// # Safety
+    /// See [`Artifact::deserialize`].
     #[cfg(not(target_arch = "wasm32"))]
-    /// Deserializes a WebAssembly module from a path
+    pub unsafe fn deserialize_from_file(
+        &self,
+        file_ref: &Path,
+    ) -> Result<Arc<Artifact>, DeserializeError> {
+        let contents = std::fs::read(file_ref)?;
+        self.deserialize(&contents)
+    }
+
+    /// Deserialize from a file path.
     ///
     /// # Safety
     ///
-    /// The file's content must represent a serialized WebAssembly module.
-    pub unsafe fn deserialize_from_file(
+    /// See [`Artifact::deserialize_unchecked`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn deserialize_from_file_unchecked(
         &self,
         file_ref: &Path,
     ) -> Result<Arc<Artifact>, DeserializeError> {
         let file = std::fs::File::open(file_ref)?;
         let mmap = Mmap::map(&file)?;
-        self.deserialize(&mmap)
+        self.deserialize_unchecked(&mmap)
     }
 
     /// A unique identifier for this object.
@@ -216,10 +270,13 @@ impl Engine {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl AsEngineRef for Engine {
-    fn as_engine_ref(&self) -> EngineRef {
-        EngineRef { inner: self }
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Engine")
+            .field("target", &self.target)
+            .field("engine_id", &self.engine_id)
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -247,7 +304,7 @@ impl EngineInner {
     pub fn compiler(&self) -> Result<&dyn Compiler, CompileError> {
         match self.compiler.as_ref() {
             None => Err(CompileError::Codegen(
-                "The Engine is not compiled in.".to_string(),
+                "No compiler compiled into executable".to_string(),
             )),
             Some(compiler) => Ok(&**compiler),
         }
