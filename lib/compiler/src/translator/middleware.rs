@@ -4,9 +4,9 @@
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use wasmer_types::{LocalFunctionIndex, MiddlewareError, ModuleInfo, WasmResult};
-use wasmparser::{BinaryReader, Operator, Range, Type};
+use wasmparser::{BinaryReader, Operator, ValType};
 
 use super::error::from_binaryreadererror_wasmerror;
 use crate::translator::environ::FunctionBinaryReader;
@@ -32,7 +32,7 @@ pub trait ModuleMiddleware: Debug + Send + Sync {
 /// A function middleware specialized for a single function.
 pub trait FunctionMiddleware<'a>: Debug {
     /// Provide info on the function's locals. This is called before feed.
-    fn locals_info(&mut self, _locals: &[Type]) {}
+    fn locals_info(&mut self, _locals: &[ValType]) {}
 
     /// Processes the given operator.
     fn feed(
@@ -71,7 +71,7 @@ pub struct MiddlewareReaderState<'a> {
     local_decls_read: u32,
 
     /// Locals read so far.
-    locals: Vec<Type>,
+    locals: Vec<ValType>,
 }
 
 /// Trait for generating middleware chains from "prototype" (generator) chains.
@@ -166,10 +166,10 @@ impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
         Ok(total)
     }
 
-    fn read_local_decl(&mut self) -> WasmResult<(u32, Type)> {
+    fn read_local_decl(&mut self) -> WasmResult<(u32, ValType)> {
         let count = self.state.inner.read_var_u32();
         let count = count.map_err(from_binaryreadererror_wasmerror)?;
-        let ty = self.state.inner.read_type();
+        let ty = self.state.inner.read_val_type();
         let ty = ty.map_err(from_binaryreadererror_wasmerror)?;
         for _ in 0..count {
             self.state.locals.push(ty);
@@ -235,7 +235,7 @@ impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
         self.state.inner.eof()
     }
 
-    fn range(&self) -> Range {
+    fn range(&self) -> Range<usize> {
         self.state.inner.range()
     }
 }
