@@ -272,7 +272,7 @@ pub struct VMGlobalImport {
 /// # Safety
 /// This data is safe to share between threads because it's plain data that
 /// is the user's responsibility to synchronize. Additionally, all operations
-/// on `from` are thread-safe through the use of a mutex in [`Global`].
+/// on `from` are thread-safe through the use of a mutex in [`VMGlobal`].
 unsafe impl Send for VMGlobalImport {}
 /// # Safety
 /// This data is safe to share between threads because it's plain data that
@@ -781,10 +781,10 @@ unsafe impl Sync for VMMemoryDefinition {}
 #[cfg(test)]
 mod test_vmmemory_definition {
     use super::VMMemoryDefinition;
-    use crate::ModuleInfo;
     use crate::VMOffsets;
     use memoffset::offset_of;
     use std::mem::size_of;
+    use wasmer_types::ModuleInfo;
 
     #[test]
     fn check_vmmemory_definition_offsets() {

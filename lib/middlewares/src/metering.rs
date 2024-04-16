@@ -1,6 +1,6 @@
 //! `metering` is a middleware for tracking how many operators are
 //! executed in total and putting a limit on the total number of
-//! operators executed. The WebAssemblt instance execution is stopped
+//! operators executed. The WebAssembly instance execution is stopped
 //! when the limit is reached.
 //!
 //! # Example
@@ -11,7 +11,7 @@
 use std::convert::TryInto;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use wasmer::wasmparser::{Operator, Type as WpType, TypeOrFuncType as WpTypeOrFuncType};
+use wasmer::wasmparser::{BlockType as WpTypeOrFuncType, Operator};
 use wasmer::{
     AsStoreMut, ExportIndex, FunctionMiddleware, GlobalInit, GlobalType, Instance,
     LocalFunctionIndex, MiddlewareError, MiddlewareReaderState, ModuleMiddleware, Mutability, Type,
@@ -238,7 +238,7 @@ impl<'a, F: Fn(&Operator) -> u64 + Send + Sync> FunctionMiddleware<'a> for Funct
                         Operator::GlobalGet { global_index: self.global_indexes.remaining_points().as_u32() },
                         Operator::I64Const { value: self.accumulated_cost as i64 },
                         Operator::I64LtU,
-                        Operator::If { ty: WpTypeOrFuncType::Type(WpType::EmptyBlockType) },
+                        Operator::If { blockty: WpTypeOrFuncType::Empty },
                         Operator::I32Const { value: 1 },
                         Operator::GlobalSet { global_index: self.global_indexes.points_exhausted().as_u32() },
                         Operator::Unreachable,

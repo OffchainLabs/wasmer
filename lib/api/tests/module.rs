@@ -101,7 +101,7 @@ fn imports() -> Result<(), String> {
     Ok(())
 }
 
-#[universal_test]
+#[test]
 fn exports() -> Result<(), String> {
     let store = Store::default();
     let wat = r#"(module
@@ -273,5 +273,20 @@ fn calling_host_functions_with_negative_values_works() -> Result<(), String> {
     f7.call(&mut store).map_err(|e| format!("{e:?}"))?;
     f8.call(&mut store).map_err(|e| format!("{e:?}"))?;
 
+    Ok(())
+}
+
+#[universal_test]
+fn module_custom_sections() -> Result<(), String> {
+    let store = Store::default();
+    let custom_section_wasm_bytes = include_bytes!("simple-name-section.wasm");
+    let module = Module::new(&store, custom_section_wasm_bytes).map_err(|e| format!("{e:?}"))?;
+    let sections = module.custom_sections("name");
+    let sections_vec: Vec<Box<[u8]>> = sections.collect();
+    assert_eq!(sections_vec.len(), 1);
+    assert_eq!(
+        sections_vec[0],
+        vec![2, 2, 36, 105, 1, 0, 0, 0].into_boxed_slice()
+    );
     Ok(())
 }
