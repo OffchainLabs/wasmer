@@ -1,10 +1,15 @@
 use std::f32::consts::E;
 
 use super::*;
+#[cfg(feature = "journal")]
+use crate::journal::JournalEffector;
 use crate::{
-    capture_snapshot,
+    capture_store_snapshot,
     os::task::thread::WasiMemoryLayout,
-    runtime::task_manager::{TaskWasm, TaskWasmRunProperties},
+    runtime::{
+        task_manager::{TaskWasm, TaskWasmRunProperties},
+        TaintReason,
+    },
     syscalls::*,
     WasiThreadHandle,
 };
@@ -32,7 +37,7 @@ pub fn thread_spawn_v2<M: MemorySize>(
     ret_tid: WasmPtr<Tid, M>,
 ) -> Errno {
     // Create the thread
-    let tid = wasi_try!(thread_spawn_internal(&mut ctx, start_ptr));
+    let tid = wasi_try!(thread_spawn_internal_from_wasi(&mut ctx, start_ptr));
 
     // Success
     let memory = unsafe { ctx.data().memory_view(&ctx) };
@@ -40,7 +45,7 @@ pub fn thread_spawn_v2<M: MemorySize>(
     Errno::Success
 }
 
-pub(crate) fn thread_spawn_internal<M: MemorySize>(
+pub fn thread_spawn_internal_from_wasi<M: MemorySize>(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     start_ptr: WasmPtr<ThreadStart<M>, M>,
 ) -> Result<Tid, Errno> {
@@ -50,9 +55,6 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
     let runtime = env.runtime.clone();
     let tasks = env.tasks().clone();
     let start_ptr_offset = start_ptr.offset();
-
-    // We extract the memory which will be passed to the thread
-    let thread_memory = unsafe { env.inner() }.memory_clone();
 
     // Read the properties about the stack which we will use for asyncify
     let layout = {
@@ -73,7 +75,10 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
     tracing::trace!("spawn with layout {:?}", layout);
 
     // Create the handle that represents this thread
-    let mut thread_handle = match env.process.new_thread() {
+    let thread_start = ThreadStartType::ThreadSpawn {
+        start_ptr: start_ptr_offset.into(),
+    };
+    let mut thread_handle = match env.process.new_thread(layout.clone(), thread_start) {
         Ok(h) => Arc::new(h),
         Err(err) => {
             error!(
@@ -87,6 +92,25 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
     let thread_id: Tid = thread_handle.id().into();
     Span::current().record("tid", thread_id);
 
+    // Spawn the thread
+    thread_spawn_internal_using_layout::<M>(ctx, thread_handle, layout, start_ptr_offset, None)?;
+
+    // Success
+    Ok(thread_id)
+}
+
+pub fn thread_spawn_internal_using_layout<M: MemorySize>(
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+    thread_handle: Arc<WasiThreadHandle>,
+    layout: WasiMemoryLayout,
+    start_ptr_offset: M::Offset,
+    rewind_state: Option<(RewindState, RewindResultType)>,
+) -> Result<(), Errno> {
+    // We extract the memory which will be passed to the thread
+    let env = ctx.data();
+    let tasks = env.tasks().clone();
+    let thread_memory = unsafe { env.inner() }.memory_clone();
+
     // We capture some local variables
     let state = env.state.clone();
     let mut thread_env = env.clone();
@@ -94,7 +118,7 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
     thread_env.layout = layout;
 
     // TODO: Currently asynchronous threading does not work with multi
-    //       threading but it does work for the main thread. This will
+    //       threading in JS but it does work for the main thread. This will
     //       require more work to find out why.
     thread_env.enable_deep_sleep = if cfg!(feature = "js") {
         false
@@ -108,7 +132,7 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
         let thread_handle = thread_handle;
         move |ctx: WasiFunctionEnv, mut store: Store| {
             // Call the thread
-            call_module::<M>(ctx, store, start_ptr_offset, thread_handle, None)
+            call_module::<M>(ctx, store, start_ptr_offset, thread_handle, rewind_state)
         }
     };
 
@@ -119,7 +143,7 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
         return Err(Errno::Notcapable);
     }
     let thread_module = unsafe { env.inner() }.module_clone();
-    let snapshot = capture_snapshot(&mut ctx.as_store_mut());
+    let globals = capture_store_snapshot(&mut ctx.as_store_mut());
     let spawn_type =
         crate::runtime::SpawnMemoryType::ShareMemory(thread_memory, ctx.as_store_ref());
 
@@ -131,13 +155,13 @@ pub(crate) fn thread_spawn_internal<M: MemorySize>(
     tasks
         .task_wasm(
             TaskWasm::new(Box::new(run), thread_env, thread_module, false)
-                .with_snapshot(&snapshot)
+                .with_globals(&globals)
                 .with_memory(spawn_type),
         )
         .map_err(Into::<Errno>::into)?;
 
     // Success
-    Ok(thread_id)
+    Ok(())
 }
 
 /// Calls the module
@@ -146,7 +170,7 @@ fn call_module<M: MemorySize>(
     mut store: Store,
     start_ptr_offset: M::Offset,
     thread_handle: Arc<WasiThreadHandle>,
-    rewind_state: Option<(RewindState, Bytes)>,
+    rewind_state: Option<(RewindState, RewindResultType)>,
 ) -> Result<Tid, Errno> {
     let env = ctx.data(&store);
     let tasks = env.tasks().clone();
@@ -175,6 +199,9 @@ fn call_module<M: MemorySize>(
                     ret = if code.is_success() {
                         Errno::Success
                     } else {
+                        env.data(&store)
+                            .runtime
+                            .on_taint(TaintReason::NonZeroExitCode(code));
                         Errno::Noexec
                     };
                 }
@@ -184,10 +211,16 @@ fn call_module<M: MemorySize>(
                 }
                 Ok(WasiError::UnknownWasiVersion) => {
                     debug!("failed as wasi version is unknown",);
+                    env.data(&store)
+                        .runtime
+                        .on_taint(TaintReason::UnknownWasiVersion);
                     ret = Errno::Noexec;
                 }
                 Err(err) => {
                     debug!("failed with runtime error: {}", err);
+                    env.data(&store)
+                        .runtime
+                        .on_taint(TaintReason::RuntimeError(err));
                     ret = Errno::Noexec;
                 }
             }
@@ -195,7 +228,7 @@ fn call_module<M: MemorySize>(
         trace!("callback finished (ret={})", ret);
 
         // Clean up the environment
-        env.cleanup(store, Some(ret.into()));
+        env.on_exit(store, Some(ret.into()));
 
         // Return the result
         Ok(ret as u32)
@@ -203,9 +236,10 @@ fn call_module<M: MemorySize>(
 
     // If we need to rewind then do so
     if let Some((rewind_state, rewind_result)) = rewind_state {
+        let mut ctx = ctx.env.clone().into_mut(&mut store);
         let res = rewind_ext::<M>(
-            ctx.env.clone().into_mut(&mut store),
-            rewind_state.memory_stack,
+            &mut ctx,
+            Some(rewind_state.memory_stack),
             rewind_state.rewind_stack,
             rewind_state.store_data,
             rewind_result,
@@ -237,7 +271,7 @@ fn call_module<M: MemorySize>(
                         store,
                         start_ptr_offset,
                         thread_handle,
-                        Some((rewind, trigger_res)),
+                        Some((rewind, RewindResultType::RewindWithResult(trigger_res))),
                     );
                 }
             };

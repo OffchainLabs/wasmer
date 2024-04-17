@@ -1,9 +1,15 @@
 use std::{collections::VecDeque, task::Waker};
 
-use virtual_fs::{AsyncReadExt, ReadBuf};
+use virtual_fs::{AsyncReadExt, DeviceFile, ReadBuf};
 
 use super::*;
-use crate::{fs::NotificationInner, net::socket::TimeType, syscalls::*};
+use crate::{
+    fs::NotificationInner,
+    journal::SnapshotTrigger,
+    net::socket::TimeType,
+    os::task::process::{MaybeCheckpointResult, WasiProcessCheckpoint, WasiProcessInner},
+    syscalls::*,
+};
 
 /// ### `fd_read()`
 /// Read data from file descriptor
@@ -38,6 +44,11 @@ pub fn fd_read<M: MemorySize>(
         fd_entry.offset.load(Ordering::Acquire) as usize
     };
 
+    ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+    if fd == DeviceFile::STDIN {
+        ctx = wasi_try_ok!(maybe_snapshot_once::<M>(ctx, SnapshotTrigger::FirstStdin)?);
+    }
+
     let res = fd_read_internal::<M>(&mut ctx, fd, iovs, iovs_len, offset, nread, true)?;
     fd_read_internal_handler(ctx, res, nread)
 }
@@ -68,6 +79,11 @@ pub fn fd_pread<M: MemorySize>(
 ) -> Result<Errno, WasiError> {
     let pid = ctx.data().pid();
     let tid = ctx.data().tid();
+
+    ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+    if fd == DeviceFile::STDIN {
+        ctx = wasi_try_ok!(maybe_snapshot_once::<M>(ctx, SnapshotTrigger::FirstStdin)?);
+    }
 
     let res = fd_read_internal::<M>(&mut ctx, fd, iovs, iovs_len, offset as usize, nread, false)?;
     fd_read_internal_handler::<M>(ctx, res, nread)
@@ -109,7 +125,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
     offset: usize,
     nread: WasmPtr<M::Offset, M>,
     should_update_cursor: bool,
-) -> Result<Result<usize, Errno>, WasiError> {
+) -> WasiResult<usize> {
     wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
 
     let env = ctx.data();

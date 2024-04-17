@@ -29,7 +29,7 @@ pub use target_lexicon::{
 ///
 /// [`cpuid` crate]: https://docs.rs/cpuid/0.1.1/cpuid/enum.CpuFeature.html
 /// [`cranelift-native`]: https://github.com/bytecodealliance/cranelift/blob/6988545fd20249b084c53f4761b8c861266f5d31/cranelift-native/src/lib.rs#L51-L92
-#[allow(missing_docs, clippy::derive_hash_xor_eq)]
+#[allow(missing_docs, clippy::derived_hash_with_manual_eq)]
 #[derive(EnumSetType, Debug, Hash)]
 pub enum CpuFeature {
     // X86 features
@@ -48,6 +48,7 @@ pub enum CpuFeature {
     AVX512F,
     LZCNT,
     // ARM features
+    NEON,
     // Risc-V features
 }
 
@@ -101,7 +102,20 @@ impl CpuFeature {
         }
         features
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+
+    #[cfg(target_arch = "aarch64")]
+    /// Retrieves the features for the current Host
+    pub fn for_host() -> EnumSet<Self> {
+        let mut features = EnumSet::new();
+
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.insert(Self::NEON);
+        }
+
+        features
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     /// Retrieves the features for the current Host
     pub fn for_host() -> EnumSet<Self> {
         // We default to an empty hash set
@@ -140,6 +154,7 @@ impl FromStr for CpuFeature {
             "avx512vl" => Ok(Self::AVX512VL),
             "avx512f" => Ok(Self::AVX512F),
             "lzcnt" => Ok(Self::LZCNT),
+            "neon" => Ok(Self::NEON),
             _ => Err(ParseCpuFeatureError::Missing(s.to_string())),
         }
     }
@@ -162,6 +177,7 @@ impl ToString for CpuFeature {
             Self::AVX512VL => "avx512vl",
             Self::AVX512F => "avx512f",
             Self::LZCNT => "lzcnt",
+            Self::NEON => "neon",
         }
         .to_string()
     }

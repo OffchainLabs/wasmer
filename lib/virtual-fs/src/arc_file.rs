@@ -3,7 +3,6 @@
 
 use crate::{ClonableVirtualFile, VirtualFile};
 use derivative::Derivative;
-use futures::future::BoxFuture;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{
@@ -12,7 +11,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 
-#[derive(Derivative, Clone)]
+#[derive(Derivative)]
 #[derivative(Debug)]
 pub struct ArcFile<T>
 where
@@ -127,11 +126,9 @@ where
         let mut inner = self.inner.lock().unwrap();
         inner.set_len(new_size)
     }
-    fn unlink(&mut self) -> BoxFuture<'static, crate::Result<()>> {
+    fn unlink(&mut self) -> crate::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let fut = inner.unlink();
-        drop(inner);
-        Box::pin(fut)
+        inner.unlink()
     }
     fn is_open(&self) -> bool {
         let inner = self.inner.lock().unwrap();
@@ -150,6 +147,17 @@ where
         let mut inner = self.inner.lock().unwrap();
         let inner = Pin::new(inner.as_mut());
         inner.poll_write_ready(cx)
+    }
+}
+
+impl<T> Clone for ArcFile<T>
+where
+    T: VirtualFile + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        ArcFile {
+            inner: self.inner.clone(),
+        }
     }
 }
 

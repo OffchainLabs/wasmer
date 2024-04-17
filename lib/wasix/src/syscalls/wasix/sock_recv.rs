@@ -27,7 +27,7 @@ pub fn sock_recv<M: MemorySize>(
     ro_flags: WasmPtr<RoFlags, M>,
 ) -> Result<Errno, WasiError> {
     let env = ctx.data();
-    let fd_entry = env.state.fs.get_fd(sock).unwrap();
+    let fd_entry = wasi_try_ok!(env.state.fs.get_fd(sock));
     let guard = fd_entry.inode.read();
     let use_read = matches!(guard.deref(), Kind::Pipe { .. });
     drop(guard);
@@ -107,7 +107,7 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
     ri_flags: RiFlags,
     ro_data_len: WasmPtr<M::Offset, M>,
     ro_flags: WasmPtr<RoFlags, M>,
-) -> Result<Result<usize, Errno>, WasiError> {
+) -> WasiResult<usize> {
     wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
 
     let mut env = ctx.data();

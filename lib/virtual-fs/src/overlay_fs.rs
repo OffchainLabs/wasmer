@@ -113,7 +113,6 @@ where
     S: for<'a> FileSystems<'a> + Send + Sync + 'static,
     for<'a> <<S as FileSystems<'a>>::Iter as IntoIterator>::IntoIter: Send,
 {
-    #[tracing::instrument(level = "debug", skip_all, fields(path=%path.display()))]
     fn read_dir(&self, path: &Path) -> Result<ReadDir, FsError> {
         let mut entries = Vec::new();
         let mut had_at_least_one_success = false;
@@ -820,27 +819,26 @@ where
             Ok(())
         }
 
-        fn unlink(&mut self) -> BoxFuture<'static, crate::Result<()>> {
+        fn unlink(&mut self) -> crate::Result<()> {
             let primary = self.primary.clone();
             let path = self.path.clone();
-            Box::pin(async move {
-                // Create the whiteout file in the primary
-                let mut had_at_least_one_success = false;
-                if ops::create_white_out(&primary, &path).is_ok() {
-                    had_at_least_one_success = true;
-                }
 
-                // Attempt to remove it from the primary first
-                match primary.remove_file(&path) {
-                    Err(e) if should_continue(e) => {}
-                    other => return other,
-                }
+            // Create the whiteout file in the primary
+            let mut had_at_least_one_success = false;
+            if ops::create_white_out(&primary, &path).is_ok() {
+                had_at_least_one_success = true;
+            }
 
-                if had_at_least_one_success {
-                    return Ok(());
-                }
-                Err(FsError::PermissionDenied)
-            })
+            // Attempt to remove it from the primary first
+            match primary.remove_file(&path) {
+                Err(e) if should_continue(e) => {}
+                other => return other,
+            }
+
+            if had_at_least_one_success {
+                return Ok(());
+            }
+            Err(FsError::PermissionDenied)
         }
 
         fn poll_read_ready(

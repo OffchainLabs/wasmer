@@ -24,12 +24,14 @@ pub fn sock_accept<M: MemorySize>(
 ) -> Result<Errno, WasiError> {
     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
 
+    ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
     let env = ctx.data();
     let (memory, state, _) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
 
-    let (fd, addr) = wasi_try_ok!(sock_accept_internal(env, sock, fd_flags, nonblocking));
+    let (fd, _, _) = wasi_try_ok!(sock_accept_internal(env, sock, fd_flags, nonblocking)?);
 
     wasi_try_mem_ok!(ro_fd.write(&memory, fd));
 
@@ -64,30 +66,50 @@ pub fn sock_accept_v2<M: MemorySize>(
 
     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
 
-    let (fd, addr) = wasi_try_ok!(sock_accept_internal(env, sock, fd_flags, nonblocking));
+    let (fd, local_addr, peer_addr) =
+        wasi_try_ok!(sock_accept_internal(env, sock, fd_flags, nonblocking)?);
 
+    #[cfg(feature = "journal")]
+    if ctx.data().enable_journal {
+        JournalEffector::save_sock_accepted(
+            &mut ctx,
+            sock,
+            fd,
+            local_addr,
+            peer_addr,
+            fd_flags,
+            nonblocking,
+        )
+        .map_err(|err| {
+            tracing::error!("failed to save sock_accepted event - {}", err);
+            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+        })?;
+    }
+
+    let env = ctx.data();
+    let (memory, state, _) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     wasi_try_mem_ok!(ro_fd.write(&memory, fd));
     wasi_try_ok!(crate::net::write_ip_port(
         &memory,
         ro_addr,
-        addr.ip(),
-        addr.port()
+        peer_addr.ip(),
+        peer_addr.port()
     ));
 
     Ok(Errno::Success)
 }
 
-pub fn sock_accept_internal(
+pub(crate) fn sock_accept_internal(
     env: &WasiEnv,
     sock: WasiFd,
     mut fd_flags: Fdflags,
     mut nonblocking: bool,
-) -> Result<(WasiFd, SocketAddr), Errno> {
+) -> Result<Result<(WasiFd, SocketAddr, SocketAddr), Errno>, WasiError> {
     let state = env.state();
     let inodes = &state.inodes;
 
     let tasks = env.tasks().clone();
-    let (child, addr, fd_flags) = __sock_asyncify(
+    let (child, local_addr, peer_addr, fd_flags) = wasi_try_ok_ok!(__sock_asyncify(
         env,
         sock,
         Rights::SOCK_ACCEPT,
@@ -101,20 +123,20 @@ pub fn sock_accept_internal(
                 .ok()
                 .flatten()
                 .unwrap_or(Duration::from_secs(30));
+            let local_addr = socket.addr_local()?;
             socket
                 .accept(tasks.deref(), nonblocking, Some(timeout))
                 .await
-                .map(|a| (a.0, a.1, fd_flags))
+                .map(|a| (a.0, local_addr, a.1, fd_flags))
         },
-    )?;
+    ));
 
     let kind = Kind::Socket {
         socket: InodeSocket::new(InodeSocketKind::TcpStream {
             socket: child,
             write_timeout: None,
             read_timeout: None,
-        })
-        .map_err(net_error_into_wasi_err)?,
+        }),
     };
     let inode = state
         .fs
@@ -131,8 +153,8 @@ pub fn sock_accept_internal(
     }
 
     let rights = Rights::all_socket();
-    let fd = state.fs.create_fd(rights, rights, new_flags, 0, inode)?;
+    let fd = wasi_try_ok_ok!(state.fs.create_fd(rights, rights, new_flags, 0, inode));
     Span::current().record("fd", fd);
 
-    Ok((fd, addr))
+    Ok(Ok((fd, local_addr, peer_addr)))
 }

@@ -169,7 +169,7 @@ impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
     fn read_local_decl(&mut self) -> WasmResult<(u32, ValType)> {
         let count = self.state.inner.read_var_u32();
         let count = count.map_err(from_binaryreadererror_wasmerror)?;
-        let ty = self.state.inner.read_val_type();
+        let ty = self.state.inner.read::<ValType>();
         let ty = ty.map_err(from_binaryreadererror_wasmerror)?;
         for _ in 0..count {
             self.state.locals.push(ty);
