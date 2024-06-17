@@ -2674,6 +2674,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90ed8c1e510134f979dbc4f070f87d4313098b704861a105fe34231c70a3901c"
 
 [[package]]
+name = "lru-mem"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf5c8c26d903a41c80d4cc171940a57a4d1bc51139ebd6aad87e2f9ae3774780"
+dependencies = [
+ "hashbrown 0.14.3",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6166,6 +6175,7 @@ dependencies = [
  "hashbrown 0.11.2",
  "indexmap 1.9.3",
  "js-sys",
+ "lru-mem",
  "macro-wasmer-universal-test",
  "more-asserts",
  "rustc-demangle",
@@ -6423,6 +6433,7 @@ dependencies = [
  "hashbrown 0.11.2",
  "lazy_static",
  "leb128",
+ "lru-mem",
  "memmap2 0.5.10",
  "more-asserts",
  "region",
@@ -6924,6 +6935,7 @@ dependencies = [
  "crossbeam-queue 0.3.11",
  "glob",
  "lazy_static",
+ "lru-mem",
  "rustc_version 0.4.0",
  "serial_test",
  "tempfile",

@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 
 use crate::engine::AsEngineRef;
+use lru_mem::HeapSize;
 use thiserror::Error;
 #[cfg(feature = "wat")]
 use wasmer_types::WasmError;
@@ -473,6 +474,12 @@ impl fmt::Debug for Module {
         f.debug_struct("Module")
             .field("name", &self.name())
             .finish()
+    }
+}
+
+impl HeapSize for Module {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.0.heap_size()
     }
 }
 
