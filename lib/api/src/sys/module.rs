@@ -1,16 +1,10 @@
 use crate::engine::AsEngineRef;
-use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
-<<<<<<< Updated upstream
-use wasmer_compiler::Artifact;
-use wasmer_compiler::ArtifactCreate;
-=======
 
 use bytes::Bytes;
 use lru_mem::HeapSize;
 use wasmer_compiler::{Artifact, ArtifactCreate};
->>>>>>> Stashed changes
 use wasmer_types::{
     CompileError, DeserializeError, ExportsIterator, ImportsIterator, ModuleInfo, SerializeError,
 };
