@@ -2,8 +2,15 @@ use crate::engine::AsEngineRef;
 use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
+<<<<<<< Updated upstream
 use wasmer_compiler::Artifact;
 use wasmer_compiler::ArtifactCreate;
+=======
+
+use bytes::Bytes;
+use lru_mem::HeapSize;
+use wasmer_compiler::{Artifact, ArtifactCreate};
+>>>>>>> Stashed changes
 use wasmer_types::{
     CompileError, DeserializeError, ExportsIterator, ImportsIterator, ModuleInfo, SerializeError,
 };
@@ -30,6 +37,12 @@ pub struct Module {
     // In the future, this code should be refactored to properly describe the
     // ownership of the code and its metadata.
     artifact: Arc<Artifact>,
+}
+
+impl HeapSize for Module {
+    fn heap_size(&self) -> usize {
+        self.artifact.heap_size()
+    }
 }
 
 impl Module {

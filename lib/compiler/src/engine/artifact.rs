@@ -16,6 +16,7 @@ use crate::{
 use crate::{Compiler, FunctionBodyData, ModuleTranslationState};
 use crate::{Engine, EngineInner};
 use enumset::EnumSet;
+use lru_mem::HeapSize;
 use shared_buffer::OwnedBuffer;
 #[cfg(any(feature = "static-artifact-create", feature = "static-artifact-load"))]
 use std::mem;
@@ -95,6 +96,14 @@ pub struct Artifact {
     // The artifact will only be allocated in memory in case we can execute it
     // (that means, if the target != host then this will be None).
     allocated: Option<AllocatedArtifact>,
+}
+
+impl HeapSize for Artifact {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of::<ArtifactId>()
+            + std::mem::size_of::<ArtifactBuildVariant>()
+            + std::mem::size_of::<AllocatedArtifact>()
+    }
 }
 
 /// Artifacts may be created as the result of the compilation of a wasm
