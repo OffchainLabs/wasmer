@@ -6,6 +6,7 @@ use crate::sys::engine as engine_imp;
 pub(crate) use crate::sys::engine::default_engine;
 #[cfg(feature = "sys")]
 use crate::IntoBytes;
+use lru_mem::HeapSize;
 #[cfg(feature = "sys")]
 use shared_buffer::OwnedBuffer;
 #[cfg(feature = "sys")]
@@ -121,6 +122,12 @@ impl Default for Engine {
 impl<T: Into<engine_imp::Engine>> From<T> for Engine {
     fn from(t: T) -> Self {
         Self(t.into())
+    }
+}
+
+impl HeapSize for Engine {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.0.heap_size()
     }
 }
 

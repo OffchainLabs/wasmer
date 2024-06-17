@@ -13,6 +13,7 @@ use crate::GlobalFrameInfoRegistration;
 use crate::{Compiler, CompilerConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{FunctionExtent, Tunables};
+use lru_mem::HeapSize;
 #[cfg(not(target_arch = "wasm32"))]
 use shared_buffer::OwnedBuffer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,6 +44,13 @@ pub struct Engine {
     #[cfg(not(target_arch = "wasm32"))]
     tunables: Arc<dyn Tunables + Send + Sync>,
     name: String,
+}
+
+impl HeapSize for Engine {
+    fn heap_size(&self) -> usize {
+        // TODO: Implement heap_size for the rest of the fields.
+        std::mem::size_of::<EngineId>() + self.name.heap_size()
+    }
 }
 
 impl Engine {
