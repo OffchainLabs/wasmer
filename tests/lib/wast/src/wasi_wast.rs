@@ -8,15 +8,14 @@ use std::{
     task::{Context, Poll},
 };
 
+use tokio::runtime::Handle;
 use virtual_fs::{
     host_fs, mem_fs, passthru_fs, tmp_fs, union_fs, AsyncRead, AsyncSeek, AsyncWrite,
     AsyncWriteExt, FileSystem, Pipe, ReadBuf, RootFileSystemBuilder,
 };
 use wasmer::{FunctionEnv, Imports, Module, Store};
-use wasmer_wasix::runtime::{
-    module_cache::ModuleHash,
-    task_manager::{tokio::TokioTaskManager, InlineWaker},
-};
+use wasmer_types::ModuleHash;
+use wasmer_wasix::runtime::task_manager::{tokio::TokioTaskManager, InlineWaker};
 use wasmer_wasix::types::wasi::{Filesize, Timestamp};
 use wasmer_wasix::{
     generate_import_object_from_env, get_wasi_version, FsError, PluggableRuntime, VirtualFile,
@@ -121,7 +120,7 @@ impl<'a> WasiTest<'a> {
             wasm_module.read_to_end(&mut out)?;
             out
         };
-        let module_hash = ModuleHash::hash(&wasm_bytes);
+        let module_hash = ModuleHash::xxhash(&wasm_bytes);
 
         let module = Module::new(store, wasm_bytes)?;
         let (builder, _tempdirs, mut stdin_tx, stdout_rx, stderr_rx) =
@@ -203,7 +202,8 @@ impl<'a> WasiTest<'a> {
 
         match filesystem_kind {
             WasiFileSystemKind::Host => {
-                let fs = host_fs::FileSystem::default();
+                let fs = host_fs::FileSystem::new(Handle::current(), PathBuf::from(BASE_TEST_DIR))
+                    .unwrap();
 
                 for (alias, real_dir) in &self.mapped_dirs {
                     let mut dir = PathBuf::from(BASE_TEST_DIR);
@@ -219,7 +219,7 @@ impl<'a> WasiTest<'a> {
                 }
 
                 for alias in &self.temp_dirs {
-                    let temp_dir = tempfile::tempdir()?;
+                    let temp_dir = tempfile::tempdir_in(PathBuf::from(BASE_TEST_DIR))?;
                     builder.add_map_dir(alias, temp_dir.path())?;
                     host_temp_dirs_to_not_drop.push(temp_dir);
                 }
@@ -246,14 +246,38 @@ impl<'a> WasiTest<'a> {
                         let e = mem_fs::FileSystem::default();
                         let f = mem_fs::FileSystem::default();
 
-                        let mut union = union_fs::UnionFileSystem::new();
+                        let union = union_fs::UnionFileSystem::new();
 
-                        union.mount("mem_fs", "/test_fs", false, Box::new(a), None);
-                        union.mount("mem_fs_2", "/snapshot1", false, Box::new(b), None);
-                        union.mount("mem_fs_3", "/tests", false, Box::new(c), None);
-                        union.mount("mem_fs_4", "/nightly_2022_10_18", false, Box::new(d), None);
-                        union.mount("mem_fs_5", "/unstable", false, Box::new(e), None);
-                        union.mount("mem_fs_6", "/.tmp_wasmer_wast_0", false, Box::new(f), None);
+                        union.mount(
+                            "mem_fs".to_string(),
+                            PathBuf::from("/test_fs").as_ref(),
+                            Box::new(a),
+                        )?;
+                        union.mount(
+                            "mem_fs_2".to_string(),
+                            PathBuf::from("/snapshot1").as_ref(),
+                            Box::new(b),
+                        )?;
+                        union.mount(
+                            "mem_fs_3".to_string(),
+                            PathBuf::from("/tests").as_ref(),
+                            Box::new(c),
+                        )?;
+                        union.mount(
+                            "mem_fs_4".to_string(),
+                            PathBuf::from("/nightly_2022_10_18").as_ref(),
+                            Box::new(d),
+                        )?;
+                        union.mount(
+                            "mem_fs_5".to_string(),
+                            PathBuf::from("/unstable").as_ref(),
+                            Box::new(e),
+                        )?;
+                        union.mount(
+                            "mem_fs_6".to_string(),
+                            PathBuf::from("/.tmp_wasmer_wast_0").as_ref(),
+                            Box::new(f),
+                        )?;
 
                         Box::new(union)
                     }

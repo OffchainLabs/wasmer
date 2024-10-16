@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{env, time::Duration};
 
 use anyhow::Context;
 use futures::{future::BoxFuture, TryStreamExt};
@@ -42,13 +42,15 @@ impl ReqwestHttpClient {
             .with_context(|| format!("Invalid http method {}", request.method))?;
 
         // TODO: use persistent client?
-        let client = {
+        let builder = {
             let _guard = Handle::try_current().map_err(|_| self.handle.enter());
-            reqwest::Client::builder()
-                .connect_timeout(self.connect_timeout)
-                .build()
-                .context("Could not create reqwest client")?
+            let mut builder = reqwest::ClientBuilder::new().connect_timeout(self.connect_timeout);
+            if let Some(proxy) = get_proxy()? {
+                builder = builder.proxy(proxy);
+            }
+            builder
         };
+        let client = builder.build().context("failed to create reqwest client")?;
 
         let mut builder = client.request(method, request.url.as_str());
         for (header, val) in &request.headers {
@@ -67,12 +69,59 @@ impl ReqwestHttpClient {
         let headers = std::mem::take(response.headers_mut());
 
         let status = response.status();
+
+        // Download the body.
         let data = if let Some(timeout) = self.response_body_chunk_timeout {
+            // Download the body with a chunk timeout.
+            // The timeout prevents long stalls.
+
             let mut stream = response.bytes_stream();
             let mut buf = Vec::new();
-            while let Some(chunk) = tokio::time::timeout(timeout, stream.try_next()).await?? {
-                buf.extend_from_slice(&chunk);
+
+            // Creating tokio timeouts has overhead, so instead of a fresh
+            // timeout per chunk a shared timeout is used, and a chunk counter
+            // is kept. Only if no chunk was downloaded within the timeout a
+            // timeout error is raised.
+            'OUTER: loop {
+                let timeout = tokio::time::sleep(timeout);
+                pin_utils::pin_mut!(timeout);
+
+                let mut chunk_count = 0;
+
+                loop {
+                    tokio::select! {
+                        // Biased because the timeout is secondary,
+                        // and chunks should always have priority.
+                        biased;
+
+                        res = stream.try_next() => {
+                            match res {
+                                Ok(Some(chunk)) => {
+                                    buf.extend_from_slice(&chunk);
+                                    chunk_count += 1;
+                                }
+                                Ok(None) => {
+                                    break 'OUTER;
+                                }
+                                Err(e) => {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+
+                        _ = &mut timeout => {
+                            if chunk_count == 0 {
+                                return Err(anyhow::anyhow!("Timeout while downloading response body"));
+                            } else {
+                                // Timeout, but chunks were still downloaded, so
+                                // just continue with a fresh timeout.
+                                continue 'OUTER;
+                            }
+                        }
+                    }
+                }
             }
+
             buf
         } else {
             response.bytes().await?.to_vec()
@@ -92,5 +141,15 @@ impl super::HttpClient for ReqwestHttpClient {
         let client = self.clone();
         let f = async move { client.request(request).await };
         Box::pin(f)
+    }
+}
+
+pub fn get_proxy() -> Result<Option<reqwest::Proxy>, anyhow::Error> {
+    if let Ok(scheme) = env::var("http_proxy").or_else(|_| env::var("HTTP_PROXY")) {
+        let proxy = reqwest::Proxy::all(scheme)?;
+
+        Ok(Some(proxy))
+    } else {
+        Ok(None)
     }
 }

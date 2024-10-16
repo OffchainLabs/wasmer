@@ -105,6 +105,11 @@ impl LogFileJournal {
         Self::from_file(file)
     }
 
+    pub fn new_readonly(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let file = std::fs::File::options().read(true).open(path)?;
+        Self::from_file(file)
+    }
+
     pub fn owned_buffer(&self) -> OwnedBuffer {
         self.rx.owned_buffer()
     }
@@ -145,7 +150,9 @@ impl LogFileJournal {
     }
 
     /// Create a new journal from a buffer
-    pub fn from_buffer(buffer: OwnedBuffer) -> RecombinedJournal {
+    pub fn from_buffer(
+        buffer: OwnedBuffer,
+    ) -> RecombinedJournal<UnsupportedJournal, LogFileJournalRx> {
         // Create the rx
         let rx = LogFileJournalRx {
             tx: None,
@@ -158,7 +165,7 @@ impl LogFileJournal {
         let tx = UnsupportedJournal::default();
 
         // Now recombine
-        RecombinedJournal::new(Box::new(tx), Box::new(rx))
+        RecombinedJournal::new(tx, rx)
     }
 }
 
@@ -197,6 +204,12 @@ impl WritableJournal for LogFileJournalTx {
             record_start: offset_start,
             record_end: offset_end,
         })
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.file.flush()?;
+        Ok(())
     }
 }
 
@@ -287,6 +300,18 @@ impl ReadableJournal for LogFileJournalRx {
 impl WritableJournal for LogFileJournal {
     fn write<'a>(&'a self, entry: JournalEntry<'a>) -> anyhow::Result<LogWriteResult> {
         self.tx.write(entry)
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        self.tx.flush()
+    }
+
+    fn commit(&self) -> anyhow::Result<usize> {
+        self.tx.commit()
+    }
+
+    fn rollback(&self) -> anyhow::Result<usize> {
+        self.tx.rollback()
     }
 }
 

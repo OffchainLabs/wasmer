@@ -4,12 +4,13 @@ use std::{
 };
 
 use super::*;
+use lz4_flex::compress_prepend_size;
 use rkyv::ser::serializers::{
     AllocScratch, CompositeSerializer, SharedSerializeMap, WriteSerializer,
 };
 use wasmer_wasix_types::wasi;
 
-pub fn run_test<'a>(record: JournalEntry<'a>) {
+pub fn run_test(record: JournalEntry<'_>) {
     tracing::info!("record: {:?}", record);
 
     // Determine the record type
@@ -49,7 +50,7 @@ pub fn run_test<'a>(record: JournalEntry<'a>) {
 #[test]
 pub fn test_record_init_module() {
     run_test(JournalEntry::InitModuleV1 {
-        wasm_hash: [13u8; 8],
+        wasm_hash: Box::new([13u8; 8]),
     });
 }
 
@@ -115,7 +116,7 @@ pub fn test_record_descriptor_write() {
 pub fn test_record_update_memory() {
     run_test(JournalEntry::UpdateMemoryRegionV1 {
         region: 76u64..8237453u64,
-        data: [74u8; 40960].to_vec().into(),
+        compressed_data: compress_prepend_size(&[74u8; 40960]).into(),
     });
 }
 
@@ -400,7 +401,7 @@ pub fn test_record_addr_clear() {
 pub fn test_record_port_bridge() {
     run_test(JournalEntry::PortBridgeV1 {
         network: "mynetwork".into(),
-        token: format!("blh blah").into(),
+        token: "blh blah".to_string().into(),
         security: JournalStreamSecurityV1::ClassicEncryption.into(),
     });
 }
@@ -511,8 +512,8 @@ pub fn test_record_socket_accepted() {
 pub fn test_record_socket_join_ipv4_multicast() {
     run_test(JournalEntry::SocketJoinIpv4MulticastV1 {
         fd: 12,
-        multiaddr: Ipv4Addr::new(123, 123, 123, 123).into(),
-        iface: Ipv4Addr::new(128, 0, 0, 1).into(),
+        multiaddr: Ipv4Addr::new(123, 123, 123, 123),
+        iface: Ipv4Addr::new(128, 0, 0, 1),
     });
 }
 
@@ -521,7 +522,7 @@ pub fn test_record_socket_join_ipv4_multicast() {
 pub fn test_record_socket_join_ipv6_multicast() {
     run_test(JournalEntry::SocketJoinIpv6MulticastV1 {
         fd: 12,
-        multi_addr: Ipv6Addr::new(123, 123, 123, 123, 1234, 12663, 31, 1324).into(),
+        multi_addr: Ipv6Addr::new(123, 123, 123, 123, 1234, 12663, 31, 1324),
         iface: 23541,
     });
 }
@@ -531,8 +532,8 @@ pub fn test_record_socket_join_ipv6_multicast() {
 pub fn test_record_socket_leave_ipv4_multicast() {
     run_test(JournalEntry::SocketLeaveIpv4MulticastV1 {
         fd: 12,
-        multi_addr: Ipv4Addr::new(123, 123, 123, 123).into(),
-        iface: Ipv4Addr::new(128, 0, 0, 1).into(),
+        multi_addr: Ipv4Addr::new(123, 123, 123, 123),
+        iface: Ipv4Addr::new(128, 0, 0, 1),
     });
 }
 
@@ -541,7 +542,7 @@ pub fn test_record_socket_leave_ipv4_multicast() {
 pub fn test_record_socket_leave_ipv6_multicast() {
     run_test(JournalEntry::SocketLeaveIpv6MulticastV1 {
         fd: 12,
-        multi_addr: Ipv6Addr::new(123, 123, 123, 123, 1234, 12663, 31, 1324).into(),
+        multi_addr: Ipv6Addr::new(123, 123, 123, 123, 1234, 12663, 31, 1324),
         iface: 23541,
     });
 }

@@ -11,7 +11,7 @@
 //! the WASI module permission to access.
 //!
 //! You can implement `VirtualFile` for your own types to get custom behavior and extend WASI, see the
-//! [WASI plugin example](https://github.com/wasmerio/wasmer/blob/master/examples/plugin.rs).
+//! [WASI plugin example](https://github.com/wasmerio/wasmer/blob/main/examples/plugin.rs).
 
 #![allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 
@@ -53,6 +53,7 @@ pub(crate) use handles::*;
 /// all the rights enabled
 pub const ALL_RIGHTS: Rights = Rights::all();
 
+#[allow(dead_code)]
 struct WasiStateOpener {
     root_fs: WasiFsRoot,
 }

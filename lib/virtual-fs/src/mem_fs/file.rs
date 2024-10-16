@@ -144,6 +144,27 @@ impl VirtualFile for FileHandle {
         node.metadata().created
     }
 
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> crate::Result<()> {
+        let mut fs = match self.filesystem.inner.write() {
+            Ok(fs) => fs,
+            _ => return Err(crate::FsError::Lock),
+        };
+
+        let inode = fs.storage.get_mut(self.inode);
+        if let Some(node) = inode {
+            if let Some(atime) = atime {
+                node.metadata_mut().accessed = atime;
+            }
+            if let Some(mtime) = mtime {
+                node.metadata_mut().modified = mtime;
+            }
+
+            return Ok(());
+        }
+
+        Err(crate::FsError::UnknownError)
+    }
+
     fn size(&self) -> u64 {
         let fs = match self.filesystem.inner.read() {
             Ok(fs) => fs,
@@ -1358,7 +1379,7 @@ mod test_read_write_seek {
 
         let mut buffer = [0; 16];
         assert!(
-            matches!(file.read_exact(&mut buffer).await, Err(_)),
+            file.read_exact(&mut buffer).await.is_err(),
             "failing to read an exact buffer",
         );
 
@@ -1369,7 +1390,7 @@ mod test_read_write_seek {
 
         let mut buffer = [0; 3];
         assert!(
-            matches!(file.read_exact(&mut buffer).await, Ok(_)),
+            file.read_exact(&mut buffer).await.is_ok(),
             "failing to read an exact buffer",
         );
     }

@@ -94,7 +94,10 @@ pub(crate) use self::types::{
     },
     *,
 };
-use self::{state::WasiInstanceGuardMemory, utils::WasiDummyWaker};
+use self::{
+    state::{conv_env_vars, WasiInstanceGuardMemory},
+    utils::WasiDummyWaker,
+};
 pub(crate) use crate::os::task::{
     process::{WasiProcessId, WasiProcessWait},
     thread::{WasiThread, WasiThreadId},
@@ -193,7 +196,10 @@ pub(crate) fn copy_from_slice<M: MemorySize>(
             break;
         }
         let (left, right) = read_loc.split_at(to_read);
-        buf.copy_from_slice(left);
+        let amt = buf.copy_from_slice_min(left);
+        if amt != to_read {
+            return Ok(bytes_read + amt);
+        }
 
         read_loc = right;
         bytes_read += to_read;
@@ -358,7 +364,6 @@ struct AsyncifyPoller<'a, 'b, 'c, T, Fut>
 where
     Fut: Future<Output = T> + Send + Sync + 'static,
 {
-    process_signals: bool,
     ctx: &'b mut FunctionEnvMut<'c, WasiEnv>,
     work: &'a mut Pin<Box<Fut>>,
 }
@@ -380,18 +385,37 @@ where
                 Errno::Child.into()
             }))));
         }
-        if self.process_signals && env.thread.has_signals_or_subscribe(cx.waker()) {
-            let signals = env.thread.signals().lock().unwrap();
-            for sig in signals.0.iter() {
-                if *sig == Signal::Sigint
-                    || *sig == Signal::Sigquit
-                    || *sig == Signal::Sigkill
-                    || *sig == Signal::Sigabrt
-                {
-                    let exit_code = env.thread.set_or_get_exit_code_for_signal(*sig);
-                    return Poll::Ready(Err(WasiError::Exit(exit_code)));
+        if env.thread.has_signals_or_subscribe(cx.waker()) {
+            let has_exit = {
+                let signals = env.thread.signals().lock().unwrap();
+                signals
+                    .0
+                    .iter()
+                    .filter_map(|sig| {
+                        if *sig == Signal::Sigint
+                            || *sig == Signal::Sigquit
+                            || *sig == Signal::Sigkill
+                            || *sig == Signal::Sigabrt
+                        {
+                            Some(env.thread.set_or_get_exit_code_for_signal(*sig))
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+            };
+
+            return match WasiEnv::process_signals_and_exit(self.ctx) {
+                Ok(Ok(_)) => {
+                    if let Some(exit_code) = has_exit {
+                        Poll::Ready(Err(WasiError::Exit(exit_code)))
+                    } else {
+                        Poll::Pending
+                    }
                 }
-            }
+                Ok(Err(err)) => Poll::Ready(Err(WasiError::Exit(ExitCode::Errno(err)))),
+                Err(err) => Poll::Ready(Err(err)),
+            };
         }
         Poll::Pending
     }
@@ -465,13 +489,6 @@ where
         false => Duration::from_millis(50),
     };
 
-    // Determine if we should process signals or now
-    let process_signals = ctx
-        .data()
-        .try_inner()
-        .map(|i| !i.signal_set)
-        .unwrap_or(true);
-
     // Box up the trigger
     let mut trigger = Box::pin(work);
 
@@ -498,7 +515,6 @@ where
         Ok(tokio::select! {
             // Inner wait with finializer
             res = AsyncifyPoller {
-                process_signals,
                 ctx: &mut ctx,
                 work: &mut trigger,
             } => {
@@ -760,7 +776,7 @@ pub(crate) fn __sock_upgrade<'a, F, Fut>(
     actor: F,
 ) -> Result<(), Errno>
 where
-    F: FnOnce(crate::net::socket::InodeSocket) -> Fut,
+    F: FnOnce(crate::net::socket::InodeSocket, Fdflags) -> Fut,
     Fut: std::future::Future<Output = Result<Option<crate::net::socket::InodeSocket>, Errno>> + 'a,
 {
     let env = ctx.data();
@@ -786,7 +802,7 @@ where
                 drop(guard);
 
                 // Start the work using the socket
-                let work = actor(socket);
+                let work = actor(socket, fd_entry.flags);
 
                 // Block on the work and process it
                 let res = InlineWaker::block_on(work);
@@ -1142,9 +1158,7 @@ where
         unwind_pointer + (std::mem::size_of::<__wasi_asyncify_t<M::Offset>>() as u64);
     let unwind_data = __wasi_asyncify_t::<M::Offset> {
         start: wasi_try_ok!(unwind_data_start.try_into().map_err(|_| Errno::Overflow)),
-        end: wasi_try_ok!(env
-            .layout
-            .stack_upper
+        end: wasi_try_ok!((env.layout.stack_upper - memory_stack.len() as u64)
             .try_into()
             .map_err(|_| Errno::Overflow)),
     };
@@ -1376,7 +1390,7 @@ pub fn rewind_ext2(
 
         if errno != Errno::Success {
             let exit_code = ExitCode::from(errno);
-            ctx.data().on_exit(Some(exit_code));
+            ctx.data().blocking_on_exit(Some(exit_code));
             return Err(exit_code);
         }
     }
@@ -1473,12 +1487,48 @@ where
 }
 
 // Function to prepare the WASI environment
-pub(crate) fn _prepare_wasi(wasi_env: &mut WasiEnv, args: Option<Vec<String>>) {
+pub(crate) fn _prepare_wasi(
+    wasi_env: &mut WasiEnv,
+    args: Option<Vec<String>>,
+    envs: Option<Vec<(String, String)>>,
+) {
     // Swap out the arguments with the new ones
     if let Some(args) = args {
         let mut wasi_state = wasi_env.state.fork();
         wasi_state.args = args;
         wasi_env.state = Arc::new(wasi_state);
+    }
+
+    // Update the env vars
+    if let Some(envs) = envs {
+        let mut guard = wasi_env.state.envs.lock().unwrap();
+
+        let mut existing_envs = guard
+            .iter()
+            .map(|b| {
+                let string = String::from_utf8_lossy(b);
+                let (key, val) = string.split_once('=').expect("env var is malformed");
+
+                (key.to_string(), val.to_string().as_bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+
+        for (key, val) in envs {
+            let val = val.as_bytes().to_vec();
+            match existing_envs
+                .iter_mut()
+                .find(|(existing_key, _)| existing_key == &key)
+            {
+                Some((_, existing_val)) => *existing_val = val,
+                None => existing_envs.push((key, val)),
+            }
+        }
+
+        let envs = conv_env_vars(existing_envs);
+
+        *guard = envs;
+
+        drop(guard)
     }
 
     // Close any files after the STDERR that are not preopened
@@ -1507,8 +1557,8 @@ pub(crate) fn _prepare_wasi(wasi_env: &mut WasiEnv, args: Option<Vec<String>>) {
 pub(crate) fn conv_spawn_err_to_errno(err: &SpawnError) -> Errno {
     match err {
         SpawnError::AccessDenied => Errno::Access,
-        SpawnError::NotFound => Errno::Noent,
         SpawnError::Unsupported => Errno::Noexec,
+        _ if err.is_not_found() => Errno::Noent,
         _ => Errno::Inval,
     }
 }

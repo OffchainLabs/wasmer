@@ -11,7 +11,7 @@
 //! Wasm functions.
 //!
 //! See `state` for the experimental WASI FS API.  Also see the
-//! [WASI plugin example](https://github.com/wasmerio/wasmer/blob/master/examples/plugin.rs)
+//! [WASI plugin example](https://github.com/wasmerio/wasmer/blob/main/examples/plugin.rs)
 //! for an example of how to extend WASI using the WASI FS API.
 
 #[cfg(all(not(feature = "sys"), not(feature = "js")))]
@@ -137,9 +137,14 @@ pub enum SpawnError {
     /// Failed to fetch the Wasmer process
     #[error("fetch failed")]
     FetchFailed,
+    #[error(transparent)]
+    CacheError(crate::runtime::module_cache::CacheError),
     /// Failed to compile the Wasmer process
-    #[error("compile error")]
-    CompileError,
+    #[error("compile error: {error:?}")]
+    CompileError {
+        module_hash: wasmer_types::ModuleHash,
+        error: wasmer::CompileError,
+    },
     /// Invalid ABI
     #[error("Wasmer process has an invalid ABI")]
     InvalidABI,
@@ -150,8 +155,18 @@ pub enum SpawnError {
     #[error("unsupported")]
     Unsupported,
     /// Not found
-    #[error("not found")]
-    NotFound,
+    #[error("not found: {message}")]
+    NotFound { message: String },
+    /// Tried to run the specified binary as a new WASI thread/process, but
+    /// the binary name was not found.
+    #[error("could not find binary '{binary}'")]
+    BinaryNotFound { binary: String },
+    #[error("could not find an entrypoint in the package '{package_id}'")]
+    MissingEntrypoint {
+        package_id: wasmer_config::package::PackageId,
+    },
+    #[error("could not load ")]
+    ModuleLoad { message: String },
     /// Bad request
     #[error("bad request")]
     BadRequest,
@@ -162,8 +177,8 @@ pub enum SpawnError {
     #[error("internal error")]
     InternalError,
     /// An error occurred while preparing the file system
-    #[error("file system error")]
-    FileSystemError,
+    #[error(transparent)]
+    FileSystemError(ExtendedFsError),
     /// Memory allocation failed
     #[error("memory allocation failed")]
     MemoryAllocationFailed,
@@ -179,13 +194,53 @@ pub enum SpawnError {
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
+#[derive(Debug)]
+pub struct ExtendedFsError {
+    pub error: virtual_fs::FsError,
+    pub message: Option<String>,
+}
+
+impl ExtendedFsError {
+    pub fn with_msg(error: virtual_fs::FsError, msg: impl Into<String>) -> Self {
+        Self {
+            error,
+            message: Some(msg.into()),
+        }
+    }
+
+    pub fn new(error: virtual_fs::FsError) -> Self {
+        Self {
+            error,
+            message: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExtendedFsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "fs error: {}", self.error)?;
+
+        if let Some(msg) = &self.message {
+            write!(f, " | {}", msg)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl std::error::Error for ExtendedFsError {
+    fn cause(&self) -> Option<&dyn std::error::Error> {
+        Some(&self.error)
+    }
+}
+
 impl SpawnError {
     /// Returns `true` if the spawn error is [`NotFound`].
     ///
     /// [`NotFound`]: SpawnError::NotFound
     #[must_use]
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::NotFound)
+        matches!(self, Self::NotFound { .. } | Self::MissingEntrypoint { .. })
     }
 }
 
@@ -295,14 +350,25 @@ pub fn generate_import_object_from_env(
     ctx: &FunctionEnv<WasiEnv>,
     version: WasiVersion,
 ) -> Imports {
-    match version {
+    let mut imports = match version {
         WasiVersion::Snapshot0 => generate_import_object_snapshot0(store, ctx),
         WasiVersion::Snapshot1 | WasiVersion::Latest => {
             generate_import_object_snapshot1(store, ctx)
         }
         WasiVersion::Wasix32v1 => generate_import_object_wasix32_v1(store, ctx),
         WasiVersion::Wasix64v1 => generate_import_object_wasix64_v1(store, ctx),
-    }
+    };
+
+    let exports_wasi_generic = wasi_exports_generic(store, ctx);
+
+    #[allow(unused_mut)]
+    let mut imports_wasi_generic = imports! {
+        "wasi" => exports_wasi_generic,
+    };
+
+    imports.extend(&imports_wasi_generic);
+
+    imports
 }
 
 fn wasi_exports_generic(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
@@ -476,6 +542,7 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "proc_join" => Function::new_typed_with_env(&mut store, env, proc_join::<Memory32>),
         "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal::<Memory32>),
         "proc_exec" => Function::new_typed_with_env(&mut store, env, proc_exec::<Memory32>),
+        "proc_exec2" => Function::new_typed_with_env(&mut store, env, proc_exec2::<Memory32>),
         "proc_raise" => Function::new_typed_with_env(&mut store, env, proc_raise),
         "proc_raise_interval" => Function::new_typed_with_env(&mut store, env, proc_raise_interval),
         "proc_spawn" => Function::new_typed_with_env(&mut store, env, proc_spawn::<Memory32>),
@@ -597,6 +664,7 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "proc_join" => Function::new_typed_with_env(&mut store, env, proc_join::<Memory64>),
         "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal::<Memory64>),
         "proc_exec" => Function::new_typed_with_env(&mut store, env, proc_exec::<Memory64>),
+        "proc_exec2" => Function::new_typed_with_env(&mut store, env, proc_exec2::<Memory64>),
         "proc_raise" => Function::new_typed_with_env(&mut store, env, proc_raise),
         "proc_raise_interval" => Function::new_typed_with_env(&mut store, env, proc_raise_interval),
         "proc_spawn" => Function::new_typed_with_env(&mut store, env, proc_spawn::<Memory64>),

@@ -13,11 +13,12 @@ use crate::{
     capabilities::Capabilities,
     journal::{DynJournal, SnapshotTrigger},
     runners::{wasi_common::CommonWasiOptions, MappedDirectory, MountedDirectory},
-    runtime::{module_cache::ModuleHash, task_manager::VirtualTaskManagerExt},
+    runtime::task_manager::VirtualTaskManagerExt,
     Runtime, WasiEnvBuilder, WasiError, WasiRuntimeError,
 };
+use wasmer_types::ModuleHash;
 
-use super::wasi_common::MappedCommand;
+use super::wasi_common::{MappedCommand, MAPPED_CURRENT_DIR_DEFAULT_PATH};
 
 #[derive(Debug, Default, Clone)]
 pub struct WasiRunner {
@@ -77,6 +78,16 @@ impl WasiRunner {
         D: Into<MappedDirectory>,
     {
         self.with_mounted_directories(dirs.into_iter().map(Into::into).map(MountedDirectory::from))
+    }
+
+    pub fn with_home_mapped(&mut self, is_home_mapped: bool) -> &mut Self {
+        self.wasi.is_home_mapped = is_home_mapped;
+        self
+    }
+
+    pub fn with_tmp_mapped(&mut self, is_tmp_mapped: bool) -> &mut Self {
+        self.wasi.is_tmp_mapped = is_tmp_mapped;
+        self
     }
 
     pub fn with_mounted_directories<I, D>(&mut self, dirs: I) -> &mut Self
@@ -231,6 +242,7 @@ impl WasiRunner {
         let container_fs = if let Some(pkg) = pkg {
             builder.add_webc(pkg.clone());
             builder.set_module_hash(pkg.hash());
+            builder.include_packages(pkg.package_ids.clone());
             Some(Arc::clone(&pkg.webc_fs))
         } else {
             None
@@ -249,6 +261,10 @@ impl WasiRunner {
             builder.set_stderr(Box::new(stderr.clone()));
         }
 
+        if self.wasi.is_home_mapped {
+            builder.set_current_dir(MAPPED_CURRENT_DIR_DEFAULT_PATH);
+        }
+
         Ok(builder)
     }
 
@@ -262,12 +278,38 @@ impl WasiRunner {
     ) -> Result<(), Error> {
         let wasi = webc::metadata::annotations::Wasi::new(program_name);
         let mut store = runtime.new_store();
-        let env = self.prepare_webc_env(program_name, &wasi, None, runtime, None)?;
+
+        let mut builder = self.prepare_webc_env(program_name, &wasi, None, runtime, None)?;
+
+        #[cfg(feature = "ctrlc")]
+        {
+            builder = builder.attach_ctrl_c();
+        }
+
+        #[cfg(feature = "journal")]
+        {
+            for trigger in self.wasi.snapshot_on.iter().cloned() {
+                builder.add_snapshot_trigger(trigger);
+            }
+            if self.wasi.snapshot_on.is_empty() && !self.wasi.journals.is_empty() {
+                for on in crate::journal::DEFAULT_SNAPSHOT_TRIGGERS {
+                    builder.add_snapshot_trigger(on);
+                }
+            }
+            if let Some(period) = self.wasi.snapshot_interval {
+                if self.wasi.journals.is_empty() {
+                    return Err(anyhow::format_err!(
+                            "If you specify a snapshot interval then you must also specify a journal file"
+                        ));
+                }
+                builder.with_snapshot_interval(period);
+            }
+        }
 
         if asyncify {
-            env.run_with_store_async(module.clone(), module_hash, store)?;
+            builder.run_with_store_async(module.clone(), module_hash, store)?;
         } else {
-            env.run_with_store_ext(module.clone(), module_hash, &mut store)?;
+            builder.run_with_store_ext(module.clone(), module_hash, &mut store)?;
         }
 
         Ok(())
@@ -310,6 +352,10 @@ impl crate::runners::Runner for WasiRunner {
             for snapshot_trigger in self.wasi.snapshot_on.iter().cloned() {
                 env.add_snapshot_trigger(snapshot_trigger);
             }
+        }
+
+        if let Some(cwd) = &wasi.cwd {
+            env.set_current_dir(cwd);
         }
 
         let env = env.build()?;

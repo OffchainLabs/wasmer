@@ -1,15 +1,15 @@
 //! Show logs for an Edge app.
 
-use comfy_table::Table;
+use colored::Colorize;
+use comfy_table::{Cell, Table};
 use edge_schema::pretty_duration::parse_timestamp_or_relative_time;
 use futures::StreamExt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use wasmer_api::types::{Log, LogStream};
 
-use crate::{
-    opts::{ApiOpts, ListFormatOpts},
-    utils::{render::CliRender, Identifier},
-};
+use crate::{config::WasmerEnv, opts::ListFormatOpts, utils::render::CliRender};
+
+use super::util::AppIdentOpts;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
 pub enum LogStreamArg {
@@ -17,11 +17,12 @@ pub enum LogStreamArg {
     Stderr,
 }
 
-/// Show an app.
+/// Retrieve the logs of an app
 #[derive(clap::Parser, Debug)]
 pub struct CmdAppLogs {
     #[clap(flatten)]
-    api: ApiOpts,
+    env: WasmerEnv,
+
     #[clap(flatten)]
     fmt: ListFormatOpts,
 
@@ -36,7 +37,7 @@ pub struct CmdAppLogs {
     /// * Unix timestamp (`1136196245`)
     /// * Relative time (`10m` / `-1h`, `1d1h30s`)
     // TODO: should default to trailing logs once trailing is implemented.
-    #[clap(long, value_parser = parse_timestamp_or_relative_time)]
+    #[clap(long, value_parser = parse_timestamp_or_relative_time, conflicts_with = "request_id")]
     from: Option<OffsetDateTime>,
 
     /// The date of the latest log entry.
@@ -47,7 +48,7 @@ pub struct CmdAppLogs {
     /// * Simple date (`2022-11-11`)
     /// * Unix timestamp (`1136196245`)
     /// * Relative time (`10m` / `1h`, `1d1h30s`)
-    #[clap(long, value_parser = parse_timestamp_or_relative_time)]
+    #[clap(long, value_parser = parse_timestamp_or_relative_time, conflicts_with = "request_id")]
     until: Option<OffsetDateTime>,
 
     /// Maximum log lines to fetch.
@@ -55,20 +56,25 @@ pub struct CmdAppLogs {
     #[clap(long, default_value = "1000")]
     max: usize,
 
+    /// Continuously watch for new logs and display them in real-time.
     #[clap(long, default_value = "false")]
     watch: bool,
-
-    /// The name of the app.
-    ///
-    /// Eg:
-    /// - name (assumes current user)
-    /// - namespace/name
-    /// - namespace/name@version
-    ident: Identifier,
 
     /// Streams of logs to display
     #[clap(long, value_delimiter = ',', value_enum)]
     streams: Option<Vec<LogStreamArg>>,
+
+    #[clap(flatten)]
+    #[allow(missing_docs)]
+    pub ident: AppIdentOpts,
+
+    /// The identifier of the request to show logs related to
+    #[clap(long)]
+    pub request_id: Option<String>,
+
+    /// The identifier of the app instance to show logs related to
+    #[clap(long, conflicts_with = "request_id", value_delimiter = ' ', num_args = 1..)]
+    pub instance_id: Option<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -76,30 +82,18 @@ impl crate::commands::AsyncCliCommand for CmdAppLogs {
     type Output = ();
 
     async fn run_async(self) -> Result<(), anyhow::Error> {
-        let client = self.api.client()?;
+        let client = self.env.client()?;
 
-        let Identifier {
-            name,
-            owner,
-            version,
-        } = &self.ident;
-
-        let owner = match owner {
-            Some(owner) => owner.to_string(),
-            None => {
-                let user = wasmer_api::query::current_user_with_namespaces(&client, None).await?;
-                user.username
-            }
-        };
+        let (_ident, app) = self.ident.load_app(&client).await?;
 
         let from = self
             .from
             .unwrap_or_else(|| OffsetDateTime::now_utc() - time::Duration::minutes(10));
 
         tracing::info!(
-            package.name=%self.ident.name,
-            package.owner=%owner,
-            package.version=self.ident.version.as_deref(),
+            app.name=%app.name,
+            app.owner=%app.owner.global_name,
+            app.version=app.active_version.version,
             range.start=%from,
             range.end=self.until.map(|ts| ts.to_string()),
             "Fetching logs",
@@ -129,38 +123,110 @@ impl crate::commands::AsyncCliCommand for CmdAppLogs {
             (false, true) => &[LogStream::Stderr][..],
         });
 
-        let logs_stream = wasmer_api::query::get_app_logs_paginated(
-            &client,
-            name.clone(),
-            owner.to_string(),
-            version.clone(),
-            from,
-            self.until,
-            self.watch,
-            Some(streams),
-        )
-        .await;
+        // Code duplication to avoid a dependency to `OR` streams.
+        if let Some(instance_id) = &self.instance_id {
+            let logs_stream = wasmer_api::query::get_app_logs_paginated_filter_instance(
+                &client,
+                app.name.clone(),
+                app.owner.global_name.to_string(),
+                None, // keep version None since we want logs from all versions atm
+                from,
+                self.until,
+                self.watch,
+                Some(streams),
+                instance_id.clone(),
+            )
+            .await;
 
-        let mut logs_stream = std::pin::pin!(logs_stream);
+            let mut logs_stream = std::pin::pin!(logs_stream);
+            let mut rem = self.max;
 
-        let mut rem = self.max;
+            while let Some(logs) = logs_stream.next().await {
+                let mut logs = logs?;
 
-        while let Some(logs) = logs_stream.next().await {
-            let mut logs = logs?;
+                let limit = std::cmp::min(logs.len(), rem);
 
-            let limit = std::cmp::min(logs.len(), rem);
+                let logs: Vec<_> = logs.drain(..limit).collect();
 
-            let logs: Vec<_> = logs.drain(..limit).collect();
+                if !logs.is_empty() {
+                    let rendered = self.fmt.format.render(&logs);
+                    println!("{rendered}");
 
-            if !logs.is_empty() {
-                let rendered = self.fmt.format.render(&logs);
-                println!("{rendered}");
+                    rem -= limit;
+                }
 
-                rem -= limit;
+                if !self.watch || rem == 0 {
+                    break;
+                }
             }
+        } else if let Some(request_id) = &self.request_id {
+            let logs_stream = wasmer_api::query::get_app_logs_paginated_filter_request(
+                &client,
+                app.name.clone(),
+                app.owner.global_name.to_string(),
+                None, // keep version None since we want logs from all versions atm
+                from,
+                self.until,
+                self.watch,
+                Some(streams),
+                request_id.clone(),
+            )
+            .await;
 
-            if !self.watch || rem == 0 {
-                break;
+            let mut logs_stream = std::pin::pin!(logs_stream);
+            let mut rem = self.max;
+
+            while let Some(logs) = logs_stream.next().await {
+                let mut logs = logs?;
+
+                let limit = std::cmp::min(logs.len(), rem);
+
+                let logs: Vec<_> = logs.drain(..limit).collect();
+
+                if !logs.is_empty() {
+                    let rendered = self.fmt.format.render(&logs);
+                    println!("{rendered}");
+
+                    rem -= limit;
+                }
+
+                if !self.watch || rem == 0 {
+                    break;
+                }
+            }
+        } else {
+            let logs_stream = wasmer_api::query::get_app_logs_paginated(
+                &client,
+                app.name.clone(),
+                app.owner.global_name.to_string(),
+                None, // keep version None since we want logs from all versions atm
+                from,
+                self.until,
+                self.watch,
+                Some(streams),
+            )
+            .await;
+
+            let mut logs_stream = std::pin::pin!(logs_stream);
+            let mut rem = self.max;
+
+            while let Some(logs) = logs_stream.next().await {
+                let mut logs = logs?;
+
+                let limit = std::cmp::min(logs.len(), rem);
+
+                let logs: Vec<_> = logs.drain(..limit).collect();
+
+                if !logs.is_empty() {
+                    let rendered = self.fmt.format.render(&logs);
+                    println!("{rendered}");
+
+                    rem -= limit;
+                }
+
+                if !self.watch || rem == 0 {
+                    break;
+                }
             }
         }
 
@@ -171,8 +237,10 @@ impl crate::commands::AsyncCliCommand for CmdAppLogs {
 impl CliRender for Log {
     fn render_item_table(&self) -> String {
         let mut table = Table::new();
-
-        let Log { message, timestamp } = self;
+        // remove all borders from the table
+        let Log {
+            message, timestamp, ..
+        }: &Log = self;
 
         table.add_rows([
             vec![
@@ -186,12 +254,26 @@ impl CliRender for Log {
 
     fn render_list_table(items: &[Self]) -> String {
         let mut table = Table::new();
-        table.set_header(vec!["Timestamp".to_string(), "Message".to_string()]);
+        // table.set_header(vec!["Timestamp".to_string(), "Message".to_string()]);
+        table.load_preset(comfy_table::presets::NOTHING);
+        table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
 
         for item in items {
+            let mut message = item.message.clone().bold();
+            if let Some(stream) = item.stream {
+                message = match stream {
+                    LogStream::Stdout => message,
+                    LogStream::Stderr => message.yellow(),
+                    LogStream::Runtime => message.cyan(),
+                };
+            }
             table.add_row([
-                datetime_from_unix(item.timestamp).format(&Rfc3339).unwrap(),
-                item.message.clone(),
+                Cell::new(format!(
+                    "[{}]",
+                    datetime_from_unix(item.timestamp).format(&Rfc3339).unwrap()
+                ))
+                .set_alignment(comfy_table::CellAlignment::Right),
+                Cell::new(message),
             ]);
         }
         table.to_string()
