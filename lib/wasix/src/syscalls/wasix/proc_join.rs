@@ -38,6 +38,8 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
 ) -> Result<Errno, WasiError> {
     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
 
+    ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
     // This lambda will look at what we wrote in the status variable
     // and use this to determine the return code sent back to the caller
     let ret_result = {
@@ -114,33 +116,27 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     let pid = match option_pid {
         None => {
             let mut process = ctx.data_mut().process.clone();
-            let pid_ptr = pid_ptr;
-            let status_ptr = status_ptr;
 
             // We wait for any process to exit (if it takes too long
             // then we go into a deep sleep)
-            let res = __asyncify_with_deep_sleep::<M, _, _>(
-                ctx,
-                Duration::from_millis(50),
-                async move {
-                    let child_exit = process.join_any_child().await;
-                    match child_exit {
-                        Ok(Some((pid, exit_code))) => {
-                            tracing::trace!(%pid, %exit_code, "triggered child join");
-                            trace!(ret_id = pid.raw(), exit_code = exit_code.raw());
-                            JoinStatusResult::ExitNormal(pid, exit_code)
-                        }
-                        Ok(None) => {
-                            tracing::trace!("triggered child join (no child)");
-                            JoinStatusResult::Err(Errno::Child)
-                        }
-                        Err(err) => {
-                            tracing::trace!(%err, "error triggered on child join");
-                            JoinStatusResult::Err(err)
-                        }
+            let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+                let child_exit = process.join_any_child().await;
+                match child_exit {
+                    Ok(Some((pid, exit_code))) => {
+                        tracing::trace!(%pid, %exit_code, "triggered child join");
+                        trace!(ret_id = pid.raw(), exit_code = exit_code.raw());
+                        JoinStatusResult::ExitNormal(pid, exit_code)
                     }
-                },
-            )?;
+                    Ok(None) => {
+                        tracing::trace!("triggered child join (no child)");
+                        JoinStatusResult::Err(Errno::Child)
+                    }
+                    Err(err) => {
+                        tracing::trace!(%err, "error triggered on child join");
+                        JoinStatusResult::Err(err)
+                    }
+                }
+            })?;
             return match res {
                 AsyncifyAction::Finish(ctx, result) => ret_result(ctx, result),
                 AsyncifyAction::Unwind => Ok(Errno::Success),
@@ -155,7 +151,7 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     // Waiting for a process that is an explicit child will join it
     // meaning it will no longer be a sub-process of the main process
     let mut process = {
-        let mut inner = ctx.data().process.inner.write().unwrap();
+        let mut inner = ctx.data().process.lock();
         let process = inner
             .children
             .iter()
@@ -192,15 +188,11 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
         } else {
             // Wait for the process to finish
             let process2 = process.clone();
-            let res = __asyncify_with_deep_sleep::<M, _, _>(
-                ctx,
-                Duration::from_millis(50),
-                async move {
-                    let exit_code = process.join().await.unwrap_or_else(|_| Errno::Child.into());
-                    tracing::trace!(%exit_code, "triggered child join");
-                    JoinStatusResult::ExitNormal(pid, exit_code)
-                },
-            )?;
+            let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+                let exit_code = process.join().await.unwrap_or_else(|_| Errno::Child.into());
+                tracing::trace!(%exit_code, "triggered child join");
+                JoinStatusResult::ExitNormal(pid, exit_code)
+            })?;
             match res {
                 AsyncifyAction::Finish(ctx, result) => ret_result(ctx, result),
                 AsyncifyAction::Unwind => Ok(Errno::Success),

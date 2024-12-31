@@ -40,6 +40,8 @@ mod filesystems;
 pub(crate) mod ops;
 mod overlay_fs;
 pub mod pipe;
+#[cfg(feature = "host-fs")]
+mod scoped_directory_fs;
 mod static_file;
 #[cfg(feature = "static-fs")]
 pub mod static_fs;
@@ -65,6 +67,8 @@ pub use null_file::*;
 pub use overlay_fs::OverlayFileSystem;
 pub use passthru_fs::*;
 pub use pipe::*;
+#[cfg(feature = "host-fs")]
+pub use scoped_directory_fs::ScopedDirectoryFileSystem;
 pub use special_file::*;
 pub use static_file::StaticFile;
 pub use tmp_fs::*;
@@ -340,7 +344,7 @@ pub trait VirtualFile:
     fn set_len(&mut self, new_size: u64) -> Result<()>;
 
     /// Request deletion of the file
-    fn unlink(&mut self) -> BoxFuture<'static, Result<()>>;
+    fn unlink(&mut self) -> Result<()>;
 
     /// Indicates if the file is opened or closed. This function must not block
     /// Defaults to a status of being constantly open
@@ -353,6 +357,12 @@ pub trait VirtualFile:
     /// on normal files
     fn get_special_fd(&self) -> Option<u32> {
         None
+    }
+
+    /// Writes to this file using an mmap offset and reference
+    /// (this method only works for mmap optimized file systems)
+    fn write_from_mmap(&mut self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
     /// This method will copy a file from a source to this destination where
@@ -668,6 +678,13 @@ impl FileType {
     pub fn new_dir() -> Self {
         Self {
             dir: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn new_file() -> Self {
+        Self {
+            file: true,
             ..Default::default()
         }
     }

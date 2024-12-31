@@ -26,6 +26,9 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
 ) -> Result<Errno, WasiError> {
     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
 
+    ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+    ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
     if timeout == TIMEOUT_FOREVER {
         tracing::trace!(maxevents, epfd, "waiting forever on wakers");
     } else {
@@ -201,7 +204,6 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
     // We use asyncify with a deep sleep to wait on new IO events
     let res = __asyncify_with_deep_sleep::<M, Result<Vec<(EpollFd, EpollType)>, Errno>, _>(
         ctx,
-        Duration::from_millis(50),
         Box::pin(trigger),
     )?;
     if let AsyncifyAction::Finish(mut ctx, events) = res {

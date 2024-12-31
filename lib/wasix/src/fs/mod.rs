@@ -43,6 +43,18 @@ use crate::syscalls::map_io_err;
 use crate::{bin_factory::BinaryPackage, state::PreopenedDir, ALL_RIGHTS};
 
 /// the fd value of the virtual root
+///
+/// Used for interacting with the file system when it has no
+/// pre-opened file descriptors at the root level. Normally
+/// a WASM process will do this in the libc initialization stage
+/// however that does not happen when the WASM process has never
+/// been run. Further that logic could change at any time in libc
+/// which would then break functionality. Instead we use this fixed
+/// file descriptor
+///
+/// This is especially important for fuse mounting journals which
+/// use the same syscalls as a normal WASI application but do not
+/// run the libc initialization logic
 pub const VIRTUAL_ROOT_FD: WasiFd = 3;
 
 const STDIN_DEFAULT_RIGHTS: Rights = {
@@ -276,6 +288,7 @@ pub enum WasiFsRoot {
 
 impl WasiFsRoot {
     /// Merge the contents of a filesystem into this one.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn merge(
         &self,
         other: &Arc<dyn FileSystem + Send + Sync>,
@@ -351,7 +364,7 @@ impl FileSystem for WasiFsRoot {
 
 /// Merge the contents of one filesystem into another.
 ///
-#[tracing::instrument(level = "debug", skip_all)]
+#[tracing::instrument(level = "trace", skip_all)]
 async fn merge_filesystems(
     source: &dyn FileSystem,
     destination: &dyn FileSystem,
@@ -410,6 +423,63 @@ fn create_dir_all(fs: &dyn FileSystem, path: &Path) -> Result<(), virtual_fs::Fs
     Ok(())
 }
 
+/// This needs to be exposed so that the multiple use-cases are able
+/// to generated unique file descriptors and update the seed during
+/// journal restoration
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct WasiFdSeed {
+    next_fd: Arc<AtomicU32>,
+}
+
+impl Default for WasiFdSeed {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
+impl WasiFdSeed {
+    pub fn new(initial_val: u32) -> Self {
+        Self {
+            next_fd: Arc::new(AtomicU32::new(initial_val)),
+        }
+    }
+
+    pub fn fork(&self) -> Self {
+        Self {
+            next_fd: Arc::new(AtomicU32::new(self.next_fd.load(Ordering::SeqCst))),
+        }
+    }
+
+    pub fn next_val(&self) -> WasiFd {
+        self.next_fd.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn set_val(&self, val: WasiFd) {
+        self.next_fd.store(val, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn cur_val(&self) -> WasiFd {
+        self.next_fd.load(Ordering::SeqCst)
+    }
+
+    pub fn clip_val(&self, fd: WasiFd) {
+        loop {
+            let existing = self.next_fd.load(Ordering::SeqCst);
+            if existing >= fd {
+                return;
+            }
+            if self
+                .next_fd
+                .compare_exchange(existing, fd, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
 /// Warning, modifying these fields directly may cause invariants to break and
 /// should be considered unsafe.  These fields may be made private in a future release
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -417,7 +487,7 @@ pub struct WasiFs {
     //pub repo: Repo,
     pub preopen_fds: RwLock<Vec<u32>>,
     pub fd_map: Arc<RwLock<HashMap<WasiFd, Fd>>>,
-    pub next_fd: AtomicU32,
+    pub next_fd: WasiFdSeed,
     pub current_dir: Mutex<String>,
     #[cfg_attr(feature = "enable-serde", serde(skip, default))]
     pub root_fs: WasiFsRoot,
@@ -429,6 +499,11 @@ pub struct WasiFs {
     // but it shouldn't be necessary
     // It should not be necessary at all.
     is_wasix: AtomicBool,
+
+    // The preopens when this was initialized
+    pub(crate) init_preopens: Vec<PreopenedDir>,
+    // The virtual file system preopens when this was initialized
+    pub(crate) init_vfs_preopens: Vec<String>,
 }
 
 impl WasiFs {
@@ -448,43 +523,40 @@ impl WasiFs {
         Self {
             preopen_fds: RwLock::new(self.preopen_fds.read().unwrap().clone()),
             fd_map: Arc::new(RwLock::new(fd_map)),
-            next_fd: AtomicU32::new(self.next_fd.load(Ordering::SeqCst)),
+            next_fd: self.next_fd.fork(),
             current_dir: Mutex::new(self.current_dir.lock().unwrap().clone()),
             is_wasix: AtomicBool::new(self.is_wasix.load(Ordering::Acquire)),
             root_fs: self.root_fs.clone(),
             root_inode: self.root_inode.clone(),
             has_unioned: Arc::new(Mutex::new(HashSet::new())),
+            init_preopens: self.init_preopens.clone(),
+            init_vfs_preopens: self.init_vfs_preopens.clone(),
         }
     }
 
     /// Closes all the file handles.
     #[allow(clippy::await_holding_lock)]
     pub async fn close_all(&self) {
-        // TODO: this should close all uniquely owned files instead of just flushing.
+        let mut to_close = {
+            if let Ok(map) = self.fd_map.read() {
+                map.keys().copied().collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            }
+        };
+        to_close.insert(__WASI_STDOUT_FILENO);
+        to_close.insert(__WASI_STDERR_FILENO);
+
+        let _ = tokio::join!(async {
+            for fd in to_close {
+                self.flush(fd).await.ok();
+                self.close_fd(fd).ok();
+            }
+        });
 
         if let Ok(mut map) = self.fd_map.write() {
             map.clear();
         }
-
-        let to_close = {
-            if let Ok(map) = self.fd_map.read() {
-                map.keys().copied().collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        };
-
-        let _ = tokio::join!(
-            // Make sure the STDOUT and STDERR are explicitely flushed
-            self.flush(__WASI_STDOUT_FILENO),
-            self.flush(__WASI_STDERR_FILENO),
-            async {
-                for fd in to_close {
-                    self.flush(fd).await.ok();
-                    self.close_fd(fd).ok();
-                }
-            }
-        );
     }
 
     /// Will conditionally union the binary file system with this one
@@ -501,14 +573,7 @@ impl WasiFs {
             return Ok(());
         }
 
-        match self.root_fs {
-            WasiFsRoot::Sandbox(ref sandbox_fs) => {
-                sandbox_fs.union(&binary.webc_fs);
-            }
-            WasiFsRoot::Backing(ref fs) => {
-                merge_filesystems(&binary.webc_fs, fs.deref()).await?;
-            }
-        }
+        self.root_fs.merge(&binary.webc_fs).await?;
 
         Ok(())
     }
@@ -520,175 +585,10 @@ impl WasiFs {
         vfs_preopens: &[String],
         fs_backing: WasiFsRoot,
     ) -> Result<Self, String> {
-        let (wasi_fs, root_inode) = Self::new_init(fs_backing, inodes)?;
-
-        for preopen_name in vfs_preopens {
-            let kind = Kind::Dir {
-                parent: root_inode.downgrade(),
-                path: PathBuf::from(preopen_name),
-                entries: Default::default(),
-            };
-            let rights = Rights::FD_ADVISE
-                | Rights::FD_TELL
-                | Rights::FD_SEEK
-                | Rights::FD_READ
-                | Rights::PATH_OPEN
-                | Rights::FD_READDIR
-                | Rights::PATH_READLINK
-                | Rights::PATH_FILESTAT_GET
-                | Rights::FD_FILESTAT_GET
-                | Rights::PATH_LINK_SOURCE
-                | Rights::PATH_RENAME_SOURCE
-                | Rights::POLL_FD_READWRITE
-                | Rights::SOCK_SHUTDOWN;
-            let inode = wasi_fs
-                .create_inode(inodes, kind, true, preopen_name.clone())
-                .map_err(|e| {
-                    format!(
-                        "Failed to create inode for preopened dir (name `{}`): WASI error code: {}",
-                        preopen_name, e
-                    )
-                })?;
-            let fd_flags = Fd::READ;
-            let fd = wasi_fs
-                .create_fd(rights, rights, Fdflags::empty(), fd_flags, inode.clone())
-                .map_err(|e| format!("Could not open fd for file {:?}: {}", preopen_name, e))?;
-            {
-                let mut guard = root_inode.write();
-                if let Kind::Root { entries } = guard.deref_mut() {
-                    let existing_entry = entries.insert(preopen_name.clone(), inode);
-                    if existing_entry.is_some() {
-                        return Err(format!(
-                            "Found duplicate entry for alias `{}`",
-                            preopen_name
-                        ));
-                    }
-                    assert!(existing_entry.is_none())
-                }
-            }
-            wasi_fs.preopen_fds.write().unwrap().push(fd);
-        }
-
-        for PreopenedDir {
-            path,
-            alias,
-            read,
-            write,
-            create,
-        } in preopens
-        {
-            debug!(
-                "Attempting to preopen {} with alias {:?}",
-                &path.to_string_lossy(),
-                &alias
-            );
-            let cur_dir_metadata = wasi_fs
-                .root_fs
-                .metadata(path)
-                .map_err(|e| format!("Could not get metadata for file {:?}: {}", path, e))?;
-
-            let kind = if cur_dir_metadata.is_dir() {
-                Kind::Dir {
-                    parent: root_inode.downgrade(),
-                    path: path.clone(),
-                    entries: Default::default(),
-                }
-            } else {
-                return Err(format!(
-                    "WASI only supports pre-opened directories right now; found \"{}\"",
-                    &path.to_string_lossy()
-                ));
-            };
-
-            let rights = {
-                // TODO: review tell' and fd_readwrite
-                let mut rights = Rights::FD_ADVISE | Rights::FD_TELL | Rights::FD_SEEK;
-                if *read {
-                    rights |= Rights::FD_READ
-                        | Rights::PATH_OPEN
-                        | Rights::FD_READDIR
-                        | Rights::PATH_READLINK
-                        | Rights::PATH_FILESTAT_GET
-                        | Rights::FD_FILESTAT_GET
-                        | Rights::PATH_LINK_SOURCE
-                        | Rights::PATH_RENAME_SOURCE
-                        | Rights::POLL_FD_READWRITE
-                        | Rights::SOCK_SHUTDOWN;
-                }
-                if *write {
-                    rights |= Rights::FD_DATASYNC
-                        | Rights::FD_FDSTAT_SET_FLAGS
-                        | Rights::FD_WRITE
-                        | Rights::FD_SYNC
-                        | Rights::FD_ALLOCATE
-                        | Rights::PATH_OPEN
-                        | Rights::PATH_RENAME_TARGET
-                        | Rights::PATH_FILESTAT_SET_SIZE
-                        | Rights::PATH_FILESTAT_SET_TIMES
-                        | Rights::FD_FILESTAT_SET_SIZE
-                        | Rights::FD_FILESTAT_SET_TIMES
-                        | Rights::PATH_REMOVE_DIRECTORY
-                        | Rights::PATH_UNLINK_FILE
-                        | Rights::POLL_FD_READWRITE
-                        | Rights::SOCK_SHUTDOWN;
-                }
-                if *create {
-                    rights |= Rights::PATH_CREATE_DIRECTORY
-                        | Rights::PATH_CREATE_FILE
-                        | Rights::PATH_LINK_TARGET
-                        | Rights::PATH_OPEN
-                        | Rights::PATH_RENAME_TARGET
-                        | Rights::PATH_SYMLINK;
-                }
-
-                rights
-            };
-            let inode = if let Some(alias) = &alias {
-                wasi_fs.create_inode(inodes, kind, true, alias.clone())
-            } else {
-                wasi_fs.create_inode(inodes, kind, true, path.to_string_lossy().into_owned())
-            }
-            .map_err(|e| {
-                format!(
-                    "Failed to create inode for preopened dir: WASI error code: {}",
-                    e
-                )
-            })?;
-            let fd_flags = {
-                let mut fd_flags = 0;
-                if *read {
-                    fd_flags |= Fd::READ;
-                }
-                if *write {
-                    // TODO: introduce API for finer grained control
-                    fd_flags |= Fd::WRITE | Fd::APPEND | Fd::TRUNCATE;
-                }
-                if *create {
-                    fd_flags |= Fd::CREATE;
-                }
-                fd_flags
-            };
-            let fd = wasi_fs
-                .create_fd(rights, rights, Fdflags::empty(), fd_flags, inode.clone())
-                .map_err(|e| format!("Could not open fd for file {:?}: {}", path, e))?;
-            {
-                let mut guard = root_inode.write();
-                if let Kind::Root { entries } = guard.deref_mut() {
-                    let key = if let Some(alias) = &alias {
-                        alias.clone()
-                    } else {
-                        path.to_string_lossy().into_owned()
-                    };
-                    let existing_entry = entries.insert(key.clone(), inode);
-                    if existing_entry.is_some() {
-                        return Err(format!("Found duplicate entry for alias `{}`", key));
-                    }
-                    assert!(existing_entry.is_none())
-                }
-            }
-            wasi_fs.preopen_fds.write().unwrap().push(fd);
-        }
-
+        let mut wasi_fs = Self::new_init(fs_backing, inodes)?;
+        wasi_fs.init_preopens = preopens.to_vec();
+        wasi_fs.init_vfs_preopens = vfs_preopens.to_vec();
+        wasi_fs.create_preopens(inodes, false)?;
         Ok(wasi_fs)
     }
 
@@ -706,7 +606,7 @@ impl WasiFs {
 
     /// Private helper function to init the filesystem, called in `new` and
     /// `new_with_preopen`
-    fn new_init(fs_backing: WasiFsRoot, inodes: &WasiInodes) -> Result<(Self, InodeGuard), String> {
+    fn new_init(fs_backing: WasiFsRoot, inodes: &WasiInodes) -> Result<Self, String> {
         debug!("Initializing WASI filesystem");
 
         let stat = Filestat {
@@ -726,50 +626,21 @@ impl WasiFs {
         let wasi_fs = Self {
             preopen_fds: RwLock::new(vec![]),
             fd_map: Arc::new(RwLock::new(HashMap::new())),
-            next_fd: AtomicU32::new(3),
+            next_fd: WasiFdSeed::default(),
             current_dir: Mutex::new("/".to_string()),
             is_wasix: AtomicBool::new(false),
             root_fs: fs_backing,
-            root_inode: root_inode.clone(),
+            root_inode,
             has_unioned: Arc::new(Mutex::new(HashSet::new())),
+            init_preopens: Default::default(),
+            init_vfs_preopens: Default::default(),
         };
         wasi_fs.create_stdin(inodes);
         wasi_fs.create_stdout(inodes);
         wasi_fs.create_stderr(inodes);
+        wasi_fs.create_rootfd()?;
 
-        // create virtual root
-        let all_rights = ALL_RIGHTS;
-        // TODO: make this a list of positive rigths instead of negative ones
-        // root gets all right for now
-        let root_rights = all_rights
-            /*
-            & (!Rights::FD_WRITE)
-            & (!Rights::FD_ALLOCATE)
-            & (!Rights::PATH_CREATE_DIRECTORY)
-            & (!Rights::PATH_CREATE_FILE)
-            & (!Rights::PATH_LINK_SOURCE)
-            & (!Rights::PATH_RENAME_SOURCE)
-            & (!Rights::PATH_RENAME_TARGET)
-            & (!Rights::PATH_FILESTAT_SET_SIZE)
-            & (!Rights::PATH_FILESTAT_SET_TIMES)
-            & (!Rights::FD_FILESTAT_SET_SIZE)
-            & (!Rights::FD_FILESTAT_SET_TIMES)
-            & (!Rights::PATH_SYMLINK)
-            & (!Rights::PATH_UNLINK_FILE)
-            & (!Rights::PATH_REMOVE_DIRECTORY)
-            */;
-        let fd = wasi_fs
-            .create_fd(
-                root_rights,
-                root_rights,
-                Fdflags::empty(),
-                Fd::READ,
-                root_inode.clone(),
-            )
-            .map_err(|e| format!("Could not create root fd: {}", e))?;
-        wasi_fs.preopen_fds.write().unwrap().push(fd);
-
-        Ok((wasi_fs, root_inode))
+        Ok(wasi_fs)
     }
 
     /// This function is like create dir all, but it also opens it.
@@ -881,7 +752,7 @@ impl WasiFs {
                 let kind = Kind::File {
                     handle: Some(Arc::new(RwLock::new(file))),
                     path: PathBuf::from(""),
-                    fd: Some(self.next_fd.fetch_add(1, Ordering::SeqCst)),
+                    fd: Some(self.next_fd.next_val()),
                 };
 
                 drop(guard);
@@ -1128,7 +999,8 @@ impl WasiFs {
                                 let (pre_open_dir_fd, relative_path) = if link_value.is_relative() {
                                     self.path_into_pre_open_and_relative_path(&file)?
                                 } else {
-                                    unimplemented!("Absolute symlinks are not yet supported");
+                                    tracing::error!("Absolute symlinks are not yet supported");
+                                    return Err(Errno::Notsup);
                                 };
                                 loop_for_symlink = true;
                                 symlink_count += 1;
@@ -1234,6 +1106,9 @@ impl WasiFs {
 
                         if let Some(entry) = entries.get(component.as_ref()) {
                             cur_inode = entry.clone();
+                        } else if let Some(root) = entries.get(&"/".to_string()) {
+                            cur_inode = root.clone();
+                            continue 'symlink_resolution;
                         } else {
                             // Root is not capable of having something other then preopenned folders
                             return Err(Errno::Notcapable);
@@ -1433,15 +1308,34 @@ impl WasiFs {
     }
 
     pub fn get_fd(&self, fd: WasiFd) -> Result<Fd, Errno> {
-        self.fd_map
+        let ret = self
+            .fd_map
             .read()
             .unwrap()
             .get(&fd)
             .ok_or(Errno::Badf)
-            .map(|a| a.clone())
+            .map(|a| a.clone());
+
+        if ret.is_err() && fd == VIRTUAL_ROOT_FD {
+            Ok(Fd {
+                rights: ALL_RIGHTS,
+                rights_inheriting: ALL_RIGHTS,
+                flags: Fdflags::empty(),
+                offset: Arc::new(AtomicU64::new(0)),
+                open_flags: 0,
+                inode: self.root_inode.clone(),
+                is_stdio: false,
+            })
+        } else {
+            ret
+        }
     }
 
     pub fn get_fd_inode(&self, fd: WasiFd) -> Result<InodeGuard, Errno> {
+        // see `VIRTUAL_ROOT_FD` for details as to why this exists
+        if fd == VIRTUAL_ROOT_FD {
+            return Ok(self.root_inode.clone());
+        }
         self.fd_map
             .read()
             .unwrap()
@@ -1502,10 +1396,10 @@ impl WasiFs {
                 Kind::File { .. } => Filetype::RegularFile,
                 Kind::Dir { .. } => Filetype::Directory,
                 Kind::Symlink { .. } => Filetype::SymbolicLink,
-                Kind::Socket { socket } => match socket.inner.protected.read().unwrap().kind {
+                Kind::Socket { socket } => match &socket.inner.protected.read().unwrap().kind {
                     InodeSocketKind::TcpStream { .. } => Filetype::SocketStream,
                     InodeSocketKind::Raw { .. } => Filetype::SocketRaw,
-                    InodeSocketKind::PreSocket { ty, .. } => match ty {
+                    InodeSocketKind::PreSocket { props, .. } => match props.ty {
                         Socktype::Stream => Filetype::SocketStream,
                         Socktype::Dgram => Filetype::SocketDgram,
                         Socktype::Raw => Filetype::SocketRaw,
@@ -1562,40 +1456,37 @@ impl WasiFs {
             }
             _ => {
                 let fd = self.get_fd(fd)?;
-                if fd.rights.contains(Rights::FD_DATASYNC) {
+                if !fd.rights.contains(Rights::FD_DATASYNC) {
                     return Err(Errno::Access);
                 }
 
-                let work = {
+                let file = {
                     let guard = fd.inode.read();
                     match guard.deref() {
                         Kind::File {
                             handle: Some(file), ..
-                        } => {
-                            struct FlushPoller {
-                                file: Arc<RwLock<Box<dyn VirtualFile + Send + Sync>>>,
-                            }
-                            impl Future for FlushPoller {
-                                type Output = Result<(), Errno>;
-                                fn poll(
-                                    self: Pin<&mut Self>,
-                                    cx: &mut Context<'_>,
-                                ) -> Poll<Self::Output> {
-                                    let mut file = self.file.write().unwrap();
-                                    Pin::new(file.as_mut())
-                                        .poll_flush(cx)
-                                        .map_err(|_| Errno::Io)
-                                }
-                            }
-                            FlushPoller { file: file.clone() }
-                        }
+                        } => file.clone(),
                         // TODO: verify this behavior
                         Kind::Dir { .. } => return Err(Errno::Isdir),
                         Kind::Buffer { .. } => return Ok(()),
                         _ => return Err(Errno::Io),
                     }
                 };
-                work.await?
+                drop(fd);
+
+                struct FlushPoller {
+                    file: Arc<RwLock<Box<dyn VirtualFile + Send + Sync>>>,
+                }
+                impl Future for FlushPoller {
+                    type Output = Result<(), Errno>;
+                    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                        let mut file = self.file.write().unwrap();
+                        Pin::new(file.as_mut())
+                            .poll_flush(cx)
+                            .map_err(|_| Errno::Io)
+                    }
+                }
+                FlushPoller { file }.await?;
             }
         }
         Ok(())
@@ -1666,9 +1557,13 @@ impl WasiFs {
         open_flags: u16,
         inode: InodeGuard,
     ) -> Result<WasiFd, Errno> {
-        let idx = self.next_fd.fetch_add(1, Ordering::SeqCst);
+        let idx = self.next_fd.next_val();
         self.create_fd_ext(rights, rights_inheriting, flags, open_flags, inode, idx)?;
         Ok(idx)
+    }
+
+    pub fn make_max_fd(&self, fd: u32) {
+        self.next_fd.clip_val(fd);
     }
 
     pub fn create_fd_ext(
@@ -1701,7 +1596,7 @@ impl WasiFs {
 
     pub fn clone_fd(&self, fd: WasiFd) -> Result<WasiFd, Errno> {
         let fd = self.get_fd(fd)?;
-        let idx = self.next_fd.fetch_add(1, Ordering::SeqCst);
+        let idx = self.next_fd.next_val();
         self.fd_map.write().unwrap().insert(
             idx,
             Fd {
@@ -1730,7 +1625,7 @@ impl WasiFs {
         guard.lookup.remove(&ino).and_then(|a| Weak::upgrade(&a))
     }
 
-    fn create_stdout(&self, inodes: &WasiInodes) {
+    pub(crate) fn create_stdout(&self, inodes: &WasiInodes) {
         self.create_std_dev_inner(
             inodes,
             Box::<Stdout>::default(),
@@ -1741,7 +1636,7 @@ impl WasiFs {
         );
     }
 
-    fn create_stdin(&self, inodes: &WasiInodes) {
+    pub(crate) fn create_stdin(&self, inodes: &WasiInodes) {
         self.create_std_dev_inner(
             inodes,
             Box::<Stdin>::default(),
@@ -1752,7 +1647,7 @@ impl WasiFs {
         );
     }
 
-    fn create_stderr(&self, inodes: &WasiInodes) {
+    pub(crate) fn create_stderr(&self, inodes: &WasiInodes) {
         self.create_std_dev_inner(
             inodes,
             Box::<Stderr>::default(),
@@ -1763,7 +1658,215 @@ impl WasiFs {
         );
     }
 
-    fn create_std_dev_inner(
+    pub(crate) fn create_rootfd(&self) -> Result<(), String> {
+        // create virtual root
+        let all_rights = ALL_RIGHTS;
+        // TODO: make this a list of positive rigths instead of negative ones
+        // root gets all right for now
+        let root_rights = all_rights
+            /*
+            & (!Rights::FD_WRITE)
+            & (!Rights::FD_ALLOCATE)
+            & (!Rights::PATH_CREATE_DIRECTORY)
+            & (!Rights::PATH_CREATE_FILE)
+            & (!Rights::PATH_LINK_SOURCE)
+            & (!Rights::PATH_RENAME_SOURCE)
+            & (!Rights::PATH_RENAME_TARGET)
+            & (!Rights::PATH_FILESTAT_SET_SIZE)
+            & (!Rights::PATH_FILESTAT_SET_TIMES)
+            & (!Rights::FD_FILESTAT_SET_SIZE)
+            & (!Rights::FD_FILESTAT_SET_TIMES)
+            & (!Rights::PATH_SYMLINK)
+            & (!Rights::PATH_UNLINK_FILE)
+            & (!Rights::PATH_REMOVE_DIRECTORY)
+            */;
+        let fd = self
+            .create_fd(
+                root_rights,
+                root_rights,
+                Fdflags::empty(),
+                Fd::READ,
+                self.root_inode.clone(),
+            )
+            .map_err(|e| format!("Could not create root fd: {}", e))?;
+        self.preopen_fds.write().unwrap().push(fd);
+        Ok(())
+    }
+
+    pub(crate) fn create_preopens(
+        &self,
+        inodes: &WasiInodes,
+        ignore_duplicates: bool,
+    ) -> Result<(), String> {
+        for preopen_name in self.init_vfs_preopens.iter() {
+            let kind = Kind::Dir {
+                parent: self.root_inode.downgrade(),
+                path: PathBuf::from(preopen_name),
+                entries: Default::default(),
+            };
+            let rights = Rights::FD_ADVISE
+                | Rights::FD_TELL
+                | Rights::FD_SEEK
+                | Rights::FD_READ
+                | Rights::PATH_OPEN
+                | Rights::FD_READDIR
+                | Rights::PATH_READLINK
+                | Rights::PATH_FILESTAT_GET
+                | Rights::FD_FILESTAT_GET
+                | Rights::PATH_LINK_SOURCE
+                | Rights::PATH_RENAME_SOURCE
+                | Rights::POLL_FD_READWRITE
+                | Rights::SOCK_SHUTDOWN;
+            let inode = self
+                .create_inode(inodes, kind, true, preopen_name.clone())
+                .map_err(|e| {
+                    format!(
+                        "Failed to create inode for preopened dir (name `{}`): WASI error code: {}",
+                        preopen_name, e
+                    )
+                })?;
+            let fd_flags = Fd::READ;
+            let fd = self
+                .create_fd(rights, rights, Fdflags::empty(), fd_flags, inode.clone())
+                .map_err(|e| format!("Could not open fd for file {:?}: {}", preopen_name, e))?;
+            {
+                let mut guard = self.root_inode.write();
+                if let Kind::Root { entries } = guard.deref_mut() {
+                    let existing_entry = entries.insert(preopen_name.clone(), inode);
+                    if existing_entry.is_some() && !ignore_duplicates {
+                        return Err(format!(
+                            "Found duplicate entry for alias `{}`",
+                            preopen_name
+                        ));
+                    }
+                }
+            }
+            self.preopen_fds.write().unwrap().push(fd);
+        }
+
+        for PreopenedDir {
+            path,
+            alias,
+            read,
+            write,
+            create,
+        } in self.init_preopens.iter()
+        {
+            debug!(
+                "Attempting to preopen {} with alias {:?}",
+                &path.to_string_lossy(),
+                &alias
+            );
+            let cur_dir_metadata = self
+                .root_fs
+                .metadata(path)
+                .map_err(|e| format!("Could not get metadata for file {:?}: {}", path, e))?;
+
+            let kind = if cur_dir_metadata.is_dir() {
+                Kind::Dir {
+                    parent: self.root_inode.downgrade(),
+                    path: path.clone(),
+                    entries: Default::default(),
+                }
+            } else {
+                return Err(format!(
+                    "WASI only supports pre-opened directories right now; found \"{}\"",
+                    &path.to_string_lossy()
+                ));
+            };
+
+            let rights = {
+                // TODO: review tell' and fd_readwrite
+                let mut rights = Rights::FD_ADVISE | Rights::FD_TELL | Rights::FD_SEEK;
+                if *read {
+                    rights |= Rights::FD_READ
+                        | Rights::PATH_OPEN
+                        | Rights::FD_READDIR
+                        | Rights::PATH_READLINK
+                        | Rights::PATH_FILESTAT_GET
+                        | Rights::FD_FILESTAT_GET
+                        | Rights::PATH_LINK_SOURCE
+                        | Rights::PATH_RENAME_SOURCE
+                        | Rights::POLL_FD_READWRITE
+                        | Rights::SOCK_SHUTDOWN;
+                }
+                if *write {
+                    rights |= Rights::FD_DATASYNC
+                        | Rights::FD_FDSTAT_SET_FLAGS
+                        | Rights::FD_WRITE
+                        | Rights::FD_SYNC
+                        | Rights::FD_ALLOCATE
+                        | Rights::PATH_OPEN
+                        | Rights::PATH_RENAME_TARGET
+                        | Rights::PATH_FILESTAT_SET_SIZE
+                        | Rights::PATH_FILESTAT_SET_TIMES
+                        | Rights::FD_FILESTAT_SET_SIZE
+                        | Rights::FD_FILESTAT_SET_TIMES
+                        | Rights::PATH_REMOVE_DIRECTORY
+                        | Rights::PATH_UNLINK_FILE
+                        | Rights::POLL_FD_READWRITE
+                        | Rights::SOCK_SHUTDOWN;
+                }
+                if *create {
+                    rights |= Rights::PATH_CREATE_DIRECTORY
+                        | Rights::PATH_CREATE_FILE
+                        | Rights::PATH_LINK_TARGET
+                        | Rights::PATH_OPEN
+                        | Rights::PATH_RENAME_TARGET
+                        | Rights::PATH_SYMLINK;
+                }
+
+                rights
+            };
+            let inode = if let Some(alias) = &alias {
+                self.create_inode(inodes, kind, true, alias.clone())
+            } else {
+                self.create_inode(inodes, kind, true, path.to_string_lossy().into_owned())
+            }
+            .map_err(|e| {
+                format!(
+                    "Failed to create inode for preopened dir: WASI error code: {}",
+                    e
+                )
+            })?;
+            let fd_flags = {
+                let mut fd_flags = 0;
+                if *read {
+                    fd_flags |= Fd::READ;
+                }
+                if *write {
+                    // TODO: introduce API for finer grained control
+                    fd_flags |= Fd::WRITE | Fd::APPEND | Fd::TRUNCATE;
+                }
+                if *create {
+                    fd_flags |= Fd::CREATE;
+                }
+                fd_flags
+            };
+            let fd = self
+                .create_fd(rights, rights, Fdflags::empty(), fd_flags, inode.clone())
+                .map_err(|e| format!("Could not open fd for file {:?}: {}", path, e))?;
+            {
+                let mut guard = self.root_inode.write();
+                if let Kind::Root { entries } = guard.deref_mut() {
+                    let key = if let Some(alias) = &alias {
+                        alias.clone()
+                    } else {
+                        path.to_string_lossy().into_owned()
+                    };
+                    let existing_entry = entries.insert(key.clone(), inode);
+                    if existing_entry.is_some() && !ignore_duplicates {
+                        return Err(format!("Found duplicate entry for alias `{}`", key));
+                    }
+                }
+            }
+            self.preopen_fds.write().unwrap().push(fd);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn create_std_dev_inner(
         &self,
         inodes: &WasiInodes,
         handle: Box<dyn VirtualFile + Send + Sync + 'static>,
@@ -1896,7 +1999,7 @@ impl std::fmt::Debug for WasiFs {
         } else {
             write!(f, "current_dir=(locked) ")?;
         }
-        write!(f, "next_fd={} ", self.next_fd.load(Ordering::Relaxed))?;
+        write!(f, "next_fd={} ", self.next_fd.cur_val())?;
         write!(f, "{:?}", self.root_fs)
     }
 }

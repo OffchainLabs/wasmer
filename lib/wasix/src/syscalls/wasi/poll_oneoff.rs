@@ -64,6 +64,9 @@ pub fn poll_oneoff<M: MemorySize + 'static>(
 ) -> Result<Errno, WasiError> {
     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
 
+    ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+    ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
     ctx.data_mut().poll_seed += 1;
     let mut env = ctx.data();
     let mut memory = unsafe { env.memory_view(&ctx) };
@@ -439,7 +442,6 @@ where
     // We use asyncify with a deep sleep to wait on new IO events
     let res = __asyncify_with_deep_sleep::<M, Result<Vec<EventResult>, Errno>, _>(
         ctx,
-        Duration::from_millis(50),
         Box::pin(trigger),
     )?;
     if let AsyncifyAction::Finish(mut ctx, events) = res {

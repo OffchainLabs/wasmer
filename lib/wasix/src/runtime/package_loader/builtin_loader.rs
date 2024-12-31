@@ -10,6 +10,7 @@ use anyhow::{Context, Error};
 use bytes::Bytes;
 use http::{HeaderMap, Method};
 use tempfile::NamedTempFile;
+use url::Url;
 use webc::{
     compat::{Container, ContainerError},
     DetectError,
@@ -31,46 +32,59 @@ pub struct BuiltinPackageLoader {
     client: Arc<dyn HttpClient + Send + Sync>,
     in_memory: InMemoryCache,
     cache: Option<FileSystemCache>,
+    /// A mapping from hostnames to tokens
+    tokens: HashMap<String, String>,
 }
 
 impl BuiltinPackageLoader {
-    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
-        let client = crate::http::default_http_client().unwrap();
-        BuiltinPackageLoader::new_with_client(cache_dir, Arc::new(client))
+    pub fn new() -> Self {
+        BuiltinPackageLoader {
+            in_memory: InMemoryCache::default(),
+            client: Arc::new(crate::http::default_http_client().unwrap()),
+            cache: None,
+            tokens: HashMap::new(),
+        }
     }
 
-    pub fn new_with_client(
-        cache_dir: impl Into<PathBuf>,
-        client: Arc<dyn HttpClient + Send + Sync>,
-    ) -> Self {
+    pub fn with_cache_dir(self, cache_dir: impl Into<PathBuf>) -> Self {
         BuiltinPackageLoader {
             cache: Some(FileSystemCache {
                 cache_dir: cache_dir.into(),
             }),
-            in_memory: InMemoryCache::default(),
-            client,
+            ..self
         }
     }
 
-    pub fn new_only_client(client: Arc<dyn HttpClient + Send + Sync>) -> Self {
-        BuiltinPackageLoader {
-            cache: None,
-            in_memory: InMemoryCache::default(),
-            client,
-        }
+    pub fn with_http_client(self, client: impl HttpClient + Send + Sync + 'static) -> Self {
+        self.with_shared_http_client(Arc::new(client))
     }
 
-    /// Create a new [`BuiltinPackageLoader`] based on `$WASMER_DIR` and the
-    /// global Wasmer config.
-    pub fn from_env() -> Result<Self, Error> {
-        let wasmer_dir = discover_wasmer_dir().context("Unable to determine $WASMER_DIR")?;
-        let client = crate::http::default_http_client().context("No HTTP client available")?;
-        let cache_dir = wasmer_dir.join("cache").join("");
+    pub fn with_shared_http_client(self, client: Arc<dyn HttpClient + Send + Sync>) -> Self {
+        BuiltinPackageLoader { client, ..self }
+    }
 
-        Ok(BuiltinPackageLoader::new_with_client(
-            cache_dir,
-            Arc::new(client),
-        ))
+    pub fn with_tokens<I, K, V>(mut self, tokens: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (hostname, token) in tokens {
+            self = self.with_token(hostname, token);
+        }
+
+        self
+    }
+
+    /// Add an API token that will be used whenever sending requests to a
+    /// particular hostname.
+    ///
+    /// Note that this uses [`Url::authority()`] when looking up tokens, so it
+    /// will match both plain hostnames (e.g. `registry.wasmer.io`) and hosts
+    /// with a port number (e.g. `localhost:8000`).
+    pub fn with_token(mut self, hostname: impl Into<String>, token: impl Into<String>) -> Self {
+        self.tokens.insert(hostname.into(), token.into());
+        self
     }
 
     /// Insert a container into the in-memory hash.
@@ -101,9 +115,12 @@ impl BuiltinPackageLoader {
         if dist.webc.scheme() == "file" {
             match crate::runtime::resolver::utils::file_path_from_url(&dist.webc) {
                 Ok(path) => {
-                    // FIXME: This will block the thread
-                    let bytes = std::fs::read(&path)
-                        .with_context(|| format!("Unable to read \"{}\"", path.display()))?;
+                    let bytes = crate::spawn_blocking({
+                        let path = path.clone();
+                        move || std::fs::read(path)
+                    })
+                    .await?
+                    .with_context(|| format!("Unable to read \"{}\"", path.display()))?;
                     return Ok(bytes.into());
                 }
                 Err(e) => {
@@ -117,9 +134,9 @@ impl BuiltinPackageLoader {
         }
 
         let request = HttpRequest {
+            headers: self.headers(&dist.webc),
             url: dist.webc.clone(),
             method: Method::GET,
-            headers: headers(),
             body: None,
             options: Default::default(),
         };
@@ -149,6 +166,37 @@ impl BuiltinPackageLoader {
 
         Ok(body.into())
     }
+
+    fn headers(&self, url: &Url) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Accept", "application/webc".parse().unwrap());
+        headers.insert("User-Agent", USER_AGENT.parse().unwrap());
+
+        if url.has_authority() {
+            if let Some(token) = self.tokens.get(url.authority()) {
+                let header = format!("Bearer {token}");
+                match header.parse() {
+                    Ok(header) => {
+                        headers.insert(http::header::AUTHORIZATION, header);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = &e as &dyn std::error::Error,
+                            "An error occurred while parsing the authorization header",
+                        );
+                    }
+                }
+            }
+        }
+
+        headers
+    }
+}
+
+impl Default for BuiltinPackageLoader {
+    fn default() -> Self {
+        BuiltinPackageLoader::new()
+    }
 }
 
 #[async_trait::async_trait]
@@ -177,7 +225,10 @@ impl PackageLoader for BuiltinPackageLoader {
         // in a smart way to keep memory usage down.
 
         if let Some(cache) = &self.cache {
-            match cache.save_and_load_as_mmapped(&bytes, &summary.dist).await {
+            match cache
+                .save_and_load_as_mmapped(bytes.clone(), &summary.dist)
+                .await
+            {
                 Ok(container) => {
                     tracing::debug!("Cached to disk");
                     self.in_memory.save(&container, summary.dist.webc_sha256);
@@ -200,7 +251,7 @@ impl PackageLoader for BuiltinPackageLoader {
 
         // The sad path - looks like we don't have a filesystem cache so we'll
         // need to keep the whole thing in memory.
-        let container = Container::from_bytes(bytes)?;
+        let container = crate::spawn_blocking(move || Container::from_bytes(bytes)).await??;
         // We still want to cache it in memory, of course
         self.in_memory.save(&container, summary.dist.webc_sha256);
         Ok(container)
@@ -215,24 +266,6 @@ impl PackageLoader for BuiltinPackageLoader {
     }
 }
 
-fn headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert("Accept", "application/webc".parse().unwrap());
-    headers.insert("User-Agent", USER_AGENT.parse().unwrap());
-    headers
-}
-
-fn discover_wasmer_dir() -> Option<PathBuf> {
-    // TODO: We should reuse the same logic from the wasmer CLI.
-    std::env::var("WASMER_DIR")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            #[allow(deprecated)]
-            std::env::home_dir().map(|home| home.join(".wasmer"))
-        })
-}
-
 // FIXME: This implementation will block the async runtime and should use
 // some sort of spawn_blocking() call to run it in the background.
 #[derive(Debug)]
@@ -244,10 +277,11 @@ impl FileSystemCache {
     async fn lookup(&self, hash: &WebcHash) -> Result<Option<Container>, Error> {
         let path = self.path(hash);
 
-        #[cfg(target_arch = "wasm32")]
-        let container = Container::from_disk(&path);
-        #[cfg(not(target_arch = "wasm32"))]
-        let container = tokio::task::block_in_place(|| Container::from_disk(&path));
+        let container = crate::spawn_blocking({
+            let path = path.clone();
+            move || Container::from_disk(path)
+        })
+        .await?;
         match container {
             Ok(c) => Ok(Some(c)),
             Err(ContainerError::Open { error, .. })
@@ -264,27 +298,32 @@ impl FileSystemCache {
         }
     }
 
-    async fn save(&self, webc: &[u8], dist: &DistributionInfo) -> Result<(), Error> {
+    async fn save(&self, webc: Bytes, dist: &DistributionInfo) -> Result<(), Error> {
         let path = self.path(&dist.webc_sha256);
+        let dist = dist.clone();
 
-        let parent = path.parent().expect("Always within cache_dir");
+        crate::spawn_blocking(move || {
+            let parent = path.parent().expect("Always within cache_dir");
 
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Unable to create \"{}\"", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Unable to create \"{}\"", parent.display()))?;
 
-        let mut temp = NamedTempFile::new_in(parent)?;
-        temp.write_all(webc)?;
-        temp.flush()?;
-        temp.as_file_mut().sync_all()?;
-        temp.persist(&path)?;
+            let mut temp = NamedTempFile::new_in(parent)?;
+            temp.write_all(&webc)?;
+            temp.flush()?;
+            temp.as_file_mut().sync_all()?;
+            temp.persist(&path)?;
 
-        tracing::debug!(
-            pkg.hash=%dist.webc_sha256,
-            pkg.url=%dist.webc,
-            path=%path.display(),
-            num_bytes=webc.len(),
-            "Saved to disk",
-        );
+            tracing::debug!(
+                pkg.hash=%dist.webc_sha256,
+                pkg.url=%dist.webc,
+                path=%path.display(),
+                num_bytes=webc.len(),
+                "Saved to disk",
+            );
+            Result::<_, Error>::Ok(())
+        })
+        .await??;
 
         Ok(())
     }
@@ -292,7 +331,7 @@ impl FileSystemCache {
     #[tracing::instrument(level = "debug", skip_all)]
     async fn save_and_load_as_mmapped(
         &self,
-        webc: &[u8],
+        webc: Bytes,
         dist: &DistributionInfo,
     ) -> Result<Container, Error> {
         // First, save it to disk
@@ -388,7 +427,9 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
         }]));
-        let loader = BuiltinPackageLoader::new_with_client(temp.path(), client.clone());
+        let loader = BuiltinPackageLoader::new()
+            .with_cache_dir(temp.path())
+            .with_shared_http_client(client.clone());
         let summary = PackageSummary {
             pkg: PackageInfo {
                 name: "python/python".to_string(),
