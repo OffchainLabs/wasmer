@@ -84,14 +84,14 @@ pub enum SocketOptTimeType {
 #[serde(rename_all = "snake_case")]
 pub enum JournalEntry<'a> {
     InitModuleV1 {
-        wasm_hash: [u8; 8],
+        wasm_hash: Box<[u8]>,
     },
     ClearEtherealV1,
     UpdateMemoryRegionV1 {
         region: Range<u64>,
         #[derivative(Debug = "ignore")]
         #[serde(with = "base64")]
-        data: Cow<'a, [u8]>,
+        compressed_data: Cow<'a, [u8]>,
     },
     ProcessExitV1 {
         exit_code: Option<ExitCode>,
@@ -376,9 +376,12 @@ impl<'a> JournalEntry<'a> {
         match self {
             Self::InitModuleV1 { wasm_hash } => JournalEntry::InitModuleV1 { wasm_hash },
             Self::ClearEtherealV1 => JournalEntry::ClearEtherealV1,
-            Self::UpdateMemoryRegionV1 { region, data } => JournalEntry::UpdateMemoryRegionV1 {
+            Self::UpdateMemoryRegionV1 {
                 region,
-                data: data.into_owned().into(),
+                compressed_data,
+            } => JournalEntry::UpdateMemoryRegionV1 {
+                region,
+                compressed_data: compressed_data.into_owned().into(),
             },
             Self::ProcessExitV1 { exit_code } => JournalEntry::ProcessExitV1 { exit_code },
             Self::SetThreadV1 {
@@ -717,7 +720,9 @@ impl<'a> JournalEntry<'a> {
         match self {
             JournalEntry::InitModuleV1 { .. } => base_size,
             JournalEntry::ClearEtherealV1 => base_size,
-            JournalEntry::UpdateMemoryRegionV1 { data, .. } => base_size + data.len(),
+            JournalEntry::UpdateMemoryRegionV1 {
+                compressed_data, ..
+            } => base_size + compressed_data.len(),
             JournalEntry::ProcessExitV1 { .. } => base_size,
             JournalEntry::SetThreadV1 {
                 call_stack,

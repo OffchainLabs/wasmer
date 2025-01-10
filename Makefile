@@ -383,7 +383,6 @@ check-capi:
 	RUSTFLAGS="${RUSTFLAGS}" $(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/c-api/Cargo.toml  \
 		--no-default-features --features wat,compiler,wasi,middlewares $(capi_compiler_features)
 
-
 build-wasmer:
 	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
 
@@ -633,6 +632,10 @@ test-wasi-fyi: build-wasmer
 	cd tests/wasi-fyi; \
 	./test.sh
 
+test-wasix: build-wasmer
+	cd tests/wasix; \
+	./test.sh
+
 test-integration-cli: build-wasmer build-capi package-capi-headless package distribution
 	cp ./dist/wasmer.tar.gz ./link.tar.gz
 	rustup target add wasm32-wasi
@@ -847,14 +850,14 @@ untar-wasmer:
 
 distribution-gnu: package-capi
 	cp LICENSE package/LICENSE
-	cp ATTRIBUTIONS.md package/ATTRIBUTIONS
+	cp docs/ATTRIBUTIONS.md package/ATTRIBUTIONS
 	mkdir -p dist
 	tar -C package -zcvf wasmer.tar.gz lib include winsdk LICENSE ATTRIBUTIONS
 	mv wasmer.tar.gz dist/
 
 distribution: package
 	cp LICENSE package/LICENSE
-	cp ATTRIBUTIONS.md package/ATTRIBUTIONS
+	cp docs/ATTRIBUTIONS.md package/ATTRIBUTIONS
 	mkdir -p dist
 ifeq ($(IS_WINDOWS), 1)
 	iscc scripts/windows-installer/wasmer.iss

@@ -83,6 +83,7 @@ pub enum InodeSocketKind {
         peer_addr: SocketAddr,
         ttl: u32,
         multicast_ttl: u32,
+        is_dead: bool,
     },
 }
 
@@ -536,6 +537,7 @@ impl InodeSocket {
         net: &dyn VirtualNetworking,
         peer: SocketAddr,
         timeout: Option<std::time::Duration>,
+        nonblocking: bool,
     ) -> Result<Option<InodeSocket>, Errno> {
         let new_write_timeout;
         let new_read_timeout;
@@ -575,6 +577,9 @@ impl InodeSocket {
                                 }
                                 if let Some(dont_route) = dont_route {
                                     ret.set_dontroute(dont_route).ok();
+                                }
+                                if !nonblocking {
+                                    futures::future::poll_fn(|cx| ret.poll_write_ready(cx)).await?;
                                 }
                                 Ok(ret)
                             })
@@ -624,7 +629,10 @@ impl InodeSocket {
             InodeSocketKind::TcpListener { .. } => WasiSocketStatus::Opened,
             InodeSocketKind::TcpStream { .. } => WasiSocketStatus::Opened,
             InodeSocketKind::UdpSocket { .. } => WasiSocketStatus::Opened,
-            InodeSocketKind::RemoteSocket { .. } => WasiSocketStatus::Opened,
+            InodeSocketKind::RemoteSocket { is_dead, .. } => match is_dead {
+                true => WasiSocketStatus::Closed,
+                false => WasiSocketStatus::Opened,
+            },
             _ => WasiSocketStatus::Failed,
         })
     }
@@ -1102,8 +1110,11 @@ impl InodeSocket {
                         InodeSocketKind::PreSocket { .. } => {
                             return Poll::Ready(Err(Errno::Notconn))
                         }
-                        InodeSocketKind::RemoteSocket { .. } => {
-                            return Poll::Ready(Ok(self.data.len()))
+                        InodeSocketKind::RemoteSocket { is_dead, .. } => {
+                            return match is_dead {
+                                true => Poll::Ready(Err(Errno::Connreset)),
+                                false => Poll::Ready(Ok(self.data.len())),
+                            }
                         }
                         _ => return Poll::Ready(Err(Errno::Notsup)),
                     };
@@ -1182,8 +1193,11 @@ impl InodeSocket {
                         InodeSocketKind::PreSocket { .. } => {
                             return Poll::Ready(Err(Errno::Notconn))
                         }
-                        InodeSocketKind::RemoteSocket { .. } => {
-                            return Poll::Ready(Ok(self.data.len()))
+                        InodeSocketKind::RemoteSocket { is_dead, .. } => {
+                            return match is_dead {
+                                true => Poll::Ready(Err(Errno::Connreset)),
+                                false => Poll::Ready(Ok(self.data.len())),
+                            };
                         }
                         _ => return Poll::Ready(Err(Errno::Notsup)),
                     };
@@ -1270,8 +1284,11 @@ impl InodeSocket {
                                 }
                             }
                         }
-                        InodeSocketKind::RemoteSocket { .. } => {
-                            return Poll::Pending;
+                        InodeSocketKind::RemoteSocket { is_dead, .. } => {
+                            return match is_dead {
+                                true => Poll::Ready(Ok(0)),
+                                false => Poll::Pending,
+                            };
                         }
                         InodeSocketKind::PreSocket { .. } => {
                             return Poll::Ready(Err(Errno::Notconn))
@@ -1349,8 +1366,13 @@ impl InodeSocket {
                         InodeSocketKind::UdpSocket { socket, .. } => {
                             socket.try_recv_from(self.data)
                         }
-                        InodeSocketKind::RemoteSocket { .. } => {
-                            return Poll::Pending;
+                        InodeSocketKind::RemoteSocket {
+                            is_dead, peer_addr, ..
+                        } => {
+                            return match is_dead {
+                                true => Poll::Ready(Ok((0, *peer_addr))),
+                                false => Poll::Pending,
+                            };
                         }
                         InodeSocketKind::PreSocket { .. } => {
                             return Poll::Ready(Err(Errno::Notconn))
@@ -1410,9 +1432,9 @@ impl InodeSocket {
             #[allow(clippy::match_like_matches_macro)]
             match &mut guard.kind {
                 InodeSocketKind::TcpStream { .. }
-                | InodeSocketKind::RemoteSocket { .. }
                 | InodeSocketKind::UdpSocket { .. }
                 | InodeSocketKind::Raw(..) => true,
+                InodeSocketKind::RemoteSocket { is_dead, .. } => !(*is_dead),
                 _ => false,
             }
         } else {
@@ -1446,7 +1468,10 @@ impl InodeSocketProtected {
             InodeSocketKind::Raw(socket) => socket.poll_read_ready(cx),
             InodeSocketKind::Icmp(socket) => socket.poll_read_ready(cx),
             InodeSocketKind::PreSocket { .. } => Poll::Pending,
-            InodeSocketKind::RemoteSocket { .. } => Poll::Pending,
+            InodeSocketKind::RemoteSocket { is_dead, .. } => match is_dead {
+                true => Poll::Ready(Ok(0)),
+                false => Poll::Pending,
+            },
         }
         .map_err(net_error_into_io_err)
     }
@@ -1459,7 +1484,10 @@ impl InodeSocketProtected {
             InodeSocketKind::Raw(socket) => socket.poll_write_ready(cx),
             InodeSocketKind::Icmp(socket) => socket.poll_write_ready(cx),
             InodeSocketKind::PreSocket { .. } => Poll::Pending,
-            InodeSocketKind::RemoteSocket { .. } => Poll::Pending,
+            InodeSocketKind::RemoteSocket { is_dead, .. } => match is_dead {
+                true => Poll::Ready(Ok(0)),
+                false => Poll::Pending,
+            },
         }
         .map_err(net_error_into_io_err)
     }

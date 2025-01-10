@@ -15,6 +15,7 @@ use wasmer::{
     AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
     MemoryView, Module, TypedFunction,
 };
+use wasmer_config::package::PackageSource;
 use wasmer_wasix_types::{
     types::Signal,
     wasi::{Errno, ExitCode, Snapshot0Clockid},
@@ -33,14 +34,12 @@ use crate::{
         process::{WasiProcess, WasiProcessId},
         thread::{WasiMemoryLayout, WasiThread, WasiThreadHandle, WasiThreadId},
     },
-    runtime::{
-        module_cache::ModuleHash, resolver::PackageSpecifier, task_manager::InlineWaker,
-        SpawnMemoryType,
-    },
+    runtime::{task_manager::InlineWaker, SpawnMemoryType},
     syscalls::platform_clock_time_get,
     Runtime, VirtualTaskManager, WasiControlPlane, WasiEnvBuilder, WasiError, WasiFunctionEnv,
     WasiResult, WasiRuntimeError, WasiStateCreationError, WasiVFork,
 };
+use wasmer_types::ModuleHash;
 
 pub(crate) use super::handles::*;
 use super::WasiState;
@@ -60,6 +59,15 @@ pub struct WasiInstanceHandles {
 
     /// Points to the current location of the memory stack pointer
     pub(crate) stack_pointer: Option<Global>,
+
+    /// Points to the end of the data section
+    pub(crate) data_end: Option<Global>,
+
+    /// Points to the lower end of the stack
+    pub(crate) stack_low: Option<Global>,
+
+    /// Points to the higher end of the stack
+    pub(crate) stack_high: Option<Global>,
 
     /// Main function that will be invoked (name = "_start")
     #[derivative(Debug = "ignore")]
@@ -86,6 +94,10 @@ pub struct WasiInstanceHandles {
     /// process - if it has not been set then the runtime behaves differently
     /// when a CTRL-C is pressed.
     pub(crate) signal_set: bool,
+
+    /// Flag that indicates if the stack capture exports are being used by
+    /// this WASM process which means that it will be using asyncify
+    pub(crate) has_stack_checkpoint: bool,
 
     /// asyncify_start_unwind(data : i32): call this to start unwinding the
     /// stack from the current location. "data" must point to a data
@@ -135,11 +147,30 @@ pub struct WasiInstanceHandles {
 
 impl WasiInstanceHandles {
     pub fn new(memory: Memory, store: &impl AsStoreRef, instance: Instance) -> Self {
+        let has_stack_checkpoint = instance
+            .module()
+            .imports()
+            .any(|f| f.name() == "stack_checkpoint");
         WasiInstanceHandles {
             memory,
             stack_pointer: instance
                 .exports
                 .get_global("__stack_pointer")
+                .map(|a| a.clone())
+                .ok(),
+            data_end: instance
+                .exports
+                .get_global("__data_end")
+                .map(|a| a.clone())
+                .ok(),
+            stack_low: instance
+                .exports
+                .get_global("__stack_low")
+                .map(|a| a.clone())
+                .ok(),
+            stack_high: instance
+                .exports
+                .get_global("__stack_high")
                 .map(|a| a.clone())
                 .ok(),
             start: instance.exports.get_typed_function(store, "_start").ok(),
@@ -155,6 +186,7 @@ impl WasiInstanceHandles {
                 .exports
                 .get_typed_function(&store, "__wasm_signal")
                 .ok(),
+            has_stack_checkpoint,
             signal_set: false,
             asyncify_start_unwind: instance
                 .exports
@@ -323,7 +355,7 @@ pub struct WasiEnv {
     /// time that it will pause the CPU)
     pub enable_exponential_cpu_backoff: Option<Duration>,
 
-    /// Flag that indicatees if the environment is currently replaying the journal
+    /// Flag that indicates if the environment is currently replaying the journal
     /// (and hence it should not record new events)
     pub replaying_journal: bool,
 
@@ -414,6 +446,12 @@ impl WasiEnv {
 
     pub fn tid(&self) -> WasiThreadId {
         self.thread.tid()
+    }
+
+    /// Returns true if this WASM process will need and try to use
+    /// asyncify while its running which normally means.
+    pub fn will_use_asyncify(&self) -> bool {
+        self.enable_deep_sleep || unsafe { self.inner().has_stack_checkpoint }
     }
 
     /// Re-initializes this environment so that it can be executed again
@@ -783,7 +821,7 @@ impl WasiEnv {
                 tracing::trace!(
                     pid=%ctx.data().pid(),
                     ?signal,
-                    "Processing signal",
+                    "processing signal via handler",
                 );
                 if let Err(err) = handler.call(ctx, signal as i32) {
                     match err.downcast::<WasiError>() {
@@ -809,6 +847,10 @@ impl WasiEnv {
                         }
                     }
                 }
+                tracing::trace!(
+                    pid=%ctx.data().pid(),
+                    "signal processed",
+                );
             }
             Ok(true)
         } else {
@@ -958,11 +1000,17 @@ impl WasiEnv {
         self.enable_journal && !self.replaying_journal
     }
 
+    /// Returns true if the environment has an active journal
+    #[cfg(feature = "journal")]
+    pub fn has_active_journal(&self) -> bool {
+        self.runtime().active_journal().is_some()
+    }
+
     /// Returns the active journal or fails with an error
     #[cfg(feature = "journal")]
     pub fn active_journal(&self) -> Result<&DynJournal, Errno> {
         self.runtime().active_journal().ok_or_else(|| {
-            tracing::warn!("failed to save thread exit as there is not active journal");
+            tracing::debug!("failed to save thread exit as there is not active journal");
             Errno::Fault
         })
     }
@@ -1043,12 +1091,12 @@ impl WasiEnv {
     /// [cmd-atom]: crate::bin_factory::BinaryPackageCommand::atom()
     /// [pkg-fs]: crate::bin_factory::BinaryPackage::webc_fs
     pub fn use_package(&self, pkg: &BinaryPackage) -> Result<(), WasiStateCreationError> {
-        tracing::trace!(packagae=%pkg.package_name, "merging package dependency into wasi environment");
+        tracing::trace!(package=%pkg.id, "merging package dependency into wasi environment");
         let root_fs = &self.state.fs.root_fs;
 
-        // We first need to copy any files in the package over to the
-        // main file system
-        if let Err(e) = InlineWaker::block_on(root_fs.merge(&pkg.webc_fs)) {
+        // We first need to merge the filesystem in the package into the
+        // main file system, if it has not been merged already.
+        if let Err(e) = InlineWaker::block_on(self.state.fs.conditional_union(pkg)) {
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
                 "Unable to merge the package's filesystem into the main one",
@@ -1089,7 +1137,7 @@ impl WasiEnv {
                         {
                             tracing::debug!(
                                 "failed to add package [{}] command [{}] - {}",
-                                pkg.package_name,
+                                pkg.id,
                                 command.name(),
                                 err
                             );
@@ -1115,7 +1163,7 @@ impl WasiEnv {
                     .set_binary(path.as_os_str().to_string_lossy().as_ref(), package);
 
                 tracing::debug!(
-                    package=%pkg.package_name,
+                    package=%pkg.id,
                     command_name=command.name(),
                     path=%path.display(),
                     "Injected a command into the filesystem",
@@ -1135,7 +1183,7 @@ impl WasiEnv {
         let rt = self.runtime();
 
         for package_name in uses {
-            let specifier = package_name.parse::<PackageSpecifier>().map_err(|e| {
+            let specifier = package_name.parse::<PackageSource>().map_err(|e| {
                 WasiStateCreationError::WasiIncludePackageError(format!(
                     "package_name={package_name}, {}",
                     e
@@ -1210,7 +1258,7 @@ impl WasiEnv {
 
         // If snap-shooting is enabled then we should record an event that the thread has exited.
         #[cfg(feature = "journal")]
-        if self.should_journal() {
+        if self.should_journal() && self.has_active_journal() {
             if let Err(err) = JournalEffector::save_thread_exit(self, self.tid(), exit_code) {
                 tracing::warn!("failed to save snapshot event for thread exit - {}", err);
             }

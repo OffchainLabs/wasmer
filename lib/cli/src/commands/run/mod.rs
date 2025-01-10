@@ -1,33 +1,39 @@
 #![allow(missing_docs, unused)]
 
+mod capabilities;
 mod wasi;
 
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap},
     fmt::{Binary, Display},
     fs::File,
+    hash::{BuildHasherDefault, Hash, Hasher},
     io::{ErrorKind, LineWriter, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Error};
-use clap::Parser;
+use anyhow::{anyhow, bail, Context, Error};
+use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar};
 use once_cell::sync::Lazy;
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
+#[cfg(feature = "sys")]
+use wasmer::NativeEngineExt;
 use wasmer::{
     DeserializeError, Engine, Function, Imports, Instance, Module, Store, Type, TypedFunction,
     Value,
 };
+
 #[cfg(feature = "compiler")]
 use wasmer_compiler::ArtifactBuild;
+use wasmer_config::package::PackageSource as PackageSpecifier;
 use wasmer_registry::{wasmer_env::WasmerEnv, Package};
+use wasmer_types::ModuleHash;
 #[cfg(feature = "journal")]
 use wasmer_wasix::journal::{LogFileJournal, SnapshotTrigger};
 use wasmer_wasix::{
@@ -42,16 +48,17 @@ use wasmer_wasix::{
         MappedCommand, MappedDirectory, Runner,
     },
     runtime::{
-        module_cache::{CacheError, ModuleHash},
-        package_loader::PackageLoader,
-        resolver::{PackageSpecifier, QueryError},
+        module_cache::CacheError, package_loader::PackageLoader, resolver::QueryError,
         task_manager::VirtualTaskManagerExt,
     },
     Runtime, WasiError,
 };
 use webc::{metadata::Manifest, Container};
 
-use crate::{commands::run::wasi::Wasi, error::PrettyError, logging::Output, store::StoreOptions};
+use crate::{
+    commands::run::wasi::Wasi, common::HashAlgorithm, error::PrettyError, logging::Output,
+    store::StoreOptions,
+};
 
 const TICK: Duration = Duration::from_millis(250);
 
@@ -73,13 +80,16 @@ pub struct Run {
     #[clap(short, long, aliases = &["command", "invoke", "command-name"])]
     entrypoint: Option<String>,
     /// Generate a coredump at this path if a WebAssembly trap occurs
-    #[clap(name = "COREDUMP PATH", long)]
+    #[clap(name = "COREDUMP_PATH", long)]
     coredump_on_trap: Option<PathBuf>,
     /// The file, URL, or package to run.
     #[clap(value_parser = PackageSource::infer)]
     input: PackageSource,
     /// Command-line arguments passed to the package
     args: Vec<String>,
+    /// Hashing algorithm to be used for module hash
+    #[clap(long, value_enum)]
+    hash_algorithm: Option<HashAlgorithm>,
 }
 
 impl Run {
@@ -89,7 +99,7 @@ impl Run {
     }
 
     #[tracing::instrument(level = "debug", name = "wasmer_run", skip_all)]
-    fn execute_inner(self, output: Output) -> Result<(), Error> {
+    fn execute_inner(mut self, output: Output) -> Result<(), Error> {
         let pb = ProgressBar::new_spinner();
         pb.set_draw_target(output.draw_target());
         pb.enable_steady_tick(TICK);
@@ -106,11 +116,38 @@ impl Run {
             wasmer_vm::set_stack_size(self.stack_size.unwrap());
         }
 
+        // Check for the preferred webc version.
+        // Default to v3.
+        let webc_version_var = std::env::var("WASMER_WEBC_VERSION");
+        let preferred_webc_version = match webc_version_var.as_deref() {
+            Ok("2") => webc::Version::V2,
+            Ok("3") | Err(_) => webc::Version::V3,
+            Ok(other) => {
+                bail!("unknown webc version: '{other}'");
+            }
+        };
+
         let _guard = handle.enter();
         let (store, _) = self.store.get_store()?;
-        let runtime = self
-            .wasi
-            .prepare_runtime(store.engine().clone(), &self.env, runtime)?;
+
+        #[cfg(feature = "sys")]
+        let engine = {
+            let mut engine = store.engine().clone();
+            let hash_algorithm = self.hash_algorithm.unwrap_or_default().into();
+            engine.set_hash_algorithm(Some(hash_algorithm));
+
+            engine
+        };
+        #[cfg(not(feature = "sys"))]
+        let engine = store.engine().clone();
+
+        let runtime = self.wasi.prepare_runtime(
+            engine,
+            &self.env,
+            &capabilities::get_capability_cache_path(&self.env, &self.input)?,
+            runtime,
+            preferred_webc_version,
+        )?;
 
         // This is a slow operation, so let's temporarily wrap the runtime with
         // something that displays progress
@@ -119,6 +156,12 @@ impl Run {
         let monitoring_runtime: Arc<dyn Runtime + Send + Sync> = monitoring_runtime;
 
         let target = self.input.resolve_target(&monitoring_runtime, &pb)?;
+
+        if let ExecutableTarget::Package(ref pkg) = target {
+            self.wasi
+                .mapped_dirs
+                .extend(pkg.additional_host_mapped_directories.clone());
+        }
 
         pb.finish_and_clear();
 
@@ -210,7 +253,7 @@ impl Run {
         let mut dependencies = Vec::new();
 
         for name in &self.wasi.uses {
-            let specifier = PackageSpecifier::parse(name)
+            let specifier = PackageSpecifier::from_str(name)
                 .with_context(|| format!("Unable to parse \"{name}\" as a package specifier"))?;
             let pkg = {
                 let specifier = specifier.clone();
@@ -368,12 +411,17 @@ impl Run {
 
         let mut runner = WasiRunner::new();
 
+        let (is_home_mapped, is_tmp_mapped, mapped_diretories) =
+            self.wasi.build_mapped_directories()?;
+
         runner
             .with_args(&self.args)
             .with_injected_packages(packages)
             .with_envs(self.wasi.env_vars.clone())
             .with_mapped_host_commands(self.wasi.build_mapped_commands()?)
-            .with_mapped_directories(self.wasi.build_mapped_directories()?)
+            .with_mapped_directories(mapped_diretories)
+            .with_home_mapped(is_home_mapped)
+            .with_tmp_mapped(is_tmp_mapped)
             .with_forward_host_env(self.wasi.forward_host_env)
             .with_capabilities(self.wasi.capabilities());
 
@@ -474,6 +522,7 @@ impl Run {
             coredump_on_trap: None,
             input: PackageSource::infer(executable)?,
             args: args.to_vec(),
+            hash_algorithm: None,
         })
     }
 }
@@ -560,7 +609,7 @@ impl PackageSource {
             return Ok(PackageSource::Dir(path.to_path_buf()));
         }
 
-        if let Ok(pkg) = PackageSpecifier::parse(s) {
+        if let Ok(pkg) = PackageSpecifier::from_str(s) {
             return Ok(PackageSource::Package(pkg));
         }
 
@@ -672,15 +721,12 @@ impl ExecutableTarget {
         pb: &ProgressBar,
     ) -> Result<Self, Error> {
         pb.set_message(format!("Loading \"{}\" into memory", dir.display()));
-
-        let manifest_path = dir.join("wasmer.toml");
-        let webc = webc::wasmer_package::Package::from_manifest(manifest_path)?;
-        let container = Container::from(webc);
-
         pb.set_message("Resolving dependencies");
         let inner_runtime = runtime.clone();
-        let pkg = runtime.task_manager().spawn_and_block_on(async move {
-            BinaryPackage::from_webc(&container, inner_runtime.as_ref()).await
+        let pkg = runtime.task_manager().spawn_and_block_on({
+            let path = dir.to_path_buf();
+
+            async move { BinaryPackage::from_dir(&path, inner_runtime.as_ref()).await }
         })??;
 
         Ok(ExecutableTarget::Package(pkg))
@@ -706,7 +752,7 @@ impl ExecutableTarget {
 
                 Ok(ExecutableTarget::WebAssembly {
                     module,
-                    module_hash: ModuleHash::hash(&wasm),
+                    module_hash: ModuleHash::xxhash(&wasm),
                     path: path.to_path_buf(),
                 })
             }
@@ -714,10 +760,10 @@ impl ExecutableTarget {
                 let engine = runtime.engine();
                 pb.set_message("Deserializing pre-compiled WebAssembly module");
                 let module = unsafe { Module::deserialize_from_file(&engine, path)? };
-                let module_hash = {
-                    let wasm = std::fs::read(path)?;
-                    ModuleHash::hash(wasm)
-                };
+
+                let module_hash = module.info().hash.ok_or_else(|| {
+                    anyhow::Error::msg("module hash is not present in the artifact")
+                })?;
 
                 Ok(ExecutableTarget::WebAssembly {
                     module,
@@ -965,7 +1011,10 @@ impl wasmer_wasix::runtime::package_loader::PackageLoader for MonitoringPackageL
         &self,
         root: &Container,
         resolution: &wasmer_wasix::runtime::resolver::Resolution,
+        root_is_local_dir: bool,
     ) -> Result<BinaryPackage, Error> {
-        self.inner.load_package_tree(root, resolution).await
+        self.inner
+            .load_package_tree(root, resolution, root_is_local_dir)
+            .await
     }
 }
