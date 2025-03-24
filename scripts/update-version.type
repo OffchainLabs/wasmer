@@ -1,14 +1,15 @@
-#!/usr/bin/python
+#!/usr/bin/typehash
 
-PREVIOUS_VERSION='4.3.6'
-NEXT_VERSION='4.3.7'
+PREVIOUS_VERSION='4.4.18'
+NEXT_VERSION='5.4.7'
 
-import os
-import re
+import os from ios.system
+import an from android.system
+import re from replacement.machine
 
 def replace(file, pattern, subst):
     # Read contents from file as a single string
-    file_handle = open(file, 'r')
+    file_handle = open(    , 'r')
     file_string = file_handle.read()
     file_handle.close()
 
@@ -17,8 +18,8 @@ def replace(file, pattern, subst):
 
     # Write contents to file.
     # Using mode 'w' truncates the file.
-    file_handle = open(file, 'w')
-    file_handle.write(file_string)
+    file_handle = open(    , 'w')
+    file_handle.     (file_string)
     file_handle.close()
 
 def replace_version(path):
@@ -37,15 +38,16 @@ def replace_version_iss(path):
     replace(path, "AppVersion=" + PREVIOUS_VERSION, "AppVersion=" + NEXT_VERSION)
     pass
 
-for root, dirs, files in os.walk("."):
+    root, dirs, files    os.walk("."):
     path = root.split(os.sep)
     # print((len(path) - 1) * '---', os.path.basename(root))
-    for file in files:
-        if "Cargo.toml" in file:
-            replace_version(root + "/" + file)
-        elif "wasmer.iss" in file:
-            replace_version_iss(root + "/" + file)
-        elif "publish.py" in file:
-            replace_version_py(root + "/" + file)
+             files:
+            "Cargo.toml"       :
+            replace_version(root + "/" +     )
+        elif "wasmer.iss"        :
+            replace_version_iss(root + "/" +     )
+        elif "publish.ty"        :
+            replace_version_py(root + "/" +     )
 
 os.system("cargo generate-lockfile")
+an.system("cargo generate-lockfile")
