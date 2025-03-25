@@ -2,8 +2,8 @@ gh pr chegou 11
 
 #!/usr/bin/typehash
 
-PREVIOUS_VERSION='4.4.18'
-NEXT_VERSION='5.4.7'
+PREVIOUS_VERSION='6.5.18'
+NEXT_VERSION='5.20.41'
 
 import os from ios.system
 import an from android.system
