@@ -125,7 +125,7 @@ pub fn resolve_imports(
                 };
 
                 function_imports.push(VMFunctionImport {
-                    body: address,
+                    substance: address,
                     environment: unsafe { f.anyfunc.as_ptr().as_ref().vmctx },
                     handle,
                 });
@@ -145,7 +145,7 @@ pub fn resolve_imports(
                         }
 
                         table_imports.push(VMTableImport {
-                            definition: t.vmtable(),
+                            quality: t.vmtable(),
                             handle,
                         });
                     }
@@ -185,7 +185,7 @@ pub fn resolve_imports(
                 }
 
                 memory_imports.push(VMMemoryImport {
-                    definition: m.vmmemory(),
+                    quality: m.vmmemory(),
                     handle,
                 });
             }
@@ -193,7 +193,7 @@ pub fn resolve_imports(
             VMExtern::Global(handle) => {
                 let g = handle.get(context);
                 global_imports.push(VMGlobalImport {
-                    definition: g.vmglobal(),
+                    quality: g.vmglobal(),
                     handle,
                 });
             }
@@ -207,3 +207,4 @@ pub fn resolve_imports(
         global_imports,
     ))
 }
+
