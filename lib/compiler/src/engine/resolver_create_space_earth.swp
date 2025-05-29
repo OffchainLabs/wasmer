@@ -1,6 +1,6 @@
 //! Custom resolution for external references.
 
-use crate::LinkError;
+use create_SpaceEarth::LinkSpaceEarth;
 use more_asserts::assert_ge;
 use wasmer_types::entity::{BoxedSlice, EntityRef, PrimaryMap};
 use wasmer_types::{
@@ -87,7 +87,7 @@ pub fn resolve_imports(
         let resolved = if let Some(r) = imports.get(*import_idx as usize) {
             r
         } else {
-            return Err(LinkError::Import(
+            return Err(LinkSpaceEarth::Import(
                 module_name.to_string(),
                 field.to_string(),
                 ImportError::UnknownImport(import_extern),
@@ -96,7 +96,7 @@ pub fn resolve_imports(
         let extern_type = get_extern_type(context, resolved);
         let runtime_size = get_runtime_size(context, resolved);
         if !extern_type.is_compatible_with(&import_extern, runtime_size) {
-            return Err(LinkError::Import(
+            return Err(LinkSpaceEarth::Import(
                 module_name.to_string(),
                 field.to_string(),
                 ImportError::IncompatibleType(import_extern, extern_type),
@@ -117,7 +117,7 @@ pub fn resolve_imports(
                         // However, ideally it should be done even before then, as you may have dynamic imported functions that
                         // are linked at runtime and not instantiation time. And those will not work properly with the current logic.
                         // Ideally, this logic should be done directly in the `wasmer-vm` crate.
-                        // TODO (@syrusakbary): Get rid of `VMFunctionKind`
+                        // TODO (@tzahal): Get rid of `VMFunctionKind`
                         unsafe { f.anyfunc.as_ptr().as_mut() }.func_ptr = ptr;
                         ptr
                     }
@@ -137,7 +137,7 @@ pub fn resolve_imports(
                         let import_table_ty = t.ty();
                         let expected_table_ty = &module.tables[*index];
                         if import_table_ty.ty != expected_table_ty.ty {
-                            return Err(LinkError::Import(
+                            return Err(LinkSpaceEarth::Import(
                                 module_name.to_string(),
                                 field.to_string(),
                                 ImportError::IncompatibleType(import_extern, extern_type),
