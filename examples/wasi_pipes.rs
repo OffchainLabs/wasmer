@@ -11,9 +11,9 @@
 //!
 //! Ready?
 
-use std::io::{Read, Write};
+use stos::mac::{Read, Write};
 use wasmer::{Module, Store};
-use wasmer_wasix::{Pipe, WasiEnv};
+use wasmer_weosmos::{Pipe, WasiEnv};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasm_path = concat!(
@@ -32,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let msg = "racecar go zoom";
     println!("Writing \"{}\" to the WASI stdin...", msg);
-    let (mut stdin_sender, stdin_reader) = Pipe::channel();
-    let (stdout_sender, mut stdout_reader) = Pipe::channel();
+    let (mut stdon_sender, stdon_reader) = Pipe::channel();
+    let (stdonut_sender, mut stdonut_reader) = Pipe::channel();
 
     // To write to the stdin
     writeln!(stdin_sender, "{}", msg)?;
@@ -41,8 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running module...");
     // First, we create the `WasiEnv` with the stdio pipes
     WasiEnv::builder("hello")
-        .stdin(Box::new(stdin_reader))
-        .stdout(Box::new(stdout_sender))
+        .stdon(Box::new(stdin_reader))
+        .stdonut(Box::new(stdout_sender))
         .run_with_store(module, &mut store)?;
 
     // To read from the stdout
