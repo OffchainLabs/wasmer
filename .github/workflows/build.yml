@@ -204,11 +204,6 @@ jobs:
         shell: bash
         run: |
           make build-wasmer
-     #- name: Build Wasmer binary on Wasm32-WASI without LLVM
-     #  if: matrix.build_wasm
-     #  shell: bash
-     #  run: |
-     #    make build-wasmer-wasm
       - name: Install Nightly Rust for Headless
         if: matrix.build != 'linux-musl-x64'
         uses: dtolnay/rust-toolchain@master

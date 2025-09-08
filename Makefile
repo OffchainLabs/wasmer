@@ -377,7 +377,7 @@ check-wasmer:
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
 
 check-wasmer-wasm:
-	$(CARGO_BINARY) check --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasi --features singlepass,cranelift --bin wasmer-compiler --locked
+	$(CARGO_BINARY) check --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasip1 --features singlepass,cranelift --bin wasmer-compiler --locked
 
 check-capi:
 	RUSTFLAGS="${RUSTFLAGS}" $(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/c-api/Cargo.toml  \
@@ -396,7 +396,7 @@ bench:
 	$(CARGO_BINARY) bench $(CARGO_TARGET_FLAG) $(compiler_features)
 
 build-wasmer-wasm:
-	$(CARGO_BINARY) build --release --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasi --features singlepass,cranelift --bin wasmer-compiler --locked
+	$(CARGO_BINARY) build --release --manifest-path lib/cli-compiler/Cargo.toml --target wasm32-wasip1 --features singlepass,cranelift --bin wasmer-compiler --locked
 
 # For best results ensure the release profile looks like the following
 # in Cargo.toml:
@@ -638,12 +638,12 @@ test-wasix: build-wasmer
 
 test-integration-cli: build-wasmer build-capi package-capi-headless package distribution
 	cp ./dist/wasmer.tar.gz ./link.tar.gz
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	WASMER_DIR=`pwd`/package $(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --features webc_runner --no-fail-fast -p wasmer-integration-tests-cli --locked
 
 # Before running this in the CI, we need to set up link.tar.gz and /cache/wasmer-[target].tar.gz
 test-integration-cli-ci: require-nextest
-	rustup target add wasm32-wasi
+	rustup target add wasm32-wasip1
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --features webc_runner -p wasmer-integration-tests-cli --locked
 
 test-integration-ios:

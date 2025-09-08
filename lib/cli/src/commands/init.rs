@@ -554,6 +554,6 @@ fn parse_cargo_toml(manifest_path: &PathBuf) -> Result<MiniCargoTomlPackage, any
         build_dir: metadata
             .target_directory
             .into_std_path_buf()
-            .join("wasm32-wasi"),
+            .join("wasm32-wasip1"),
     })
 }

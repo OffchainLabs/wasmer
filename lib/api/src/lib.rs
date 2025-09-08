@@ -417,7 +417,7 @@ compile_error!("The `jsc` feature must be enabled only for non-`wasm32` target."
 
 #[cfg(all(feature = "js", not(target_arch = "wasm32")))]
 compile_error!(
-    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasi`)."
+    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasip1`)."
 );
 
 mod access;

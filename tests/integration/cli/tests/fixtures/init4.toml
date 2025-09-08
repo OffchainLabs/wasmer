@@ -7,7 +7,7 @@ description = 'Description for package wasmer'
 
 [[module]]
 name = 'wasmer'
-source = 'target/wasm32-wasi/release/wasmer.wasm'
+source = 'target/wasm32-wasip1/release/wasmer.wasm'
 abi = 'wasi'
 
 [module.interfaces]
