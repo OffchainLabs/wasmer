@@ -4,13 +4,13 @@ use anyhow::Context as _;
 use reqwest;
 use thiserror::Error;
 use wasmer_backend_api::{
-    types::{DeployApp, DeployAppVersion, PublishDeployAppVars},
     WasmerClient,
+    types::{DeployApp, DeployAppVersion, PublishDeployAppVars},
 };
 use wasmer_config::{app::AppConfigV1, package::PackageSource};
 
 use crate::package::publish::{
-    publish_package_directory, PackagePublishError, PublishOptions, PublishProgress, PublishWait,
+    PackagePublishError, PublishOptions, PublishProgress, PublishWait, publish_package_directory,
 };
 
 /// When waiting for an app deployment.
@@ -88,24 +88,24 @@ where
         .or_else(|| config.owner.clone())
         .ok_or(DeployError::MissingOwner)?;
 
-    if opts.publish_package {
-        if let PackageSource::Path(ref path) = config.package {
-            let publish_opts = PublishOptions {
-                namespace: Some(
-                    opts.package_namespace
-                        .clone()
-                        .unwrap_or_else(|| owner.clone()),
-                ),
-                timeout: opts.publish_timeout,
-                wait: PublishWait::Container,
-                ..Default::default()
-            };
-            let ident = publish_package_directory(client, path.as_ref(), publish_opts, |e| {
-                progress(DeployProgress::Publishing(e));
-            })
-            .await?;
-            config.package = ident.into();
-        }
+    if opts.publish_package
+        && let PackageSource::Path(ref path) = config.package
+    {
+        let publish_opts = PublishOptions {
+            namespace: Some(
+                opts.package_namespace
+                    .clone()
+                    .unwrap_or_else(|| owner.clone()),
+            ),
+            timeout: opts.publish_timeout,
+            wait: PublishWait::Container,
+            ..Default::default()
+        };
+        let ident = publish_package_directory(client, path.as_ref(), publish_opts, |e| {
+            progress(DeployProgress::Publishing(e));
+        })
+        .await?;
+        config.package = ident.into();
     }
 
     let name = config.name.clone().ok_or(DeployError::MissingName)?;
