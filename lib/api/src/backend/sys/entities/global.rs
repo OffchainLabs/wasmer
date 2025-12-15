@@ -59,7 +59,7 @@ impl Global {
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
-        let global = self.handle.get_mut(store.objects_mut());
+        let global = self.handle.get_mut(store.objects_mut().as_sys_mut());
         if global.ty().mutability != Mutability::Var {
             return Err(RuntimeError::new("Attempted to set an immutable global"));
         }

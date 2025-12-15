@@ -48,7 +48,7 @@ pub enum CpuFeature {
     LZCNT,
     // ARM features
     NEON,
-    // Risc-V features
+    // RISC-V features
 }
 
 impl CpuFeature {
@@ -125,6 +125,11 @@ impl CpuFeature {
     pub fn set() -> EnumSet<Self> {
         // We default to an empty hash set
         EnumSet::new()
+    }
+
+    /// Build a set of all available `CpuFeature`s.
+    pub fn all() -> EnumSet<Self> {
+        EnumSet::all()
     }
 }
 
