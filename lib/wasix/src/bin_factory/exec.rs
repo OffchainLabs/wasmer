@@ -6,6 +6,7 @@ use crate::{
         TaskJoinHandle,
     },
     runtime::{
+        module_cache::HashedModuleData,
         task_manager::{
             TaskWasm, TaskWasmRecycle, TaskWasmRecycleProperties, TaskWasmRunProperties,
         },
@@ -15,69 +16,80 @@ use crate::{
     RewindState, SpawnError, WasiError, WasiRuntimeError,
 };
 use tracing::*;
-use wasmer::{Function, Memory32, Memory64, Module, Store};
+use virtual_mio::InlineWaker;
+use wasmer::{Function, Memory32, Memory64, Module, RuntimeError, Store, Value};
 use wasmer_wasix_types::wasi::Errno;
 
-use super::BinaryPackage;
+use super::{BinaryPackage, BinaryPackageCommand};
 use crate::{Runtime, WasiEnv, WasiFunctionEnv};
 
 #[tracing::instrument(level = "trace", skip_all, fields(%name, package_id=%binary.id))]
 pub async fn spawn_exec(
     binary: BinaryPackage,
     name: &str,
-    _store: Store,
     env: WasiEnv,
     runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
 ) -> Result<TaskJoinHandle, SpawnError> {
     spawn_union_fs(&env, &binary).await?;
 
-    let wasm = spawn_load_wasm(&env, &binary, name).await?;
+    let cmd = package_command_by_name(&binary, name)?;
+    let module = runtime.load_command_module(cmd).await?;
 
-    spawn_exec_wasm(wasm, name, env, runtime).await
-}
-
-#[tracing::instrument(level = "trace", skip_all, fields(%name))]
-pub async fn spawn_exec_wasm(
-    wasm: &[u8],
-    name: &str,
-    env: WasiEnv,
-    runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
-) -> Result<TaskJoinHandle, SpawnError> {
-    let module = spawn_load_module(&env, name, wasm, runtime).await?;
+    // Free the space used by the binary, since we don't need it
+    // any longer
+    drop(binary);
 
     spawn_exec_module(module, env, runtime)
 }
 
-pub async fn spawn_load_wasm<'a>(
-    env: &WasiEnv,
-    binary: &'a BinaryPackage,
+#[tracing::instrument(level = "trace", skip_all, fields(%name))]
+pub async fn spawn_exec_wasm(
+    wasm: HashedModuleData,
     name: &str,
-) -> Result<&'a [u8], SpawnError> {
-    let wasm = if let Some(cmd) = binary.get_command(name) {
-        cmd.atom.as_ref()
-    } else if let Some(cmd) = binary.get_entrypoint_command() {
-        &cmd.atom
+    env: WasiEnv,
+    runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
+) -> Result<TaskJoinHandle, SpawnError> {
+    let module = spawn_load_module(name, wasm, runtime).await?;
+
+    spawn_exec_module(module, env, runtime)
+}
+
+pub fn package_command_by_name<'a>(
+    pkg: &'a BinaryPackage,
+    name: &str,
+) -> Result<&'a BinaryPackageCommand, SpawnError> {
+    // If an explicit command is provided, use it.
+    // Otherwise, use the entrypoint.
+    // If no entrypoint exists, and the package has a single
+    // command, then use it. This is done for backwards
+    // compatibility.
+    let cmd = if let Some(cmd) = pkg.get_command(name) {
+        cmd
+    } else if let Some(cmd) = pkg.get_entrypoint_command() {
+        cmd
     } else {
-        tracing::error!(
-          command=name,
-          pkg=%binary.id,
-          "Unable to spawn a command because its package has no entrypoint",
-        );
-        env.on_exit(Some(Errno::Noexec.into())).await;
-        return Err(SpawnError::MissingEntrypoint {
-            package_id: binary.id.clone(),
-        });
+        match pkg.commands.as_slice() {
+            // Package only has a single command, so use it.
+            [first] => first,
+            // Package either has no command, or has multiple commands, which
+            // would make the choice ambiguous, so fail.
+            _ => {
+                return Err(SpawnError::MissingEntrypoint {
+                    package_id: pkg.id.clone(),
+                });
+            }
+        }
     };
-    Ok(wasm)
+
+    Ok(cmd)
 }
 
 pub async fn spawn_load_module(
-    env: &WasiEnv,
     name: &str,
-    wasm: &[u8],
+    wasm: HashedModuleData,
     runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
 ) -> Result<Module, SpawnError> {
-    match runtime.load_module(wasm).await {
+    match runtime.load_hashed_module(wasm, None).await {
         Ok(module) => Ok(module),
         Err(err) => {
             tracing::error!(
@@ -85,7 +97,6 @@ pub async fn spawn_load_module(
                 error = &err as &dyn std::error::Error,
                 "Failed to compile the module",
             );
-            env.on_exit(Some(Errno::Noexec.into())).await;
             Err(err)
         }
     }
@@ -125,10 +136,18 @@ pub fn spawn_exec_module(
         let tasks_outer = tasks.clone();
 
         tasks_outer
-            .task_wasm(TaskWasm::new(Box::new(run_exec), env, module, true))
+            .task_wasm(
+                TaskWasm::new(Box::new(run_exec), env, module, true, true).with_pre_run(Box::new(
+                    |ctx, store| {
+                        Box::pin(async move {
+                            ctx.data(store).state.fs.close_cloexec_fds().await;
+                        })
+                    },
+                )),
+            )
             .map_err(|err| {
                 error!("wasi[{}]::failed to launch module - {}", pid, err);
-                SpawnError::UnknownError
+                SpawnError::Other(Box::new(err))
             })?
     };
 
@@ -167,7 +186,10 @@ pub fn run_exec(props: TaskWasmRunProperties) {
     // Perform the initialization
     let ctx = {
         // If this module exports an _initialize function, run that first.
-        if let Ok(initialize) = unsafe { ctx.data(&store).inner() }
+        if let Ok(initialize) = ctx
+            .data(&store)
+            .inner()
+            .main_module_instance_handles()
             .instance
             .exports
             .get_function("_initialize")
@@ -209,11 +231,13 @@ pub fn run_exec(props: TaskWasmRunProperties) {
 }
 
 fn get_start(ctx: &WasiFunctionEnv, store: &Store) -> Option<Function> {
-    unsafe { ctx.data(store).inner() }
+    ctx.data(store)
+        .inner()
+        .main_module_instance_handles()
         .instance
         .exports
         .get_function("_start")
-        .map(|a| a.clone())
+        .cloned()
         .ok()
 }
 
@@ -266,9 +290,7 @@ fn call_module(
     // Invoke the start function
     let ret = {
         // Call the module
-        let call_ret = if let Some(start) = get_start(&ctx, &store) {
-            start.call(&mut store, &[])
-        } else {
+        let Some(start) = get_start(&ctx, &store) else {
             debug!("wasi[{}]::exec-failed: missing _start function", pid);
             ctx.data(&store)
                 .blocking_on_exit(Some(Errno::Noexec.into()));
@@ -276,9 +298,29 @@ fn call_module(
             return;
         };
 
+        let mut call_ret = start.call(&mut store, &[]);
+
+        loop {
+            // Technically, it's an error for a vfork to return from main, but anyway...
+            match resume_vfork(&ctx, &mut store, &start, &call_ret) {
+                // A vfork was resumed, there may be another, so loop back
+                Ok(Some(ret)) => call_ret = ret,
+
+                // An error was encountered when restoring from the vfork, report it
+                Err(e) => {
+                    call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(e.into()))));
+                    break;
+                }
+
+                // No vfork, keep the call_ret value
+                Ok(None) => break,
+            }
+        }
+
         if let Err(err) = call_ret {
             match err.downcast::<WasiError>() {
                 Ok(WasiError::Exit(code)) if code.is_success() => Ok(Errno::Success),
+                Ok(WasiError::ThreadExit) => Ok(Errno::Success),
                 Ok(WasiError::Exit(code)) => {
                     runtime.on_taint(TaintReason::NonZeroExitCode(code));
                     Err(WasiError::Exit(code).into())
@@ -308,9 +350,14 @@ fn call_module(
                     return;
                 }
                 Ok(WasiError::UnknownWasiVersion) => {
-                    debug!("failed as wasi version is unknown",);
+                    debug!("failed as wasi version is unknown");
                     runtime.on_taint(TaintReason::UnknownWasiVersion);
                     Ok(Errno::Noexec)
+                }
+                Ok(WasiError::DlSymbolResolutionFailed(symbol)) => {
+                    debug!("failed as a needed DL symbol could not be resolved");
+                    runtime.on_taint(TaintReason::DlSymbolResolutionFailed(symbol.clone()));
+                    Err(WasiError::DlSymbolResolutionFailed(symbol).into())
                 }
                 Err(err) => {
                     runtime.on_taint(TaintReason::RuntimeError(err.clone()));
@@ -323,7 +370,14 @@ fn call_module(
     };
 
     let code = if let Err(err) = &ret {
-        err.as_exit_code().unwrap_or_else(|| Errno::Noexec.into())
+        match err.as_exit_code() {
+            Some(s) => s,
+            None => {
+                error!("{err}");
+                eprintln!("{err}");
+                Errno::Noexec.into()
+            }
+        }
     } else {
         Errno::Success.into()
     };
@@ -334,4 +388,99 @@ fn call_module(
 
     debug!("wasi[{pid}]::main() has exited with {code}");
     handle.thread.set_status_finished(ret.map(|a| a.into()));
+}
+
+#[allow(clippy::type_complexity)]
+fn resume_vfork(
+    ctx: &WasiFunctionEnv,
+    store: &mut Store,
+    start: &Function,
+    call_ret: &Result<Box<[Value]>, RuntimeError>,
+) -> Result<Option<Result<Box<[Value]>, RuntimeError>>, Errno> {
+    let (err, code) = match call_ret {
+        Ok(_) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),
+        Err(err) => match err.downcast_ref::<WasiError>() {
+            // If the child process is just deep sleeping, we don't restore the vfork
+            Some(WasiError::DeepSleep(..)) => return Ok(None),
+
+            Some(WasiError::Exit(code)) => (None, *code),
+            Some(WasiError::ThreadExit) => (None, wasmer_wasix_types::wasi::ExitCode::from(0u16)),
+            Some(WasiError::UnknownWasiVersion) => (None, Errno::Noexec.into()),
+            Some(WasiError::DlSymbolResolutionFailed(_)) => (None, Errno::Nolink.into()),
+            None => (
+                Some(WasiRuntimeError::from(err.clone())),
+                Errno::Unknown.into(),
+            ),
+        },
+    };
+
+    if let Some(mut vfork) = ctx.data_mut(store).vfork.take() {
+        if let Some(err) = err {
+            error!(%err, "Error from child process");
+            eprintln!("{err}");
+        }
+
+        InlineWaker::block_on(
+            unsafe { ctx.data(store).get_memory_and_wasi_state(store, 0) }
+                .1
+                .fs
+                .close_all(),
+        );
+
+        tracing::debug!(
+            pid = %ctx.data_mut(store).process.pid(),
+            vfork_pid = %vfork.env.process.pid(),
+            "Resuming from vfork after child process was terminated"
+        );
+
+        // Restore the WasiEnv to the point when we vforked
+        vfork.env.swap_inner(ctx.data_mut(store));
+        std::mem::swap(vfork.env.as_mut(), ctx.data_mut(store));
+        let mut child_env = *vfork.env;
+        child_env.owned_handles.push(vfork.handle);
+
+        // Terminate the child process
+        child_env.process.terminate(code);
+
+        // Jump back to the vfork point and current on execution
+        let child_pid = child_env.process.pid();
+        let rewind_stack = vfork.rewind_stack.freeze();
+        let store_data = vfork.store_data;
+
+        let ctx = ctx.env.clone().into_mut(store);
+        // Now rewind the previous stack and carry on from where we did the vfork
+        let rewind_result = if vfork.is_64bit {
+            crate::syscalls::rewind::<Memory64, _>(
+                ctx,
+                None,
+                rewind_stack,
+                store_data,
+                crate::syscalls::ForkResult {
+                    pid: child_pid.raw() as wasmer_wasix_types::wasi::Pid,
+                    ret: Errno::Success,
+                },
+            )
+        } else {
+            crate::syscalls::rewind::<Memory32, _>(
+                ctx,
+                None,
+                rewind_stack,
+                store_data,
+                crate::syscalls::ForkResult {
+                    pid: child_pid.raw() as wasmer_wasix_types::wasi::Pid,
+                    ret: Errno::Success,
+                },
+            )
+        };
+
+        match rewind_result {
+            Errno::Success => Ok(Some(start.call(store, &[]))),
+            err => {
+                warn!("fork failed - could not rewind the stack - errno={}", err);
+                Err(err)
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }

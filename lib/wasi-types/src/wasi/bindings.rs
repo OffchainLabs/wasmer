@@ -674,6 +674,22 @@ impl core::fmt::Debug for Advice {
     }
 }
 wai_bindgen_rust::bitflags::bitflags! {
+    // Actual file descriptor flags. Note, WASI's fdflags actually represent
+    // file table flags, not fd flags... Hence the weird name.
+    #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+    pub struct Fdflagsext : u16 {
+        #[doc = " Close this file in the child process when spawning one."]
+        const CLOEXEC = 1 << 0;
+    }
+}
+impl Fdflagsext {
+    #[doc = " Convert from a raw integer, preserving any unknown bits. See"]
+    #[doc = " <https://github.com/bitflags/bitflags/issues/263#issuecomment-957088321>"]
+    pub fn from_bits_preserve(bits: u16) -> Self {
+        Self { bits }
+    }
+}
+wai_bindgen_rust::bitflags::bitflags! {
     #[doc = " File descriptor flags."]
     #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
     pub struct Fdflags : u16 {
@@ -2240,6 +2256,7 @@ impl core::fmt::Debug for OptionTimestamp {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub enum Signal {
     Signone = 0,
     Sighup,
@@ -2273,6 +2290,7 @@ pub enum Signal {
     Sigpoll,
     Sigpwr,
     Sigsys,
+    Sigwakeup, // This is a host-side-only signal. Add new guest-side signals before this one.
 }
 impl core::fmt::Debug for Signal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2309,9 +2327,195 @@ impl core::fmt::Debug for Signal {
             Signal::Sigpoll => f.debug_tuple("Signal::Sigpoll").finish(),
             Signal::Sigpwr => f.debug_tuple("Signal::Sigpwr").finish(),
             Signal::Sigsys => f.debug_tuple("Signal::Sigsys").finish(),
+            Signal::Sigwakeup => f.debug_tuple("Signal::Sigwakeup").finish(),
         }
     }
 }
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub enum Disposition {
+    Default,
+    Ignore,
+}
+impl core::fmt::Debug for Disposition {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Disposition::Default => f.debug_tuple("SigAction::Default").finish(),
+            Disposition::Ignore => f.debug_tuple("SigAction::Ignore").finish(),
+        }
+    }
+}
+
+#[doc = " A signal and its corresponding action."]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SignalDisposition {
+    pub sig: Signal,
+    pub disp: Disposition,
+}
+impl core::fmt::Debug for SignalDisposition {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SignalAndAction")
+            .field("sig", &self.sig)
+            .field("act", &self.disp)
+            .finish()
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+pub enum ProcSpawnFdOpName {
+    Close,
+    Dup2,
+    Open,
+    Chdir,
+    Fchdir,
+}
+impl core::fmt::Debug for ProcSpawnFdOpName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ProcSpawnFdOpName::Close => f.debug_tuple("ProcSpawnFdOpName::Close").finish(),
+            ProcSpawnFdOpName::Dup2 => f.debug_tuple("ProcSpawnFdOpName::Dup2").finish(),
+            ProcSpawnFdOpName::Open => f.debug_tuple("ProcSpawnFdOpName::Open").finish(),
+            ProcSpawnFdOpName::Chdir => f.debug_tuple("ProcSpawnFdOpName::Chdir").finish(),
+            ProcSpawnFdOpName::Fchdir => f.debug_tuple("ProcSpawnFdOpName::Fchdir").finish(),
+        }
+    }
+}
+
+#[doc = "  An FD operation performed during proc_spawn2, which is the backing syscall for posix_spawn."]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ProcSpawnFdOp<M: MemorySize> {
+    pub cmd: ProcSpawnFdOpName,
+    pub fd: Fd,
+    pub src_fd: Fd,
+    pub name: M::Offset,
+    pub name_len: M::Offset,
+    pub dirflags: LookupFlags,
+    pub oflags: Oflags,
+    pub fs_rights_base: Rights,
+    pub fs_rights_inheriting: Rights,
+    pub fdflags: Fdflags,
+    pub fdflagsext: Fdflagsext,
+}
+impl<M: MemorySize> core::fmt::Debug for ProcSpawnFdOp<M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProcSpawnFdOp")
+            .field("cmd", &self.cmd)
+            .field("fd", &self.fd)
+            .field("src_fd", &self.src_fd)
+            .field("name", &self.name)
+            .field("name_len", &self.name_len)
+            .field("dirflags", &self.dirflags)
+            .field("oflags", &self.oflags)
+            .field("fs_rights_base", &self.fs_rights_base)
+            .field("fs_rights_inheriting", &self.fs_rights_inheriting)
+            .field("fdflags", &self.fdflags)
+            .field("fdflagsext", &self.fdflagsext)
+            .finish()
+    }
+}
+
+pub type DlHandle = u32;
+
+wai_bindgen_rust::bitflags::bitflags! {
+    pub struct DlFlags : u32 {
+        const LAZY = 1 << 0;
+        const NOW = 1 << 1;
+        const GLOBAL = 1 << 2;
+        const NOLOAD = 1 << 3;
+        const NODELETE = 1 << 4;
+        const DEEPBIND = 1 << 5;
+    }
+}
+impl DlFlags {
+    pub fn from_bits_preserve(bits: u32) -> Self {
+        Self { bits }
+    }
+}
+
+#[doc = " The type of a WASM value represented at runtime for use with the wasix closures API."]
+#[doc = ""]
+#[doc = " For now only number types are supported, but this may be extended in the future to include references"]
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+pub enum WasmValueType {
+    #[doc = " A i32 parameter."]
+    I32,
+    #[doc = " A i64 parameter."]
+    I64,
+    #[doc = " A f32 parameter."]
+    F32,
+    #[doc = " A f64 parameter."]
+    F64,
+    #[doc = " A v128 parameter."]
+    V128,
+}
+impl core::fmt::Debug for WasmValueType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WasmValueType::I32 => f.debug_tuple("WasmValueType::I32").finish(),
+            WasmValueType::I64 => f.debug_tuple("WasmValueType::I64").finish(),
+            WasmValueType::F32 => f.debug_tuple("WasmValueType::F32").finish(),
+            WasmValueType::F64 => f.debug_tuple("WasmValueType::F64").finish(),
+            WasmValueType::V128 => f.debug_tuple("WasmValueType::V128").finish(),
+        }
+    }
+}
+
+// TODO: if necessary, must be implemented in wit-bindgen
+unsafe impl ValueType for WasmValueType {
+    #[inline]
+    fn zero_padding_bytes(&self, _bytes: &mut [MaybeUninit<u8>]) {}
+}
+
+impl TryFrom<wasmer::Type> for WasmValueType {
+    type Error = ();
+    fn try_from(value: wasmer::Type) -> Result<Self, Self::Error> {
+        match value {
+            wasmer::Type::I32 => Ok(Self::I32),
+            wasmer::Type::I64 => Ok(Self::I64),
+            wasmer::Type::F32 => Ok(Self::F32),
+            wasmer::Type::F64 => Ok(Self::F64),
+            wasmer::Type::V128 => Ok(Self::V128),
+            _ => Err(()),
+        }
+    }
+}
+impl From<WasmValueType> for wasmer::Type {
+    fn from(value: WasmValueType) -> Self {
+        match value {
+            WasmValueType::I32 => Self::I32,
+            WasmValueType::I64 => Self::I64,
+            WasmValueType::F32 => Self::F32,
+            WasmValueType::F64 => Self::F64,
+            WasmValueType::V128 => Self::V128,
+        }
+    }
+}
+
+#[doc = " A structure representing the reflection information for a function signature"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ReflectionResult {
+    #[doc = " Whether the result is cacheable"]
+    pub cacheable: Bool,
+    #[doc = " Number of arguments the function takes"]
+    pub arguments: u16,
+    #[doc = " Number of results the function returns"]
+    pub results: u16,
+}
+
+unsafe impl wasmer_types::ValueType for ReflectionResult {
+    #[inline]
+    fn zero_padding_bytes(&self, bytes: &mut [MaybeUninit<u8>]) {
+        bytes[1].write(0);
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct AddrUnspec {
@@ -2737,6 +2941,12 @@ unsafe impl wasmer::FromToNativeWasmType for Advice {
     fn is_from_store(&self, _store: &impl wasmer::AsStoreRef) -> bool {
         false
     }
+}
+
+// TODO: if necessary, must be implemented in wit-bindgen
+unsafe impl ValueType for Fdflagsext {
+    #[inline]
+    fn zero_padding_bytes(&self, _bytes: &mut [MaybeUninit<u8>]) {}
 }
 
 // TODO: if necessary, must be implemented in wit-bindgen

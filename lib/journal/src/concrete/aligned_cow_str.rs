@@ -1,9 +1,10 @@
-use std::{borrow::Cow, fmt, ops::Deref};
+use std::{borrow::Cow, ops::Deref};
 
 use rkyv::{
-    ser::{ScratchSpace, Serializer},
+    rancor::Fallible,
+    ser::{Allocator, WriterExt},
     vec::{ArchivedVec, VecResolver},
-    Archive, Archived, Serialize,
+    Archive, Archived,
 };
 
 #[derive(Clone)]
@@ -32,7 +33,7 @@ impl<'a> AlignedCowStr<'a> {
     }
 }
 
-impl<'a> Default for AlignedCowStr<'a> {
+impl Default for AlignedCowStr<'_> {
     fn default() -> Self {
         Self {
             inner: String::new().into(),
@@ -40,14 +41,14 @@ impl<'a> Default for AlignedCowStr<'a> {
     }
 }
 
-impl<'a> fmt::Debug for AlignedCowStr<'a> {
+impl std::fmt::Debug for AlignedCowStr<'_> {
     #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.fmt(f)
     }
 }
 
-impl<'a> From<String> for AlignedCowStr<'a> {
+impl From<String> for AlignedCowStr<'_> {
     fn from(value: String) -> Self {
         Self {
             inner: value.into(),
@@ -56,7 +57,7 @@ impl<'a> From<String> for AlignedCowStr<'a> {
 }
 
 #[allow(clippy::from_over_into)]
-impl<'a> Into<String> for AlignedCowStr<'a> {
+impl Into<String> for AlignedCowStr<'_> {
     fn into(self) -> String {
         self.inner.into_owned()
     }
@@ -75,7 +76,7 @@ impl<'a> Into<Cow<'a, str>> for AlignedCowStr<'a> {
     }
 }
 
-impl<'a> Deref for AlignedCowStr<'a> {
+impl Deref for AlignedCowStr<'_> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -83,32 +84,31 @@ impl<'a> Deref for AlignedCowStr<'a> {
     }
 }
 
-impl<'a> AsRef<str> for AlignedCowStr<'a> {
+impl AsRef<str> for AlignedCowStr<'_> {
     #[inline]
     fn as_ref(&self) -> &str {
         self.inner.as_ref()
     }
 }
 
-impl<'a> Archive for AlignedCowStr<'a> {
+impl Archive for AlignedCowStr<'_> {
     type Archived = ArchivedVec<u8>;
     type Resolver = VecResolver;
 
     #[inline]
-    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
-        ArchivedVec::resolve_from_len(self.inner.as_bytes().len(), pos, resolver, out);
+    fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        ArchivedVec::resolve_from_len(self.inner.len(), resolver, out);
     }
 }
 
-impl<'a, S: ScratchSpace + Serializer + ?Sized> Serialize<S> for AlignedCowStr<'a> {
+impl<S> rkyv::Serialize<S> for AlignedCowStr<'_>
+where
+    S: Fallible + WriterExt<S::Error> + Allocator + ?Sized,
+    S::Error: rkyv::rancor::Source,
+{
     #[inline]
     fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
         serializer.align(Self::ALIGNMENT)?;
-        unsafe {
-            ArchivedVec::<Archived<u8>>::serialize_copy_from_slice(
-                self.inner.as_bytes(),
-                serializer,
-            )
-        }
+        ArchivedVec::<Archived<u8>>::serialize_from_slice(self.inner.as_bytes(), serializer)
     }
 }

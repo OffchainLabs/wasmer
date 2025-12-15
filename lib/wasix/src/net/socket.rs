@@ -4,12 +4,11 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard},
     task::{Context, Poll},
     time::Duration,
 };
 
-use derivative::Derivative;
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use virtual_mio::InterestHandler;
@@ -33,8 +32,7 @@ pub enum InodeHttpSocketType {
     Headers,
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct SocketProperties {
     pub family: Addressfamily,
     pub ty: Socktype,
@@ -51,7 +49,6 @@ pub struct SocketProperties {
     pub read_timeout: Option<Duration>,
     pub accept_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
-    #[derivative(Debug = "ignore")]
     pub handler: Option<Box<dyn InterestHandler + Send + Sync>>,
 }
 
@@ -236,6 +233,35 @@ impl InodeSocket {
         inner.poll_read_ready(cx)
     }
 
+    // When a sendto or connect call comes in for a UDP "pre-socket", it must be bound to
+    // an ephemeral port automatically.
+    // Apparently, clippy fails to recognize the write-locked guard being passed into
+    // the other function, hence the `allow` attribute.
+    #[allow(clippy::await_holding_lock, clippy::readonly_write_lock)]
+    pub async fn auto_bind_udp(
+        &self,
+        tasks: &dyn VirtualTaskManager,
+        net: &dyn VirtualNetworking,
+    ) -> Result<Option<InodeSocket>, Errno> {
+        let timeout = self
+            .opt_time(TimeType::BindTimeout)
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(30));
+        let inner = self.inner.protected.write().unwrap();
+        match &inner.kind {
+            InodeSocketKind::PreSocket { props, .. } if props.ty == Socktype::Dgram => {
+                let addr = match props.family {
+                    Addressfamily::Inet4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    Addressfamily::Inet6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+                    _ => return Err(Errno::Notsup),
+                };
+                Self::bind_internal(tasks, net, addr, timeout, inner).await
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub async fn bind(
         &self,
         tasks: &dyn VirtualTaskManager,
@@ -247,9 +273,20 @@ impl InodeSocket {
             .ok()
             .flatten()
             .unwrap_or(Duration::from_secs(30));
+        let inner = self.inner.protected.write().unwrap();
+        Self::bind_internal(tasks, net, set_addr, timeout, inner).await
+    }
 
+    // The lock is dropped before awaiting, but clippy doesn't realize it
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_internal(
+        tasks: &dyn VirtualTaskManager,
+        net: &dyn VirtualNetworking,
+        set_addr: SocketAddr,
+        timeout: Duration,
+        mut inner: RwLockWriteGuard<'_, InodeSocketProtected>,
+    ) -> Result<Option<InodeSocket>, Errno> {
         let socket = {
-            let mut inner = self.inner.protected.write().unwrap();
             match &mut inner.kind {
                 InodeSocketKind::PreSocket { props, addr, .. } => {
                     match props.family {
@@ -286,7 +323,6 @@ impl InodeSocket {
                         Socktype::Dgram => {
                             let reuse_port = props.reuse_port;
                             let reuse_addr = props.reuse_addr;
-                            drop(inner);
 
                             net.bind_udp(addr, reuse_port, reuse_addr)
                         }
@@ -332,7 +368,6 @@ impl InodeSocket {
                         Socktype::Dgram => {
                             let reuse_port = props.reuse_port;
                             let reuse_addr = props.reuse_addr;
-                            drop(inner);
 
                             net.bind_udp(addr, reuse_port, reuse_addr)
                         }
@@ -342,6 +377,8 @@ impl InodeSocket {
                 _ => return Err(Errno::Notsup),
             }
         };
+
+        drop(inner);
 
         tokio::select! {
             socket = socket => {
@@ -459,7 +496,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a> Drop for SocketAccepter<'a> {
+        impl Drop for SocketAccepter<'_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.sock.inner.protected.write().unwrap();
@@ -467,7 +504,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a> Future for SocketAccepter<'a> {
+        impl Future for SocketAccepter<'_> {
             type Output = Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr), Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1081,7 +1118,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketSender<'a, 'b> {
+        impl Drop for SocketSender<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1089,7 +1126,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketSender<'a, 'b> {
+        impl Future for SocketSender<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1169,7 +1206,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketSender<'a, 'b> {
+        impl Drop for SocketSender<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1177,7 +1214,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketSender<'a, 'b> {
+        impl Future for SocketSender<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1244,14 +1281,16 @@ impl InodeSocket {
         buf: &mut [MaybeUninit<u8>],
         timeout: Option<Duration>,
         nonblocking: bool,
+        peek: bool,
     ) -> Result<usize, Errno> {
         struct SocketReceiver<'a, 'b> {
             inner: &'a InodeSocketInner,
             data: &'b mut [MaybeUninit<u8>],
             nonblocking: bool,
+            peek: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketReceiver<'a, 'b> {
+        impl Drop for SocketReceiver<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1259,26 +1298,29 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketReceiver<'a, 'b> {
+        impl Future for SocketReceiver<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> Poll<Self::Output> {
                 loop {
+                    let peek = self.peek;
                     let mut inner = self.inner.protected.write().unwrap();
                     let res = match &mut inner.kind {
-                        InodeSocketKind::Raw(socket) => socket.try_recv(self.data),
-                        InodeSocketKind::TcpStream { socket, .. } => socket.try_recv(self.data),
+                        InodeSocketKind::Raw(socket) => socket.try_recv(self.data, peek),
+                        InodeSocketKind::TcpStream { socket, .. } => {
+                            socket.try_recv(self.data, peek)
+                        }
                         InodeSocketKind::UdpSocket { socket, peer } => {
                             if let Some(peer) = peer {
-                                match socket.try_recv_from(self.data) {
+                                match socket.try_recv_from(self.data, peek) {
                                     Ok((amt, addr)) if addr == *peer => Ok(amt),
                                     Ok(_) => Err(NetworkError::WouldBlock),
                                     Err(err) => Err(err),
                                 }
                             } else {
-                                match socket.try_recv_from(self.data) {
+                                match socket.try_recv_from(self.data, peek) {
                                     Ok((amt, _)) => Ok(amt),
                                     Err(err) => Err(err),
                                 }
@@ -1320,6 +1362,7 @@ impl InodeSocket {
             inner: &self.inner,
             data: buf,
             nonblocking,
+            peek,
             handler_registered: false,
         };
         if let Some(timeout) = timeout {
@@ -1338,14 +1381,16 @@ impl InodeSocket {
         buf: &mut [MaybeUninit<u8>],
         timeout: Option<Duration>,
         nonblocking: bool,
+        peek: bool,
     ) -> Result<(usize, SocketAddr), Errno> {
         struct SocketReceiver<'a, 'b> {
             inner: &'a InodeSocketInner,
             data: &'b mut [MaybeUninit<u8>],
             nonblocking: bool,
+            peek: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketReceiver<'a, 'b> {
+        impl Drop for SocketReceiver<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1353,18 +1398,19 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketReceiver<'a, 'b> {
+        impl Future for SocketReceiver<'_, '_> {
             type Output = Result<(usize, SocketAddr), Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> Poll<Self::Output> {
+                let peek = self.peek;
                 let mut inner = self.inner.protected.write().unwrap();
                 loop {
                     let res = match &mut inner.kind {
-                        InodeSocketKind::Icmp(socket) => socket.try_recv_from(self.data),
+                        InodeSocketKind::Icmp(socket) => socket.try_recv_from(self.data, peek),
                         InodeSocketKind::UdpSocket { socket, .. } => {
-                            socket.try_recv_from(self.data)
+                            socket.try_recv_from(self.data, peek)
                         }
                         InodeSocketKind::RemoteSocket {
                             is_dead, peer_addr, ..
@@ -1402,6 +1448,7 @@ impl InodeSocket {
             inner: &self.inner,
             data: buf,
             nonblocking,
+            peek,
             handler_registered: false,
         };
         if let Some(timeout) = timeout {

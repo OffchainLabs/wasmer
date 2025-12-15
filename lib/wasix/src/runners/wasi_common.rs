@@ -5,17 +5,15 @@ use std::{
 };
 
 use anyhow::{Context, Error};
-use derivative::Derivative;
 use futures::future::BoxFuture;
 use tokio::runtime::Handle;
 use virtual_fs::{FileSystem, FsError, OverlayFileSystem, RootFileSystemBuilder, TmpFileSystem};
-use wasmer::Imports;
 use webc::metadata::annotations::Wasi as WasiAnnotation;
 
 use crate::{
     bin_factory::BinaryPackage,
     capabilities::Capabilities,
-    journal::{DynJournal, SnapshotTrigger},
+    journal::{DynJournal, DynReadableJournal, SnapshotTrigger},
     WasiEnvBuilder,
 };
 
@@ -29,9 +27,9 @@ pub struct MappedCommand {
     pub target: String,
 }
 
-#[derive(Derivative, Default, Clone)]
-#[derivative(Debug)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct CommonWasiOptions {
+    pub(crate) entry_function: Option<String>,
     pub(crate) args: Vec<String>,
     pub(crate) env: HashMap<String, String>,
     pub(crate) forward_host_env: bool,
@@ -41,12 +39,13 @@ pub(crate) struct CommonWasiOptions {
     pub(crate) is_tmp_mapped: bool,
     pub(crate) injected_packages: Vec<BinaryPackage>,
     pub(crate) capabilities: Capabilities,
-    #[derivative(Debug = "ignore")]
-    pub(crate) journals: Vec<Arc<DynJournal>>,
+    pub(crate) read_only_journals: Vec<Arc<DynReadableJournal>>,
+    pub(crate) writable_journals: Vec<Arc<DynJournal>>,
     pub(crate) snapshot_on: Vec<SnapshotTrigger>,
     pub(crate) snapshot_interval: Option<std::time::Duration>,
+    pub(crate) stop_running_after_snapshot: bool,
+    pub(crate) skip_stdio_during_bootstrap: bool,
     pub(crate) current_dir: Option<PathBuf>,
-    pub(crate) additional_imports: Imports,
 }
 
 impl CommonWasiOptions {
@@ -57,6 +56,10 @@ impl CommonWasiOptions {
         wasi: &WasiAnnotation,
         root_fs: Option<TmpFileSystem>,
     ) -> Result<(), anyhow::Error> {
+        if let Some(ref entry_function) = self.entry_function {
+            builder.set_entry_function(entry_function);
+        }
+
         let root_fs = root_fs.unwrap_or_else(|| {
             RootFileSystemBuilder::default()
                 .with_tmp(!self.is_tmp_mapped)
@@ -64,12 +67,14 @@ impl CommonWasiOptions {
         });
         let fs = prepare_filesystem(root_fs, &self.mounts, container_fs)?;
 
-        builder.add_preopen_dir("/")?;
-
+        // TODO: What's a preopen for '.' supposed to mean anyway? Why do we need it?
         if self.mounts.iter().all(|m| m.guest != ".") {
             // The user hasn't mounted "." to anything, so let's map it to "/"
-            builder.add_map_dir(".", "/")?;
+            let path = builder.get_current_dir().unwrap_or(PathBuf::from("/"));
+            builder.add_map_dir(".", path)?;
         }
+
+        builder.add_preopen_dir("/")?;
 
         builder.set_fs(Box::new(fs));
 
@@ -88,7 +93,22 @@ impl CommonWasiOptions {
 
         *builder.capabilities_mut() = self.capabilities.clone();
 
-        builder.add_imports(&self.additional_imports);
+        #[cfg(feature = "journal")]
+        {
+            for journal in &self.read_only_journals {
+                builder.add_read_only_journal(journal.clone());
+            }
+            for journal in &self.writable_journals {
+                builder.add_writable_journal(journal.clone());
+            }
+            for trigger in &self.snapshot_on {
+                builder.add_snapshot_trigger(*trigger);
+            }
+            if let Some(interval) = self.snapshot_interval {
+                builder.with_snapshot_interval(interval);
+            }
+            builder.with_stop_running_after_snapshot(self.stop_running_after_snapshot);
+        }
 
         Ok(())
     }
@@ -380,7 +400,7 @@ mod tests {
 
     use tempfile::TempDir;
     use virtual_fs::{DirEntry, FileType, Metadata, WebcVolumeFileSystem};
-    use webc::Container;
+    use wasmer_package::utils::from_bytes;
 
     use super::*;
 
@@ -457,7 +477,7 @@ mod tests {
             guest: "/home".to_string(),
             host: sub_dir,
         })];
-        let container = Container::from_bytes(PYTHON).unwrap();
+        let container = from_bytes(PYTHON).unwrap();
         let webc_fs = WebcVolumeFileSystem::mount_all(&container);
 
         let root_fs = RootFileSystemBuilder::default().build();

@@ -31,13 +31,18 @@ impl ThreadLocalCache {
 impl ModuleCache for ThreadLocalCache {
     #[tracing::instrument(level = "debug", skip_all, fields(%key))]
     async fn load(&self, key: ModuleHash, engine: &Engine) -> Result<Module, CacheError> {
-        match self.lookup(key, engine.deterministic_id()) {
+        match self.lookup(key, &engine.deterministic_id()) {
             Some(m) => {
                 tracing::debug!("Cache hit!");
                 Ok(m)
             }
             None => Err(CacheError::NotFound),
         }
+    }
+
+    async fn contains(&self, key: ModuleHash, engine: &Engine) -> Result<bool, CacheError> {
+        let exists = self.lookup(key, &engine.deterministic_id()).is_some();
+        Ok(exists)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(%key))]
@@ -47,7 +52,7 @@ impl ModuleCache for ThreadLocalCache {
         engine: &Engine,
         module: &Module,
     ) -> Result<(), CacheError> {
-        self.insert(key, module, engine.deterministic_id());
+        self.insert(key, module, &engine.deterministic_id());
         Ok(())
     }
 }

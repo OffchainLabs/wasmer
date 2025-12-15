@@ -19,7 +19,7 @@ use crate::syscalls::*;
 /// ## Return
 ///
 /// The number of IP addresses returned during the DNS resolution.
-#[instrument(level = "debug", skip_all, fields(host = field::Empty, %port), ret)]
+#[instrument(level = "trace", skip_all, fields(host = field::Empty, %port), ret)]
 pub fn resolve<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     host: WasmPtr<u8, M>,
@@ -29,6 +29,8 @@ pub fn resolve<M: MemorySize>(
     naddrs: M::Offset,
     ret_naddrs: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let naddrs: usize = wasi_try_ok!(naddrs.try_into().map_err(|_| Errno::Inval));
     let mut env = ctx.data();
     let host_str = {

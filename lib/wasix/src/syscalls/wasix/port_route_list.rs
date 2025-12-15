@@ -10,12 +10,14 @@ use crate::syscalls::*;
 /// ## Parameters
 ///
 /// * `routes` - The buffer where routes will be stored
-#[instrument(level = "debug", skip_all, fields(nroutes = field::Empty, max_routes = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(nroutes = field::Empty, max_routes = field::Empty), ret)]
 pub fn port_route_list<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     routes_ptr: WasmPtr<Route, M>,
     nroutes_ptr: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let mut env = ctx.data();
     let mut memory = unsafe { env.memory_view(&ctx) };
     let ref_nroutes = nroutes_ptr.deref(&memory);

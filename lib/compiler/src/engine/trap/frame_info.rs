@@ -11,32 +11,29 @@
 //! let module: ModuleInfo = ...;
 //! FRAME_INFO.register(module, compiled_functions);
 //! ```
-use core::ops::Deref;
-use rkyv::vec::ArchivedVec;
-use std::cmp;
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
-use wasmer_types::compilation::address_map::{
-    ArchivedFunctionAddressMap, ArchivedInstructionAddressMap,
+
+use crate::types::address_map::{
+    ArchivedFunctionAddressMap, ArchivedInstructionAddressMap, FunctionAddressMap,
+    InstructionAddressMap,
 };
-use wasmer_types::compilation::function::ArchivedCompiledFunctionFrameInfo;
-use wasmer_types::entity::{BoxedSlice, EntityRef, PrimaryMap};
+use crate::types::function::{ArchivedCompiledFunctionFrameInfo, CompiledFunctionFrameInfo};
+use crate::ArtifactBuildFromArchive;
+use rkyv::vec::ArchivedVec;
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock, RwLock};
+use wasmer_types::lib::std::{cmp, ops::Deref};
 use wasmer_types::{
-    CompiledFunctionFrameInfo, FrameInfo, FunctionAddressMap, InstructionAddressMap,
-    LocalFunctionIndex, ModuleInfo, SourceLoc, TrapInformation,
+    entity::{BoxedSlice, EntityRef, PrimaryMap},
+    FrameInfo, LocalFunctionIndex, ModuleInfo, SourceLoc, TrapInformation,
 };
 use wasmer_vm::FunctionBodyPtr;
 
-use crate::ArtifactBuildFromArchive;
-
-lazy_static::lazy_static! {
-    /// This is a global cache of backtrace frame information for all active
-    ///
-    /// This global cache is used during `Trap` creation to symbolicate frames.
-    /// This is populated on module compilation, and it is cleared out whenever
-    /// all references to a module are dropped.
-    pub static ref FRAME_INFO: RwLock<GlobalFrameInfo> = Default::default();
-}
+/// This is a global cache of backtrace frame information for all active
+///
+/// This global cache is used during `Trap` creation to symbolicate frames.
+/// This is populated on module compilation, and it is cleared out whenever
+/// all references to a module are dropped.
+pub static FRAME_INFO: LazyLock<RwLock<GlobalFrameInfo>> = LazyLock::new(RwLock::default);
 
 #[derive(Default)]
 pub struct GlobalFrameInfo {
@@ -54,6 +51,7 @@ pub struct GlobalFrameInfo {
 
 /// An RAII structure used to unregister a module's frame information when the
 /// module is destroyed.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct GlobalFrameInfoRegistration {
     /// The key that will be removed from the global `ranges` map when this is
     /// dropped.
@@ -244,7 +242,8 @@ impl CompiledFunctionFrameInfoVariant<'_> {
                 VecTrapInformationVariant::Ref(&info.traps)
             }
             CompiledFunctionFrameInfoVariant::Archived(info) => {
-                VecTrapInformationVariant::Archived(&info.traps)
+                let traps = rkyv::deserialize::<_, rkyv::rancor::Error>(&info.traps).unwrap();
+                VecTrapInformationVariant::Owned(traps)
             }
         }
     }
@@ -254,16 +253,17 @@ impl CompiledFunctionFrameInfoVariant<'_> {
 #[derive(Debug)]
 pub enum VecTrapInformationVariant<'a> {
     Ref(&'a Vec<TrapInformation>),
-    Archived(&'a ArchivedVec<TrapInformation>),
+    Owned(Vec<TrapInformation>),
 }
 
+// We need to implement it for the `Deref` in `wasmer_types` to support both `core` and `std`.
 impl Deref for VecTrapInformationVariant<'_> {
     type Target = [TrapInformation];
 
     fn deref(&self) -> &Self::Target {
         match self {
             VecTrapInformationVariant::Ref(traps) => traps,
-            VecTrapInformationVariant::Archived(traps) => traps,
+            VecTrapInformationVariant::Owned(traps) => traps,
         }
     }
 }
@@ -289,28 +289,32 @@ impl FunctionAddressMapVariant<'_> {
     pub fn start_srcloc(&self) -> SourceLoc {
         match self {
             FunctionAddressMapVariant::Ref(map) => map.start_srcloc,
-            FunctionAddressMapVariant::Archived(map) => map.start_srcloc,
+            FunctionAddressMapVariant::Archived(map) => {
+                rkyv::deserialize::<_, rkyv::rancor::Error>(&map.start_srcloc).unwrap()
+            }
         }
     }
 
     pub fn end_srcloc(&self) -> SourceLoc {
         match self {
             FunctionAddressMapVariant::Ref(map) => map.end_srcloc,
-            FunctionAddressMapVariant::Archived(map) => map.end_srcloc,
+            FunctionAddressMapVariant::Archived(map) => {
+                rkyv::deserialize::<_, rkyv::rancor::Error>(&map.end_srcloc).unwrap()
+            }
         }
     }
 
     pub fn body_offset(&self) -> usize {
         match self {
             FunctionAddressMapVariant::Ref(map) => map.body_offset,
-            FunctionAddressMapVariant::Archived(map) => map.body_offset as usize,
+            FunctionAddressMapVariant::Archived(map) => map.body_offset.to_native() as usize,
         }
     }
 
     pub fn body_len(&self) -> usize {
         match self {
             FunctionAddressMapVariant::Ref(map) => map.body_len,
-            FunctionAddressMapVariant::Archived(map) => map.body_len as usize,
+            FunctionAddressMapVariant::Archived(map) => map.body_len.to_native() as usize,
         }
     }
 }
@@ -328,7 +332,7 @@ impl FunctionAddressMapInstructionVariant<'_> {
                 instructions.binary_search_by_key(&key, |map| map.code_offset)
             }
             FunctionAddressMapInstructionVariant::Archived(instructions) => {
-                instructions.binary_search_by_key(&key, |map| map.code_offset as usize)
+                instructions.binary_search_by_key(&key, |map| map.code_offset.to_native() as usize)
             }
         }
     }
@@ -339,9 +343,9 @@ impl FunctionAddressMapInstructionVariant<'_> {
             FunctionAddressMapInstructionVariant::Archived(instructions) => instructions
                 .get(index)
                 .map(|map| InstructionAddressMap {
-                    srcloc: map.srcloc,
-                    code_offset: map.code_offset as usize,
-                    code_len: map.code_len as usize,
+                    srcloc: rkyv::deserialize::<_, rkyv::rancor::Error>(&map.srcloc).unwrap(),
+                    code_offset: map.code_offset.to_native() as usize,
+                    code_len: map.code_len.to_native() as usize,
                 })
                 .unwrap(),
         }
@@ -359,7 +363,7 @@ pub fn register(
     finished_functions: &BoxedSlice<LocalFunctionIndex, FunctionExtent>,
     frame_infos: FrameInfosVariant,
 ) -> Option<GlobalFrameInfoRegistration> {
-    let mut min = usize::max_value();
+    let mut min = usize::MAX;
     let mut max = 0;
     let mut functions = BTreeMap::new();
     for (

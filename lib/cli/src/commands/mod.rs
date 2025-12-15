@@ -178,12 +178,12 @@ impl WasmerCmd {
             #[cfg(feature = "compiler")]
             Some(Cmd::Compile(compile)) => compile.execute(),
             #[cfg(any(feature = "static-artifact-create", feature = "wasmer-artifact-create"))]
-            Some(Cmd::CreateExe(create_exe)) => create_exe.execute(),
+            Some(Cmd::CreateExe(create_exe)) => create_exe.run(),
             #[cfg(feature = "static-artifact-create")]
             Some(Cmd::CreateObj(create_obj)) => create_obj.execute(),
-            Some(Cmd::Config(config)) => config.execute(),
+            Some(Cmd::Config(config)) => config.run(),
             Some(Cmd::Inspect(inspect)) => inspect.execute(),
-            Some(Cmd::Init(init)) => init.execute(),
+            Some(Cmd::Init(init)) => init.run(),
             Some(Cmd::Login(login)) => login.run(),
             Some(Cmd::Auth(auth)) => auth.run(),
             Some(Cmd::Publish(publish)) => publish.run().map(|_| ()),
@@ -198,9 +198,6 @@ impl WasmerCmd {
             Some(Cmd::Container(cmd)) => match cmd {
                 crate::commands::Container::Unpack(cmd) => cmd.execute(),
             },
-            /*
-            Some(Cmd::Connect(connect)) => connect.execute(),
-            */
             #[cfg(feature = "static-artifact-create")]
             Some(Cmd::GenCHeader(gen_heder)) => gen_heder.execute(),
             #[cfg(feature = "wast")]
@@ -208,7 +205,7 @@ impl WasmerCmd {
             #[cfg(target_os = "linux")]
             Some(Cmd::Binfmt(binfmt)) => binfmt.execute(),
             Some(Cmd::Whoami(whoami)) => whoami.run(),
-            Some(Cmd::Add(install)) => install.execute(),
+            Some(Cmd::Add(add)) => add.run(),
 
             // Deploy commands.
             Some(Cmd::Deploy(c)) => c.run(),
@@ -287,7 +284,7 @@ impl WasmerCmd {
 #[allow(clippy::large_enum_variant)]
 /// The options for the wasmer Command Line Interface
 enum Cmd {
-    /// Login into a wasmer.io-like registry
+    /// Login into Wasmer
     Login(Login),
 
     #[clap(subcommand)]
@@ -295,7 +292,7 @@ enum Cmd {
 
     /// Publish a package to a registry [alias: package publish]
     #[clap(name = "publish")]
-    Publish(crate::commands::package::publish::PackagePublish),
+    Publish(PackagePublish),
 
     /// Manage the local Wasmer cache
     Cache(Cache),
@@ -405,7 +402,7 @@ enum Cmd {
     Whoami(Whoami),
 
     /// Add a Wasmer package's bindings to your application
-    Add(Add),
+    Add(CmdAdd),
 
     /// Run a WebAssembly file or Wasmer container
     #[clap(alias = "run-unstable")]
@@ -482,17 +479,29 @@ fn print_version(verbose: bool) -> Result<(), anyhow::Error> {
     println!("commit-date: {}", env!("WASMER_BUILD_DATE"));
     println!("host: {}", target_lexicon::HOST);
 
-    let mut compilers = Vec::<&'static str>::new();
+    let mut runtimes = Vec::<&'static str>::new();
     if cfg!(feature = "singlepass") {
-        compilers.push("singlepass");
+        runtimes.push("singlepass");
     }
     if cfg!(feature = "cranelift") {
-        compilers.push("cranelift");
+        runtimes.push("cranelift");
     }
     if cfg!(feature = "llvm") {
-        compilers.push("llvm");
+        runtimes.push("llvm");
     }
-    println!("compiler: {}", compilers.join(","));
 
+    if cfg!(feature = "wamr") {
+        runtimes.push("wamr");
+    }
+
+    if cfg!(feature = "wasmi") {
+        runtimes.push("wasmi");
+    }
+
+    if cfg!(feature = "v8") {
+        runtimes.push("v8");
+    }
+
+    println!("runtimes: {}", runtimes.join(", "));
     Ok(())
 }

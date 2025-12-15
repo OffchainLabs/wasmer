@@ -12,7 +12,7 @@ use crate::syscalls::*;
 ///     The length from the offset to which the advice applies
 /// - `__wasi_advice_t advice`
 ///     The advice to give
-#[instrument(level = "debug", skip_all, fields(%fd, %offset, %len, ?advice), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, %offset, %len, ?advice), ret)]
 pub fn fd_advise(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
@@ -20,6 +20,8 @@ pub fn fd_advise(
     len: Filesize,
     advice: Advice,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     wasi_try_ok!(fd_advise_internal(&mut ctx, fd, offset, len, advice));
     let env = ctx.data();
 
@@ -27,7 +29,7 @@ pub fn fd_advise(
     if env.enable_journal {
         JournalEffector::save_fd_advise(&mut ctx, fd, offset, len, advice).map_err(|err| {
             tracing::error!("failed to save file descriptor advise event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -49,7 +51,7 @@ pub(crate) fn fd_advise_internal(
     let fd_entry = state.fs.get_fd(fd)?;
     let inode = fd_entry.inode;
 
-    if !fd_entry.rights.contains(Rights::FD_ADVISE) {
+    if !fd_entry.inner.rights.contains(Rights::FD_ADVISE) {
         return Err(Errno::Access);
     }
 

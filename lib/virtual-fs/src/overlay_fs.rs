@@ -823,7 +823,7 @@ where
         fn poll_copy_start_and_progress(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
             replace_with_or_abort(&mut self.state, |state| match state {
                 CowState::ReadOnly(inner) => {
-                    tracing::trace!("COW file touched, starting file clone",);
+                    tracing::trace!("COW file touched, starting file clone");
                     CowState::SeekingGet(inner)
                 }
                 state => state,
@@ -970,22 +970,33 @@ where
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> Poll<Result<(), std::io::Error>> {
-            match self.poll_copy_start_and_progress(cx) {
+            match self.poll_copy_progress(cx) {
                 Poll::Ready(Ok(())) => {}
-                p => return p,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
-            Pin::new(self.state.as_mut()).poll_flush(cx)
+            // The file may actually be read-only and not support flush operations
+            // at all, and there's nothing to flush in read-only state anyway.
+            match self.state {
+                CowState::ReadOnly(_) => Poll::Ready(Ok(())),
+                _ => Pin::new(self.state.as_mut()).poll_flush(cx),
+            }
         }
 
         fn poll_shutdown(
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> Poll<Result<(), std::io::Error>> {
-            match self.poll_copy_start_and_progress(cx) {
+            match self.poll_copy_progress(cx) {
                 Poll::Ready(Ok(())) => {}
-                p => return p,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
-            Pin::new(self.state.as_mut()).poll_shutdown(cx)
+            // Same deal as flush above
+            match self.state {
+                CowState::ReadOnly(_) => Poll::Ready(Ok(())),
+                _ => Pin::new(self.state.as_mut()).poll_shutdown(cx),
+            }
         }
     }
 
@@ -1082,7 +1093,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         struct IterFilesystems<'a, S>(&'a S);
-        impl<'a, S> Debug for IterFilesystems<'a, S>
+        impl<S> Debug for IterFilesystems<'_, S>
         where
             S: for<'b> FileSystems<'b>,
         {
@@ -1285,7 +1296,7 @@ mod tests {
         f.set_len(0).unwrap();
         assert_eq!(f.write(b"Hi").await.unwrap(), 2);
         // Same with flushing
-        assert_eq!(f.flush().await.unwrap(), (),);
+        assert_eq!(f.flush().await.unwrap(), ());
 
         // if we now read it then the data should be different
         buf = String::new();
@@ -1536,6 +1547,39 @@ mod tests {
             fs.metadata(Path::new("/secondary")).unwrap_err(),
             FsError::EntryNotFound
         )
+    }
+
+    /// Make sure files that are never written are not copied to the primary,
+    /// even when opened with write permissions.
+    /// Regression test for https://github.com/wasmerio/wasmer/issues/5445
+    #[tokio::test]
+    async fn test_overlayfs_readonly_files_not_copied() {
+        let primary = MemFS::default();
+        let secondary = MemFS::default();
+        ops::create_dir_all(&secondary, "/secondary").unwrap();
+        ops::write(&secondary, "/secondary/file.txt", b"Hello, World!")
+            .await
+            .unwrap();
+
+        let fs = OverlayFileSystem::new(primary, [secondary]);
+
+        {
+            let mut f = fs
+                .new_open_options()
+                .read(true)
+                .write(true)
+                .open(Path::new("/secondary/file.txt"))
+                .unwrap();
+            let mut s = String::new();
+            f.read_to_string(&mut s).await.unwrap();
+            assert_eq!(s, "Hello, World!");
+
+            f.flush().await.unwrap();
+            f.shutdown().await.unwrap();
+        }
+
+        // Primary should not have the file
+        assert!(!ops::is_file(&fs.primary, "/secondary/file.txt"));
     }
 
     // OLD tests that used WebcFileSystem.

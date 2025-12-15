@@ -10,13 +10,15 @@ use crate::syscalls::*;
 ///     The offset from the start marking the beginning of the allocation
 /// - `Filesize len`
 ///     The length from the offset marking the end of the allocation
-#[instrument(level = "debug", skip_all, fields(%fd, %offset, %len), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, %offset, %len), ret)]
 pub fn fd_allocate(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
     offset: Filesize,
     len: Filesize,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     wasi_try_ok!(fd_allocate_internal(&mut ctx, fd, offset, len));
     let env = ctx.data();
 
@@ -24,7 +26,7 @@ pub fn fd_allocate(
     if env.enable_journal {
         JournalEffector::save_fd_allocate(&mut ctx, fd, offset, len).map_err(|err| {
             tracing::error!("failed to save file descriptor allocate event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -42,7 +44,7 @@ pub(crate) fn fd_allocate_internal(
     let fd_entry = state.fs.get_fd(fd)?;
     let inode = fd_entry.inode;
 
-    if !fd_entry.rights.contains(Rights::FD_ALLOCATE) {
+    if !fd_entry.inner.rights.contains(Rights::FD_ALLOCATE) {
         return Err(Errno::Access);
     }
     let new_size = offset.checked_add(len).ok_or(Errno::Inval)?;
@@ -57,13 +59,16 @@ pub(crate) fn fd_allocate_internal(
                     return Err(Errno::Badf);
                 }
             }
-            Kind::Socket { .. } => return Err(Errno::Badf),
-            Kind::Pipe { .. } => return Err(Errno::Badf),
             Kind::Buffer { buffer } => {
                 buffer.resize(new_size as usize, 0);
             }
-            Kind::Symlink { .. } => return Err(Errno::Badf),
-            Kind::EventNotifications { .. } | Kind::Epoll { .. } => return Err(Errno::Badf),
+            Kind::Socket { .. }
+            | Kind::PipeRx { .. }
+            | Kind::PipeTx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::Symlink { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Err(Errno::Badf),
             Kind::Dir { .. } | Kind::Root { .. } => return Err(Errno::Isdir),
         }
     }

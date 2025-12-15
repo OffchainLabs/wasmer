@@ -6,7 +6,7 @@ use crate::location::CombinedRegister;
 use crate::location::Reg as AbstractReg;
 use std::collections::BTreeMap;
 use std::slice::Iter;
-use wasmer_types::{CallingConvention, Type};
+use wasmer_types::{target::CallingConvention, CompileError, Type};
 
 /// General-purpose registers.
 #[repr(u8)]
@@ -30,6 +30,12 @@ pub enum GPR {
     R15 = 15,
 }
 
+impl From<GPR> for u8 {
+    fn from(val: GPR) -> Self {
+        val as u8
+    }
+}
+
 /// XMM registers.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -51,6 +57,12 @@ pub enum XMM {
     XMM13 = 13,
     XMM14 = 14,
     XMM15 = 15,
+}
+
+impl From<XMM> for u8 {
+    fn from(val: XMM) -> Self {
+        val as u8
+    }
 }
 
 impl AbstractReg for GPR {
@@ -257,8 +269,12 @@ pub struct ArgumentRegisterAllocator {
 
 impl ArgumentRegisterAllocator {
     /// Allocates a register for argument type `ty`. Returns `None` if no register is available for this type.
-    pub fn next(&mut self, ty: Type, calling_convention: CallingConvention) -> Option<X64Register> {
-        match calling_convention {
+    pub fn next(
+        &mut self,
+        ty: Type,
+        calling_convention: CallingConvention,
+    ) -> Result<Option<X64Register>, CompileError> {
+        let ret = match calling_convention {
             CallingConvention::WindowsFastcall => {
                 static GPR_SEQ: &[GPR] = &[GPR::RCX, GPR::RDX, GPR::R8, GPR::R9];
                 static XMM_SEQ: &[XMM] = &[XMM::XMM0, XMM::XMM1, XMM::XMM2, XMM::XMM3];
@@ -282,10 +298,11 @@ impl ArgumentRegisterAllocator {
                             None
                         }
                     }
-                    _ => todo!(
-                        "ArgumentRegisterAllocator::next: Unsupported type: {:?}",
-                        ty
-                    ),
+                    _ => {
+                        return Err(CompileError::Codegen(format!(
+                            "No register available for {calling_convention:?} and type {ty}"
+                        )))
+                    }
                 }
             }
             _ => {
@@ -320,13 +337,16 @@ impl ArgumentRegisterAllocator {
                             None
                         }
                     }
-                    _ => todo!(
-                        "ArgumentRegisterAllocator::next: Unsupported type: {:?}",
-                        ty
-                    ),
+                    _ => {
+                        return Err(CompileError::Codegen(format!(
+                            "No register available for {calling_convention:?} and type {ty}"
+                        )))
+                    }
                 }
             }
-        }
+        };
+
+        Ok(ret)
     }
 }
 
@@ -337,6 +357,6 @@ pub fn new_machine_state() -> MachineState {
         register_values: vec![MachineValue::Undefined; 16 + 8],
         prev_frame: BTreeMap::new(),
         wasm_stack: vec![],
-        wasm_inst_offset: std::usize::MAX,
+        wasm_inst_offset: usize::MAX,
     }
 }

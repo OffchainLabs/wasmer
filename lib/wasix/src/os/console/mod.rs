@@ -12,7 +12,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
-use derivative::*;
+use futures::future::Either;
 use linked_hash_set::LinkedHashSet;
 use tokio::sync::{mpsc, RwLock};
 #[allow(unused_imports, dead_code)]
@@ -31,12 +31,12 @@ use crate::{
     bin_factory::{spawn_exec, BinFactory, BinaryPackage},
     capabilities::Capabilities,
     os::task::{control_plane::WasiControlPlane, process::WasiProcess},
+    runners::wasi::{PackageOrHash, RuntimeOrEngine},
     runtime::task_manager::InlineWaker,
     Runtime, SpawnError, WasiEnv, WasiEnvBuilder, WasiRuntimeError,
 };
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct Console {
     user_agent: Option<String>,
     boot_cmd: String,
@@ -231,8 +231,8 @@ impl Console {
             .prepare_webc_env(
                 prog,
                 &wasi_opts,
-                Some(&pkg),
-                self.runtime.clone(),
+                PackageOrHash::Package(&pkg),
+                RuntimeOrEngine::Runtime(self.runtime.clone()),
                 Some(root_fs),
             )
             // TODO: better error conversion
@@ -250,12 +250,9 @@ impl Console {
         if let Err(err) = env.uses(self.uses.clone()) {
             let mut stderr = self.stderr.clone();
             InlineWaker::block_on(async {
-                virtual_fs::AsyncWriteExt::write_all(
-                    &mut stderr,
-                    format!("{}\r\n", err).as_bytes(),
-                )
-                .await
-                .ok();
+                virtual_fs::AsyncWriteExt::write_all(&mut stderr, format!("{err}\r\n").as_bytes())
+                    .await
+                    .ok();
             });
             tracing::debug!("failed to load used dependency - {}", err);
             return Err(SpawnError::BadRequest);
@@ -280,8 +277,7 @@ impl Console {
 
         // Build the config
         // Run the binary
-        let store = self.runtime.new_store();
-        let process = InlineWaker::block_on(spawn_exec(pkg, prog, store, env, &self.runtime))?;
+        let process = InlineWaker::block_on(spawn_exec(pkg, prog, env, &self.runtime))?;
 
         // Return the process
         Ok((process, wasi_process))
@@ -338,8 +334,7 @@ mod tests {
         let tm = TokioTaskManager::new(tokio_rt);
         let mut rt = PluggableRuntime::new(Arc::new(tm));
         let client = rt.http_client().unwrap().clone();
-        rt.set_engine(Some(wasmer::Engine::default()))
-            .set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
+        rt.set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
 
         let env: HashMap<String, String> = [("MYENV1".to_string(), "VAL1".to_string())]
             .into_iter()
@@ -366,7 +361,6 @@ mod tests {
                 )
                 .await?;
 
-                stdin_tx.close();
                 std::mem::drop(stdin_tx);
 
                 let res = handle.wait_finished().await?;
@@ -393,8 +387,7 @@ mod tests {
         let tm = TokioTaskManager::new(tokio_rt);
         let mut rt = PluggableRuntime::new(Arc::new(tm));
         let client = rt.http_client().unwrap().clone();
-        rt.set_engine(Some(wasmer::Engine::default()))
-            .set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
+        rt.set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
 
         let cmd = "wasmer-tests/python-env-dump --help";
 

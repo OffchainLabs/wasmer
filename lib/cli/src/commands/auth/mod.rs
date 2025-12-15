@@ -3,12 +3,11 @@ mod logout;
 mod whoami;
 
 pub use login::*;
-pub use logout::*;
 pub use whoami::*;
 
 use super::AsyncCliCommand;
 
-/// Manage your .
+/// Manage authentication in Wasmer
 #[derive(clap::Subcommand, Debug)]
 pub enum CmdAuth {
     Login(login::Login),

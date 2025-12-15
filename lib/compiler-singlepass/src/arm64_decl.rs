@@ -1,11 +1,13 @@
 //! ARM64 structures.
 
-use crate::common_decl::{MachineState, MachineValue, RegisterIndex};
-use crate::location::CombinedRegister;
-use crate::location::Reg as AbstractReg;
+use crate::{
+    common_decl::{MachineState, MachineValue, RegisterIndex},
+    location::{CombinedRegister, Reg as AbstractReg},
+};
 use std::collections::BTreeMap;
 use std::slice::Iter;
-use wasmer_types::{CallingConvention, Type};
+use wasmer_types::target::CallingConvention;
+use wasmer_types::{CompileError, Type};
 
 /// General-purpose registers.
 #[repr(u8)]
@@ -46,6 +48,12 @@ pub enum GPR {
     XzrSp = 31,
 }
 
+impl From<GPR> for u8 {
+    fn from(val: GPR) -> Self {
+        val as u8
+    }
+}
+
 /// NEON registers.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -84,6 +92,12 @@ pub enum NEON {
     V29 = 29,
     V30 = 30,
     V31 = 31,
+}
+
+impl From<NEON> for u8 {
+    fn from(val: NEON) -> Self {
+        val as u8
+    }
 }
 
 impl AbstractReg for GPR {
@@ -252,8 +266,8 @@ impl ArgumentRegisterAllocator {
         &mut self,
         ty: Type,
         calling_convention: CallingConvention,
-    ) -> Option<ARM64Register> {
-        match calling_convention {
+    ) -> Result<Option<ARM64Register>, CompileError> {
+        let ret = match calling_convention {
             CallingConvention::SystemV | CallingConvention::AppleAarch64 => {
                 static GPR_SEQ: &[GPR] = &[
                     GPR::X0,
@@ -294,14 +308,21 @@ impl ArgumentRegisterAllocator {
                             None
                         }
                     }
-                    _ => todo!(
-                        "ArgumentRegisterAllocator::next: Unsupported type: {:?}",
-                        ty
-                    ),
+                    _ => {
+                        return Err(CompileError::Codegen(format!(
+                            "No register available for {calling_convention:?} and type {ty}"
+                        )))
+                    }
                 }
             }
-            _ => unimplemented!(),
-        }
+            _ => {
+                return Err(CompileError::Codegen(format!(
+                    "No register available for {calling_convention:?} and type {ty}"
+                )))
+            }
+        };
+
+        Ok(ret)
     }
 }
 
@@ -312,6 +333,6 @@ pub fn new_machine_state() -> MachineState {
         register_values: vec![MachineValue::Undefined; 32 + 32],
         prev_frame: BTreeMap::new(),
         wasm_stack: vec![],
-        wasm_inst_offset: std::usize::MAX,
+        wasm_inst_offset: usize::MAX,
     }
 }

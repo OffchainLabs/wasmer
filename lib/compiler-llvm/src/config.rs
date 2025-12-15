@@ -5,11 +5,14 @@ use inkwell::targets::{
 };
 pub use inkwell::OptimizationLevel as LLVMOptLevel;
 use itertools::Itertools;
-use std::fmt::Debug;
 use std::sync::Arc;
-use target_lexicon::Architecture;
+use std::{fmt::Debug, num::NonZero};
+use target_lexicon::BinaryFormat;
 use wasmer_compiler::{Compiler, CompilerConfig, Engine, EngineBuilder, ModuleMiddleware};
-use wasmer_types::{FunctionType, LocalFunctionIndex, Target, Triple};
+use wasmer_types::{
+    target::{Architecture, OperatingSystem, Target, Triple},
+    Features, FunctionType, LocalFunctionIndex,
+};
 
 /// The InkWell ModuleInfo type
 pub type InkwellModule<'ctx> = inkwell::module::Module<'ctx>;
@@ -35,17 +38,22 @@ pub trait LLVMCallbacks: Debug + Send + Sync {
     fn preopt_ir(&self, function: &CompiledKind, module: &InkwellModule);
     fn postopt_ir(&self, function: &CompiledKind, module: &InkwellModule);
     fn obj_memory_buffer(&self, function: &CompiledKind, memory_buffer: &InkwellMemoryBuffer);
+    fn asm_memory_buffer(&self, function: &CompiledKind, memory_buffer: &InkwellMemoryBuffer);
 }
 
 #[derive(Debug, Clone)]
 pub struct LLVM {
     pub(crate) enable_nan_canonicalization: bool,
+    pub(crate) enable_g0m0_opt: bool,
     pub(crate) enable_verifier: bool,
+    pub(crate) enable_perfmap: bool,
     pub(crate) opt_level: LLVMOptLevel,
     is_pic: bool,
     pub(crate) callbacks: Option<Arc<dyn LLVMCallbacks>>,
     /// The middleware chain.
     pub(crate) middlewares: Vec<Arc<dyn ModuleMiddleware>>,
+    /// Number of threads to use when compiling a module.
+    pub(crate) num_threads: NonZero<usize>,
 }
 
 impl LLVM {
@@ -55,16 +63,32 @@ impl LLVM {
         Self {
             enable_nan_canonicalization: false,
             enable_verifier: false,
+            enable_perfmap: false,
             opt_level: LLVMOptLevel::Aggressive,
             is_pic: false,
             callbacks: None,
             middlewares: vec![],
+            enable_g0m0_opt: false,
+            num_threads: std::thread::available_parallelism().unwrap_or(NonZero::new(1).unwrap()),
         }
     }
 
     /// The optimization levels when optimizing the IR.
     pub fn opt_level(&mut self, opt_level: LLVMOptLevel) -> &mut Self {
         self.opt_level = opt_level;
+        self
+    }
+
+    /// (warning: experimental) Pass the value of the first (#0) global and the base pointer of the
+    /// first (#0) memory as parameter between guest functions.
+    pub fn enable_pass_params_opt(&mut self) -> &mut Self {
+        // internally, the "pass_params" opt is known as g0m0 opt.
+        self.enable_g0m0_opt = true;
+        self
+    }
+
+    pub fn num_threads(&mut self, num_threads: NonZero<usize>) -> &mut Self {
+        self.num_threads = num_threads;
         self
     }
 
@@ -75,7 +99,11 @@ impl LLVM {
         self
     }
 
-    fn reloc_mode(&self) -> RelocMode {
+    fn reloc_mode(&self, binary_format: BinaryFormat) -> RelocMode {
+        if matches!(binary_format, BinaryFormat::Macho) {
+            return RelocMode::Static;
+        }
+
         if self.is_pic {
             RelocMode::PIC
         } else {
@@ -83,16 +111,50 @@ impl LLVM {
         }
     }
 
-    fn code_model(&self) -> CodeModel {
+    fn code_model(&self, binary_format: BinaryFormat) -> CodeModel {
         // We normally use the large code model, but when targeting shared
         // objects, we are required to use PIC. If we use PIC anyways, we lose
         // any benefit from large code model and there's some cost on all
         // platforms, plus some platforms (MachO) don't support PIC + large
         // at all.
+        if matches!(binary_format, BinaryFormat::Macho) {
+            return CodeModel::Default;
+        }
+
         if self.is_pic {
             CodeModel::Small
         } else {
             CodeModel::Large
+        }
+    }
+
+    pub(crate) fn target_operating_system(&self, target: &Target) -> OperatingSystem {
+        if target.triple().operating_system == OperatingSystem::Darwin && !self.is_pic {
+            // LLVM detects static relocation + darwin + 64-bit and
+            // force-enables PIC because MachO doesn't support that
+            // combination. They don't check whether they're targeting
+            // MachO, they check whether the OS is set to Darwin.
+            //
+            // Since both linux and darwin use SysV ABI, this should work.
+            //  but not in the case of Aarch64, there the ABI is slightly different
+            #[allow(clippy::match_single_binding)]
+            match target.triple().architecture {
+                Architecture::Aarch64(_) => OperatingSystem::Darwin,
+                _ => OperatingSystem::Linux,
+            }
+        } else {
+            target.triple().operating_system
+        }
+    }
+
+    pub(crate) fn target_binary_format(&self, target: &Target) -> target_lexicon::BinaryFormat {
+        if self.is_pic {
+            target.triple().binary_format
+        } else {
+            match self.target_operating_system(target) {
+                OperatingSystem::Darwin => target_lexicon::BinaryFormat::Macho,
+                _ => target_lexicon::BinaryFormat::Elf,
+            }
         }
     }
 
@@ -106,29 +168,10 @@ impl LLVM {
         };
         // Hack: we're using is_pic to determine whether this is a native
         // build or not.
-        let operating_system = if target.triple().operating_system
-            == wasmer_types::OperatingSystem::Darwin
-            && !self.is_pic
-        {
-            // LLVM detects static relocation + darwin + 64-bit and
-            // force-enables PIC because MachO doesn't support that
-            // combination. They don't check whether they're targeting
-            // MachO, they check whether the OS is set to Darwin.
-            //
-            // Since both linux and darwin use SysV ABI, this should work.
-            //  but not in the case of Aarch64, there the ABI is slightly different
-            #[allow(clippy::match_single_binding)]
-            match target.triple().architecture {
-                _ => wasmer_types::OperatingSystem::Linux,
-            }
-        } else {
-            target.triple().operating_system
-        };
-        let binary_format = if self.is_pic {
-            target.triple().binary_format
-        } else {
-            target_lexicon::BinaryFormat::Elf
-        };
+
+        let operating_system = self.target_operating_system(target);
+        let binary_format = self.target_binary_format(target);
+
         let triple = Triple {
             architecture,
             vendor: target.triple().vendor.clone(),
@@ -171,6 +214,16 @@ impl LLVM {
                 info: true,
                 machine_code: true,
             }),
+            Architecture::LoongArch64 => {
+                InkwellTarget::initialize_loongarch(&InitializationConfig {
+                    asm_parser: true,
+                    asm_printer: true,
+                    base: true,
+                    disassembler: true,
+                    info: true,
+                    machine_code: true,
+                })
+            }
             // Architecture::Arm(_) => InkwellTarget::initialize_arm(&InitializationConfig {
             //     asm_parser: true,
             //     asm_printer: true,
@@ -187,7 +240,7 @@ impl LLVM {
         // are compliant with the same string representations as gcc.
         let llvm_cpu_features = cpu_features
             .iter()
-            .map(|feature| format!("+{}", feature.to_string()))
+            .map(|feature| format!("+{feature}"))
             .join(",");
 
         let target_triple = self.target_triple(target);
@@ -197,17 +250,19 @@ impl LLVM {
                 &target_triple,
                 match triple.architecture {
                     Architecture::Riscv64(_) => "generic-rv64",
+                    Architecture::LoongArch64 => "generic-la64",
                     _ => "generic",
                 },
                 match triple.architecture {
                     Architecture::Riscv64(_) => "+m,+a,+c,+d,+f",
+                    Architecture::LoongArch64 => "+f,+d",
                     _ => &llvm_cpu_features,
                 },
                 self.opt_level,
-                self.reloc_mode(),
+                self.reloc_mode(self.target_binary_format(target)),
                 match triple.architecture {
-                    Architecture::Riscv64(_) => CodeModel::Medium,
-                    _ => self.code_model(),
+                    Architecture::LoongArch64 | Architecture::Riscv64(_) => CodeModel::Medium,
+                    _ => self.code_model(self.target_binary_format(target)),
                 },
             )
             .unwrap();
@@ -233,12 +288,14 @@ impl LLVM {
 
                 *((my_target_machine.target_machine as *mut u8).offset(0x410) as *mut u64) = 5;
                 std::ptr::copy_nonoverlapping(
-                    "lp64d\0".as_ptr(),
-                    (my_target_machine.target_machine as *mut u8).offset(0x418),
+                    c"lp64d".as_ptr(),
+                    (my_target_machine.target_machine as *mut i8).offset(0x418),
                     6,
                 );
 
-                std::mem::transmute(my_target_machine)
+                std::mem::transmute::<MyTargetMachine, inkwell::targets::TargetMachine>(
+                    my_target_machine,
+                )
             }
         } else {
             llvm_target_machine
@@ -252,6 +309,10 @@ impl CompilerConfig for LLVM {
         // TODO: although we can emit PIC, the object file parser does not yet
         // support all the relocations.
         self.is_pic = true;
+    }
+
+    fn enable_perfmap(&mut self) {
+        self.enable_perfmap = true
     }
 
     /// Whether to verify compiler IR.
@@ -271,6 +332,12 @@ impl CompilerConfig for LLVM {
     /// Pushes a middleware onto the back of the middleware chain.
     fn push_middleware(&mut self, middleware: Arc<dyn ModuleMiddleware>) {
         self.middlewares.push(middleware);
+    }
+
+    fn supported_features_for_target(&self, _target: &Target) -> wasmer_types::Features {
+        let mut feats = Features::default();
+        feats.exceptions(true);
+        feats
     }
 }
 

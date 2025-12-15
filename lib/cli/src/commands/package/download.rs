@@ -5,11 +5,19 @@ use dialoguer::console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
 use tempfile::NamedTempFile;
 use wasmer_config::package::{PackageIdent, PackageSource};
-use wasmer_wasix::http::reqwest::get_proxy;
+use wasmer_package::utils::from_disk;
 
 use crate::config::WasmerEnv;
 
 /// Download a package from the registry.
+///
+/// Examples:
+/// * `wasmer package download wasmer/hello`
+///   Download the `wasmer/hello` package, writing to `./hello@<version>.webc`.
+///
+/// * `wasmer package download --unpack wasmer/hello@0.1.0 -o hello.webc`
+///    Download the `wasmer/hello` package version `0.1.0`, writing to `./hello.webc`,
+///    and unpacking it to `./hello.webc.unpacked/`.
 #[derive(clap::Parser, Debug)]
 pub struct PackageDownload {
     #[clap(flatten)]
@@ -26,11 +34,15 @@ pub struct PackageDownload {
 
     /// Run the download command without any output
     #[clap(long)]
-    pub quiet: bool,
+    quiet: bool,
 
-    /// proxy to use for downloading
-    #[clap(long)]
-    pub proxy: Option<String>,
+    /// Unpack the downloaded package.
+    ///
+    /// The unpacked directory will be next to the downloaded file, with a `.unpacked` suffix.
+    ///
+    /// Note: unpacking can also be done manually with the `wasmer package unpack` command.
+    #[clap(short, long)]
+    unpack: bool,
 
     /// The package to download.
     package: PackageSource,
@@ -60,13 +72,33 @@ impl PackageDownload {
 
         pb.println(format!(
             "{} {}Creating output directory...",
-            style(format!("[{}/{}]", step_num, total_steps))
-                .bold()
-                .dim(),
+            style(format!("[{step_num}/{total_steps}]")).bold().dim(),
             CREATING_OUTPUT_DIRECTORY_EMOJI,
         ));
 
         step_num += 1;
+
+        let out_dir = if let Some(parent) = self.out_path.as_ref().and_then(|p| p.parent()) {
+            match parent.metadata() {
+                Ok(m) => {
+                    if !m.is_dir() {
+                        bail!(
+                            "parent of output file is not a directory: '{}'",
+                            parent.display()
+                        );
+                    }
+                    parent.to_owned()
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(parent)
+                        .context("could not create parent directory of output file")?;
+                    parent.to_owned()
+                }
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            current_dir()?
+        };
 
         if let Some(parent) = self.out_path.as_ref().and_then(|p| p.parent()) {
             match parent.metadata() {
@@ -88,9 +120,7 @@ impl PackageDownload {
 
         pb.println(format!(
             "{} {}Retrieving package information...",
-            style(format!("[{}/{}]", step_num, total_steps))
-                .bold()
-                .dim(),
+            style(format!("[{step_num}/{total_steps}]")).bold().dim(),
             RETRIEVING_PACKAGE_INFORMATION_EMOJI
         ));
 
@@ -101,13 +131,7 @@ impl PackageDownload {
                 // caveat: client_unauthennticated will use a token if provided, it
                 // just won't fail if none is present. So, _unauthenticated() can actually
                 // produce an authenticated client.
-                let client = if let Some(proxy) = &self.proxy {
-                    let proxy = reqwest::Proxy::all(proxy)?;
-
-                    self.env.client_unauthennticated_with_proxy(proxy)?
-                } else {
-                    self.env.client_unauthennticated()?
-                };
+                let client = self.env.client_unauthennticated()?;
 
                 let version = id.version_or_default().to_string();
                 let version = if version == "*" {
@@ -119,7 +143,7 @@ impl PackageDownload {
 
                 let rt = tokio::runtime::Runtime::new()?;
                 let package = rt
-                    .block_on(wasmer_api::query::get_package_version(
+                    .block_on(wasmer_backend_api::query::get_package_version(
                         &client,
                         full_name.clone(),
                         version.clone(),
@@ -157,11 +181,11 @@ impl PackageDownload {
                 let client = self.env.client_unauthennticated()?;
 
                 let rt = tokio::runtime::Runtime::new()?;
-                let pkg = rt.block_on(wasmer_api::query::get_package_release(&client, &hash.to_string()))?
+                let pkg = rt.block_on(wasmer_backend_api::query::get_package_release(&client, &hash.to_string()))?
                     .with_context(|| format!("Package with {hash} does not exist in the registry, or is not accessible"))?;
 
                 let ident = hash.to_string();
-                let filename = format!("{}.webc", hash);
+                let filename = format!("{hash}.webc");
 
                 (pkg.webc_url, ident, filename)
             }
@@ -171,7 +195,7 @@ impl PackageDownload {
 
         let builder = {
             let mut builder = reqwest::blocking::ClientBuilder::new();
-            if let Some(proxy) = get_proxy()? {
+            if let Some(proxy) = self.env.proxy()? {
                 builder = builder.proxy(proxy);
             }
             builder
@@ -183,12 +207,8 @@ impl PackageDownload {
             .header(http::header::ACCEPT, "application/webc");
 
         pb.println(format!(
-            "{} {}Downloading package {} ...",
-            style(format!("[{}/{}]", step_num, total_steps))
-                .bold()
-                .dim(),
-            DOWNLOADING_PACKAGE_EMOJI,
-            ident,
+            "{} {DOWNLOADING_PACKAGE_EMOJI}Downloading package {ident} ...",
+            style(format!("[{step_num}/{total_steps}]")).bold().dim(),
         ));
 
         step_num += 1;
@@ -213,11 +233,7 @@ impl PackageDownload {
         // Set the length of the progress bar
         pb.set_length(webc_total_size);
 
-        let mut tmpfile = if let Some(parent) = self.out_path.as_ref().and_then(|p| p.parent()) {
-            NamedTempFile::new_in(parent)?
-        } else {
-            NamedTempFile::new()?
-        };
+        let mut tmpfile = NamedTempFile::new_in(&out_dir)?;
         let accepted_contenttypes = vec![
             "application/webc",
             "application/octet-stream",
@@ -231,8 +247,7 @@ impl PackageDownload {
         if !(accepted_contenttypes.contains(&ty)) {
             eprintln!(
                 "Warning: response has invalid content type - expected \
-                 one of {:?}, got {ty}",
-                accepted_contenttypes
+                 one of {accepted_contenttypes:?}, got {ty}",
             );
         }
 
@@ -244,24 +259,21 @@ impl PackageDownload {
         if self.validate {
             if !self.quiet {
                 println!(
-                    "{} {}Validating package...",
-                    style(format!("[{}/{}]", step_num, total_steps))
-                        .bold()
-                        .dim(),
-                    VALIDATING_PACKAGE_EMOJI
+                    "{} {VALIDATING_PACKAGE_EMOJI}Validating package...",
+                    style(format!("[{step_num}/{total_steps}]")).bold().dim(),
                 );
             }
 
             step_num += 1;
 
-            webc::compat::Container::from_disk(tmpfile.path())
+            from_disk(tmpfile.path())
                 .context("could not parse downloaded file as a package - invalid download?")?;
         }
 
         let out_path = if let Some(out_path) = &self.out_path {
             out_path.clone()
         } else {
-            current_dir()?.join(filename)
+            out_dir.join(filename)
         };
 
         tmpfile.persist(&out_path).with_context(|| {
@@ -272,16 +284,30 @@ impl PackageDownload {
         })?;
 
         pb.println(format!(
-            "{} {}Package downloaded to '{}'",
-            style(format!("[{}/{}]", step_num, total_steps))
-                .bold()
-                .dim(),
-            WRITING_PACKAGE_EMOJI,
+            "{} {WRITING_PACKAGE_EMOJI}Package downloaded to '{}'",
+            style(format!("[{step_num}/{total_steps}]")).bold().dim(),
             out_path.display()
         ));
 
         // We're done, so finish the progress bar
         pb.finish();
+
+        if self.unpack {
+            let out_dir = if out_path.extension().is_some() {
+                out_path.with_extension("")
+            } else {
+                out_path.with_extension("unpacked")
+            };
+
+            let unpack_cmd = super::unpack::PackageUnpack {
+                out_dir,
+                overwrite: false,
+                quiet: self.quiet,
+                package_path: out_path,
+                format: super::unpack::Format::Package,
+            };
+            unpack_cmd.execute()?;
+        }
 
         Ok(())
     }
@@ -308,12 +334,14 @@ mod tests {
             validate: true,
             out_path: Some(out_path.clone()),
             package: "wasmer/hello@0.1.0".parse().unwrap(),
+            unpack: true,
             quiet: true,
-            proxy: None,
         };
 
         cmd.execute().unwrap();
 
-        webc::compat::Container::from_disk(out_path).unwrap();
+        from_disk(out_path).unwrap();
+
+        assert!(dir.path().join("hello/wasmer.toml").is_file());
     }
 }

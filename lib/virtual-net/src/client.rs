@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::BytesMut;
-use derivative::Derivative;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesOrdered;
 use futures_util::Sink;
 use futures_util::Stream;
 use futures_util::StreamExt;
+#[cfg(feature = "hyper")]
 use hyper_util::rt::tokio::TokioIo;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -529,12 +529,11 @@ struct SocketWithAddr {
 }
 type SocketMap<T> = HashMap<SocketId, T>;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug)]
 struct RemoteCommon {
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     tx: RemoteTx<MessageRequest>,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     rx: Mutex<RemoteRx<MessageResponse>>,
     request_seed: AtomicU64,
     requests: Mutex<HashMap<u64, RequestTx>>,
@@ -543,7 +542,7 @@ struct RemoteCommon {
     recv_with_addr_tx: Mutex<SocketMap<mpsc::Sender<DataWithAddr>>>,
     accept_tx: Mutex<SocketMap<mpsc::Sender<SocketWithAddr>>>,
     sent_tx: Mutex<SocketMap<mpsc::Sender<u64>>>,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     handlers: Mutex<SocketMap<Box<dyn virtual_mio::InterestHandler + Send + Sync>>>,
 
     // The stall guard will prevent reads while its held and there are background tasks running
@@ -1196,13 +1195,15 @@ impl VirtualRawSocket for RemoteSocket {
         }
     }
 
-    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>]) -> Result<usize> {
+    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>], peek: bool) -> Result<usize> {
         loop {
             if !self.rx_buffer.is_empty() {
                 let amt = self.rx_buffer.len().min(buf.len());
                 let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
                 buf[..amt].copy_from_slice(&self.rx_buffer[..amt]);
-                self.rx_buffer.advance(amt);
+                if !peek {
+                    self.rx_buffer.advance(amt);
+                }
                 return Ok(amt);
             }
             match self.rx_recv.try_recv() {
@@ -1254,7 +1255,15 @@ impl VirtualConnectionlessSocket for RemoteSocket {
     fn try_recv_from(
         &mut self,
         buf: &mut [std::mem::MaybeUninit<u8>],
+        peek: bool,
     ) -> Result<(usize, SocketAddr)> {
+        // FIXME: A proper peek implementation would require correct use of a
+        // buffer. We don't use this implementation AFAIK, so I'll skip over it
+        // for the time being.
+        if peek {
+            return Err(NetworkError::Unsupported);
+        }
+
         match self.rx_recv_with_addr.try_recv() {
             Ok(received) => {
                 let amt = buf.len().min(received.data.len());
@@ -1422,13 +1431,15 @@ impl VirtualConnectedSocket for RemoteSocket {
         self.io_socket_fire_and_forget(RequestType::Close)
     }
 
-    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>]) -> Result<usize> {
+    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>], peek: bool) -> Result<usize> {
         loop {
             if !self.rx_buffer.is_empty() {
                 let amt = self.rx_buffer.len().min(buf.len());
                 let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
                 buf[..amt].copy_from_slice(&self.rx_buffer[..amt]);
-                self.rx_buffer.advance(amt);
+                if !peek {
+                    self.rx_buffer.advance(amt);
+                }
                 return Ok(amt);
             }
             match self.rx_recv.try_recv() {

@@ -1,25 +1,32 @@
-use crate::codegen_error;
-use crate::common_decl::*;
-use crate::emitter_x64::*;
-use crate::location::Location as AbstractLocation;
-use crate::location::Reg;
-use crate::machine::*;
-use crate::unwind::{UnwindInstructions, UnwindOps};
 #[cfg(feature = "unwind")]
 use crate::unwind_winx64::create_unwind_info_from_insts;
-use crate::x64_decl::new_machine_state;
-use crate::x64_decl::{ArgumentRegisterAllocator, X64Register, GPR, XMM};
+use crate::{
+    codegen_error,
+    common_decl::*,
+    emitter_x64::*,
+    location::{Location as AbstractLocation, Reg},
+    machine::*,
+    unwind::{UnwindInstructions, UnwindOps},
+    x64_decl::{new_machine_state, ArgumentRegisterAllocator, X64Register, GPR, XMM},
+};
 use dynasmrt::{x64::X64Relocation, DynasmError, VecAssembler};
 #[cfg(feature = "unwind")]
 use gimli::{write::CallFrameInstruction, X86_64};
 use std::ops::{Deref, DerefMut};
-use wasmer_compiler::wasmparser::ValType as WpType;
-use wasmer_types::{
-    CallingConvention, CompileError, CpuFeature, CustomSection, CustomSectionProtection,
-    Relocation, RelocationKind, RelocationTarget, SectionBody, Target,
+use wasmer_compiler::{
+    types::{
+        address_map::InstructionAddressMap,
+        function::FunctionBody,
+        relocation::{Relocation, RelocationKind, RelocationTarget},
+        section::{CustomSection, CustomSectionProtection, SectionBody},
+    },
+    wasmparser::{MemArg, ValType as WpType},
 };
-use wasmer_types::{FunctionBody, InstructionAddressMap, SourceLoc, TrapInformation};
-use wasmer_types::{FunctionIndex, FunctionType, TrapCode, Type, VMOffsets};
+use wasmer_types::{
+    target::{CallingConvention, CpuFeature, Target},
+    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, Type,
+    VMOffsets,
+};
 
 type Assembler = VecAssembler<X64Relocation>;
 
@@ -119,7 +126,7 @@ fn dwarf_index(reg: u16) -> gimli::Register {
     match reg {
         0..=15 => DWARF_GPR[reg as usize],
         17..=24 => DWARF_XMM[reg as usize - 17],
-        _ => panic!("Unknown register index {}", reg),
+        _ => panic!("Unknown register index {reg}"),
     }
 }
 
@@ -1105,7 +1112,7 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::u64::MAX),
+                    Location::Imm64(u64::MAX),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1256,14 +1263,14 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::i64::MIN as u64),
+                    Location::Imm64(i64::MIN as u64),
                     Location::GPR(tmp_out),
                 )
             },
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::i64::MAX as u64),
+                    Location::Imm64(i64::MAX as u64),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1348,14 +1355,14 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::i32::MIN as u32),
+                    Location::Imm32(i32::MIN as u32),
                     Location::GPR(tmp_out),
                 )
             },
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::i32::MAX as u32),
+                    Location::Imm32(i32::MAX as u32),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1444,7 +1451,7 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::u32::MAX),
+                    Location::Imm32(u32::MAX),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1518,7 +1525,7 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::u64::MAX),
+                    Location::Imm64(u64::MAX),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1669,14 +1676,14 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::i64::MIN as u64),
+                    Location::Imm64(i64::MIN as u64),
                     Location::GPR(tmp_out),
                 )
             },
             |this| {
                 this.assembler.emit_mov(
                     Size::S64,
-                    Location::Imm64(std::i64::MAX as u64),
+                    Location::Imm64(i64::MAX as u64),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1748,14 +1755,14 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::i32::MIN as u32),
+                    Location::Imm32(i32::MIN as u32),
                     Location::GPR(tmp_out),
                 )
             },
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::i32::MAX as u32),
+                    Location::Imm32(i32::MAX as u32),
                     Location::GPR(tmp_out),
                 )
             },
@@ -1831,7 +1838,7 @@ impl MachineX86_64 {
             |this| {
                 this.assembler.emit_mov(
                     Size::S32,
-                    Location::Imm32(std::u32::MAX),
+                    Location::Imm32(u32::MAX),
                     Location::GPR(tmp_out),
                 )
             },
@@ -2426,10 +2433,7 @@ impl Machine for MachineX86_64 {
                     }
                 }
             },
-            _ => panic!(
-                "unimplemented move_location_extend({:?}, {}, {:?}, {:?}, {:?}",
-                size_val, signed, source, size_op, dest
-            ),
+            _ => panic!(                "unimplemented move_location_extend({size_val:?}, {signed}, {source:?}, {size_op:?}, {dest:?}"            ),
         }?;
         if dst != dest {
             self.assembler.emit_mov(size_op, dst, dest)?;
@@ -2501,7 +2505,7 @@ impl Machine for MachineX86_64 {
     // assembler finalize
     fn assembler_finalize(self) -> Result<Vec<u8>, CompileError> {
         self.assembler.finalize().map_err(|e| {
-            CompileError::Codegen(format!("Assembler failed finalization with: {:?}", e))
+            CompileError::Codegen(format!("Assembler failed finalization with: {e:?}"))
         })
     }
 
@@ -7970,7 +7974,7 @@ impl Machine for MachineX86_64 {
             let mut stack_param_count: usize = 0;
 
             for (i, ty) in sig.params().iter().enumerate() {
-                let source_loc = match argalloc.next(*ty, calling_convention) {
+                let source_loc = match argalloc.next(*ty, calling_convention)? {
                     Some(X64Register::GPR(gpr)) => Location::GPR(gpr),
                     Some(X64Register::XMM(xmm)) => Location::SIMD(xmm),
                     None => {
@@ -8106,7 +8110,7 @@ impl Machine for MachineX86_64 {
                     let mut argalloc = ArgumentRegisterAllocator::default();
                     for (i, ty) in sig.params().iter().enumerate() {
                         let prev_loc = param_locations[i];
-                        match argalloc.next(*ty, calling_convention) {
+                        match argalloc.next(*ty, calling_convention)? {
                             Some(X64Register::GPR(_gpr)) => continue,
                             Some(X64Register::XMM(xmm)) => {
                                 a.emit_mov(Size::S64, prev_loc, Location::SIMD(xmm))?
@@ -8151,11 +8155,11 @@ impl Machine for MachineX86_64 {
 
                     // Copy arguments.
                     let mut argalloc = ArgumentRegisterAllocator::default();
-                    argalloc.next(Type::I64, calling_convention).unwrap(); // skip VMContext
+                    argalloc.next(Type::I64, calling_convention)?.unwrap(); // skip VMContext
                     let mut caller_stack_offset: i32 = 0;
                     for (i, ty) in sig.params().iter().enumerate() {
                         let prev_loc = param_locations[i];
-                        let targ = match argalloc.next(*ty, calling_convention) {
+                        let targ = match argalloc.next(*ty, calling_convention)? {
                             Some(X64Register::GPR(gpr)) => Location::GPR(gpr),
                             Some(X64Register::XMM(xmm)) => Location::SIMD(xmm),
                             None => {
@@ -8231,6 +8235,7 @@ impl Machine for MachineX86_64 {
 
         Ok(CustomSection {
             protection: CustomSectionProtection::ReadExecute,
+            alignment: None,
             bytes: section_body,
             relocations: vec![],
         })
@@ -8298,7 +8303,7 @@ mod test {
     use super::*;
     use enumset::enum_set;
     use std::str::FromStr;
-    use wasmer_types::{CpuFeature, Target, Triple};
+    use wasmer_types::target::{CpuFeature, Target, Triple};
 
     fn test_move_location(machine: &mut MachineX86_64) -> Result<(), CompileError> {
         machine.move_location_for_native(

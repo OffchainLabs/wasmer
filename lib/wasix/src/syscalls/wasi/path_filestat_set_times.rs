@@ -18,7 +18,7 @@ use crate::syscalls::*;
 ///     The timestamp that the last modified time attribute is set to
 /// - `Fstflags fst_flags`
 ///     A bitmask controlling which attributes are set
-#[instrument(level = "debug", skip_all, fields(%fd, path = field::Empty, %st_atim, %st_mtim), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, path = field::Empty, %st_atim, %st_mtim), ret)]
 pub fn path_filestat_set_times<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
@@ -29,19 +29,13 @@ pub fn path_filestat_set_times<M: MemorySize>(
     st_mtim: Timestamp,
     fst_flags: Fstflags,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let mut path_string = unsafe { get_input_str_ok!(&memory, path, path_len) };
+    let path_string = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_string.as_str());
-
-    // Convert relative paths into absolute paths
-    if path_string.starts_with("./") {
-        path_string = ctx.data().state.fs.relative_path_to_absolute(path_string);
-        trace!(
-            %path_string
-        );
-    }
 
     wasi_try_ok!(path_filestat_set_times_internal(
         &mut ctx,
@@ -67,7 +61,7 @@ pub fn path_filestat_set_times<M: MemorySize>(
         )
         .map_err(|err| {
             tracing::error!("failed to save file set times event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -87,7 +81,11 @@ pub(crate) fn path_filestat_set_times_internal(
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     let fd_entry = state.fs.get_fd(fd)?;
     let fd_inode = fd_entry.inode;
-    if !fd_entry.rights.contains(Rights::PATH_FILESTAT_SET_TIMES) {
+    if !fd_entry
+        .inner
+        .rights
+        .contains(Rights::PATH_FILESTAT_SET_TIMES)
+    {
         return Err(Errno::Access);
     }
     if (fst_flags.contains(Fstflags::SET_ATIM) && fst_flags.contains(Fstflags::SET_ATIM_NOW))

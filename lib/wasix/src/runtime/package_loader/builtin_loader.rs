@@ -11,10 +11,12 @@ use bytes::Bytes;
 use http::{HeaderMap, Method};
 use tempfile::NamedTempFile;
 use url::Url;
-use webc::{
-    compat::{Container, ContainerError},
-    DetectError,
+use wasmer_package::{
+    package::WasmerPackageError,
+    utils::{from_bytes, from_disk},
 };
+use webc::DetectError;
+use webc::{Container, ContainerError};
 
 use crate::{
     bin_factory::BinaryPackage,
@@ -76,6 +78,10 @@ impl BuiltinPackageLoader {
             }),
             ..self
         }
+    }
+
+    pub fn cache(&self) -> Option<&FileSystemCache> {
+        self.cache.as_ref()
     }
 
     pub fn validate_cache(
@@ -369,7 +375,7 @@ impl PackageLoader for BuiltinPackageLoader {
 
         // The sad path - looks like we don't have a filesystem cache so we'll
         // need to keep the whole thing in memory.
-        let container = crate::spawn_blocking(move || Container::from_bytes(bytes)).await??;
+        let container = crate::spawn_blocking(move || from_bytes(bytes)).await??;
         // We still want to cache it in memory, of course
         self.in_memory.save(&container, summary.dist.webc_sha256);
         Ok(container)
@@ -417,12 +423,16 @@ pub enum CacheValidationMode {
 // FIXME: This implementation will block the async runtime and should use
 // some sort of spawn_blocking() call to run it in the background.
 #[derive(Debug)]
-struct FileSystemCache {
+pub struct FileSystemCache {
     cache_dir: PathBuf,
 }
 
 impl FileSystemCache {
     const FILE_SUFFIX: &'static str = ".bin";
+
+    fn temp_dir(&self) -> PathBuf {
+        self.cache_dir.join("__temp__")
+    }
 
     /// Validate that the cached image file names correspond to their actual
     /// file content hashes.
@@ -487,18 +497,16 @@ impl FileSystemCache {
 
         let container = crate::spawn_blocking({
             let path = path.clone();
-            move || Container::from_disk(path)
+            move || from_disk(path)
         })
         .await?;
         match container {
             Ok(c) => Ok(Some(c)),
-            Err(ContainerError::Open { error, .. })
-            | Err(ContainerError::Read { error, .. })
-            | Err(ContainerError::Detect(DetectError::Io(error)))
-                if error.kind() == ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
+            Err(WasmerPackageError::ContainerError(ContainerError::Open { error, .. }))
+            | Err(WasmerPackageError::ContainerError(ContainerError::Read { error, .. }))
+            | Err(WasmerPackageError::ContainerError(ContainerError::Detect(DetectError::Io(
+                error,
+            )))) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => {
                 let msg = format!("Unable to read \"{}\"", path.display());
                 Err(Error::new(e).context(msg))
@@ -506,20 +514,25 @@ impl FileSystemCache {
         }
     }
 
-    async fn save(&self, webc: Bytes, dist: &DistributionInfo) -> Result<(), Error> {
+    async fn save(&self, webc: Bytes, dist: &DistributionInfo) -> Result<PathBuf, Error> {
         let path = self.path(&dist.webc_sha256);
         let dist = dist.clone();
+        let temp_dir = self.temp_dir();
 
+        let path2 = path.clone();
         crate::spawn_blocking(move || {
-            let parent = path.parent().expect("Always within cache_dir");
+            // Keep files in a temporary directory until they are fully written
+            // to prevent temp files being included in [`Self::scan`] or `[Self::retain]`.
 
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Unable to create \"{}\"", parent.display()))?;
+            std::fs::create_dir_all(&temp_dir)
+                .with_context(|| format!("Unable to create directory '{}'", temp_dir.display()))?;
 
-            let mut temp = NamedTempFile::new_in(parent)?;
+            let mut temp = NamedTempFile::new_in(&temp_dir)?;
             temp.write_all(&webc)?;
             temp.flush()?;
             temp.as_file_mut().sync_all()?;
+
+            // Move the temporary file to the final location.
             temp.persist(&path)?;
 
             tracing::debug!(
@@ -533,7 +546,7 @@ impl FileSystemCache {
         })
         .await??;
 
-        Ok(())
+        Ok(path2)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -567,6 +580,97 @@ impl FileSystemCache {
         filename.push_str(Self::FILE_SUFFIX);
 
         self.cache_dir.join(filename)
+    }
+
+    /// Scan all the cached webc files and invoke the callback for each.
+    pub async fn scan<S, F>(&self, state: S, callback: F) -> Result<S, Error>
+    where
+        S: Send + 'static,
+        F: Fn(&mut S, &std::fs::DirEntry) -> Result<(), Error> + Send + 'static,
+    {
+        let cache_dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<S, anyhow::Error> {
+            let mut state = state;
+
+            let iter = match std::fs::read_dir(&cache_dir) {
+                Ok(v) => v,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // path does not exist, so nothing to scan.
+                    return Ok(state);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("Could not read image cache dir: '{}'", cache_dir.display())
+                    });
+                }
+            };
+
+            for res in iter {
+                let entry = res?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+
+                callback(&mut state, &entry)?;
+            }
+
+            Ok(state)
+        })
+        .await?
+        .context("tokio runtime failed")
+    }
+
+    /// Remove entries from the cache that do not pass the callback.
+    pub async fn retain<S, F>(&self, state: S, filter: F) -> Result<S, Error>
+    where
+        S: Send + 'static,
+        F: Fn(&mut S, &std::fs::DirEntry) -> Result<bool, anyhow::Error> + Send + 'static,
+    {
+        let cache_dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let iter = match std::fs::read_dir(&cache_dir) {
+                Ok(v) => v,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // path does not exist, so nothing to scan.
+                    return Ok(state);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("Could not read image cache dir: '{}'", cache_dir.display())
+                    });
+                }
+            };
+
+            let mut state = state;
+            for res in iter {
+                let entry = res?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+
+                if !filter(&mut state, &entry)? {
+                    tracing::debug!(
+                        path=%entry.path().display(),
+                        "Removing cached image file - does not pass the filter",
+                    );
+                    match std::fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(fs_err) => {
+                            tracing::warn!(
+                                path=%entry.path().display(),
+                                ?fs_err,
+                                "Could not delete cached image file",
+                            );
+                        }
+                    }
+                }
+            }
+
+            Ok(state)
+        })
+        .await?
+        .context("tokio runtime failed")
     }
 }
 
@@ -704,7 +808,7 @@ mod test {
         let path = dir.path();
 
         let contents = "fail";
-        let correct_hash = WebcHash::sha256(&contents);
+        let correct_hash = WebcHash::sha256(contents);
         let used_hash =
             WebcHash::parse_hex("0000a28ea38a000f3a3328cb7fabe330638d3258affe1a869e3f92986222d997")
                 .unwrap();
@@ -722,5 +826,91 @@ mod test {
         assert_eq!(errors[0].expected_hash, used_hash);
 
         assert_eq!(file_path.exists(), false);
+    }
+
+    #[tokio::test]
+    async fn test_file_cache_scan_retain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let cache = FileSystemCache {
+            cache_dir: path.to_path_buf(),
+        };
+
+        {
+            let state = cache
+                .scan(0u64, |state: &mut u64, _entry| {
+                    *state += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(state, 0);
+        }
+
+        let path1 = cache
+            .save(
+                Bytes::from_static(b"test1"),
+                &DistributionInfo {
+                    webc: Url::parse("file:///test1.webc").unwrap(),
+                    webc_sha256: WebcHash::sha256(b"test1"),
+                },
+            )
+            .await
+            .unwrap();
+        let path2 = cache
+            .save(
+                Bytes::from_static(b"test2"),
+                &DistributionInfo {
+                    webc: Url::parse("file:///test2.webc").unwrap(),
+                    webc_sha256: WebcHash::sha256(b"test2"),
+                },
+            )
+            .await
+            .unwrap();
+
+        {
+            let path1 = path1.clone();
+            let path2 = path2.clone();
+            let state = cache
+                .scan(0u64, move |state: &mut u64, entry| {
+                    *state += 1;
+                    assert!(entry.path() == path1 || entry.path() == path2);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(state, 2);
+        }
+
+        {
+            let path1 = path1.clone();
+            let state = cache
+                .retain(0u64, move |state: &mut u64, entry| {
+                    *state += 1;
+                    Ok(entry.path() == path1)
+                })
+                .await
+                .unwrap();
+            assert_eq!(state, 2);
+        }
+
+        assert!(path1.exists());
+        assert!(!path2.exists(), "Path 2 should have been deleted");
+
+        {
+            let path1 = path1.clone();
+            let state = cache
+                .scan(0u64, move |state: &mut u64, entry| {
+                    *state += 1;
+                    assert!(entry.path() == path1);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(state, 1);
+        }
     }
 }

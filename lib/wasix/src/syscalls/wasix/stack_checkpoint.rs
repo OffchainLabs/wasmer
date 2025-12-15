@@ -18,9 +18,9 @@ pub fn stack_checkpoint<M: MemorySize>(
         trace!("restored - (ret={})", val);
         return Ok(Errno::Success);
     }
-    trace!("capturing",);
+    trace!("capturing");
 
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     // Set the return value that we will give back to
     // indicate we are a normal function call that has not yet
@@ -36,7 +36,7 @@ pub fn stack_checkpoint<M: MemorySize>(
 
     // We clear the target memory location before we grab the stack so that
     // it correctly hashes
-    if let Err(err) = snapshot_ptr.write(&memory, StackSnapshot { hash: 0, user: 0 }) {
+    if let Err(err) = snapshot_ptr.write(&memory, StackSnapshot::new(0, 0)) {
         warn!(
             %err
         );
@@ -67,10 +67,7 @@ pub fn stack_checkpoint<M: MemorySize>(
         };
 
         // Build a stack snapshot
-        let snapshot = StackSnapshot {
-            hash,
-            user: ret_offset.into(),
-        };
+        let snapshot = StackSnapshot::new(ret_offset.into(), hash);
 
         // Get a reference directly to the bytes of snapshot
         let val_bytes = unsafe {
@@ -115,7 +112,7 @@ pub fn stack_checkpoint<M: MemorySize>(
             &rewind_stack[..],
             &store_data[..],
         );
-        trace!(hash = snapshot.hash, user = snapshot.user);
+        trace!(hash = snapshot.hash(), user = snapshot.user);
 
         // Save the stack snapshot
         let env = ctx.data();
@@ -131,7 +128,7 @@ pub fn stack_checkpoint<M: MemorySize>(
         let tid = ctx.data().tid();
         match rewind::<M, _>(
             ctx,
-            memory_stack_corrected.freeze(),
+            Some(memory_stack_corrected.freeze()),
             rewind_stack.freeze(),
             store_data,
             0 as Longsize,

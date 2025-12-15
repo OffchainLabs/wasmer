@@ -4,7 +4,10 @@
 use crate::compiler::SinglepassCompiler;
 use std::sync::Arc;
 use wasmer_compiler::{Compiler, CompilerConfig, Engine, EngineBuilder, ModuleMiddleware};
-use wasmer_types::{CpuFeature, Features, Target};
+use wasmer_types::{
+    target::{CpuFeature, Target},
+    Features,
+};
 
 #[derive(Debug, Clone)]
 pub struct Singlepass {
@@ -40,8 +43,8 @@ impl CompilerConfig for Singlepass {
         Box::new(SinglepassCompiler::new(*self))
     }
 
-    /// Gets the default features for this compiler in the given target
-    fn default_features_for_target(&self, _target: &Target) -> Features {
+    /// Gets the supported features for this compiler in the given target
+    fn supported_features_for_target(&self, _target: &Target) -> Features {
         let mut features = Features::default();
         features.multi_value(false);
         features

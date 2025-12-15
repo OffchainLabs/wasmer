@@ -8,11 +8,10 @@ use std::{
 };
 
 use anyhow::Context;
-use exec::spawn_exec_wasm;
+use shared_buffer::OwnedBuffer;
 use virtual_fs::{AsyncReadExt, FileSystem};
 use wasmer::FunctionEnvMut;
-use wasmer_wasix_types::wasi::Errno;
-use webc::Container;
+use wasmer_package::utils::from_bytes;
 
 mod binary_package;
 mod exec;
@@ -20,11 +19,13 @@ mod exec;
 pub use self::{
     binary_package::*,
     exec::{
-        run_exec, spawn_exec, spawn_exec_module, spawn_load_module, spawn_load_wasm, spawn_union_fs,
+        package_command_by_name, run_exec, spawn_exec, spawn_exec_module, spawn_exec_wasm,
+        spawn_load_module, spawn_union_fs,
     },
 };
 use crate::{
     os::{command::Commands, task::TaskJoinHandle},
+    runtime::module_cache::HashedModuleData,
     Runtime, SpawnError, WasiEnv,
 };
 
@@ -70,7 +71,6 @@ impl BinFactory {
     pub fn spawn<'a>(
         &'a self,
         name: String,
-        store: wasmer::Store,
         env: WasiEnv,
     ) -> Pin<Box<dyn Future<Output = Result<TaskJoinHandle, SpawnError>> + 'a>> {
         Box::pin(async move {
@@ -81,18 +81,21 @@ impl BinFactory {
                 .ok_or_else(|| SpawnError::BinaryNotFound {
                     binary: name.clone(),
                 });
-            if res.is_err() {
-                env.on_exit(Some(Errno::Noent.into())).await;
-            }
             let executable = res?;
 
             // Execute
             match executable {
                 Executable::Wasm(bytes) => {
-                    spawn_exec_wasm(&bytes, name.as_str(), env, &self.runtime).await
+                    let data = HashedModuleData::new(bytes.clone());
+                    spawn_exec_wasm(data, name.as_str(), env, &self.runtime).await
                 }
                 Executable::BinaryPackage(pkg) => {
-                    spawn_exec(pkg, name.as_str(), store, env, &self.runtime).await
+                    // Get the command that is going to be executed
+                    let cmd = package_command_by_name(&pkg, name.as_str())?;
+
+                    env.prepare_spawn(cmd);
+
+                    spawn_exec(pkg, name.as_str(), env, &self.runtime).await
                 }
             }
         })
@@ -102,15 +105,12 @@ impl BinFactory {
         &self,
         name: String,
         parent_ctx: Option<&FunctionEnvMut<'_, WasiEnv>>,
-        store: &mut Option<wasmer::Store>,
         builder: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError> {
         // We check for built in commands
         if let Some(parent_ctx) = parent_ctx {
             if self.commands.exists(name.as_str()) {
-                return self
-                    .commands
-                    .exec(parent_ctx, name.as_str(), store, builder);
+                return self.commands.exec(parent_ctx, name.as_str(), builder);
             }
         } else if self.commands.exists(name.as_str()) {
             tracing::warn!("builtin command without a parent ctx - {}", name);
@@ -173,7 +173,7 @@ impl BinFactory {
 }
 
 pub enum Executable {
-    Wasm(bytes::Bytes),
+    Wasm(OwnedBuffer),
     BinaryPackage(BinaryPackage),
 }
 
@@ -188,18 +188,35 @@ async fn load_executable_from_filesystem(
         .open(path)
         .context("Unable to open the file")?;
 
-    let mut data = Vec::with_capacity(f.size() as usize);
-    f.read_to_end(&mut data).await.context("Read failed")?;
+    // Fast path if the file is fully available in memory.
+    // Prevents redundant copying of the file data.
+    if let Some(buf) = f.as_owned_buffer() {
+        if wasmer_package::utils::is_container(buf.as_slice()) {
+            let bytes = buf.clone().into_bytes();
+            if let Ok(container) = from_bytes(bytes.clone()) {
+                let pkg = BinaryPackage::from_webc(&container, rt)
+                    .await
+                    .context("Unable to load the package")?;
 
-    let bytes: bytes::Bytes = data.into();
+                return Ok(Executable::BinaryPackage(pkg));
+            }
+        }
 
-    if let Ok(container) = Container::from_bytes(bytes.clone()) {
-        let pkg = BinaryPackage::from_webc(&container, rt)
-            .await
-            .context("Unable to load the package")?;
-
-        Ok(Executable::BinaryPackage(pkg))
+        Ok(Executable::Wasm(buf))
     } else {
-        Ok(Executable::Wasm(bytes))
+        let mut data = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut data).await.context("Read failed")?;
+
+        let bytes: bytes::Bytes = data.into();
+
+        if let Ok(container) = from_bytes(bytes.clone()) {
+            let pkg = BinaryPackage::from_webc(&container, rt)
+                .await
+                .context("Unable to load the package")?;
+
+            Ok(Executable::BinaryPackage(pkg))
+        } else {
+            Ok(Executable::Wasm(OwnedBuffer::from_bytes(bytes)))
+        }
     }
 }

@@ -10,7 +10,6 @@ use crate::vmcontext::VMTableDefinition;
 use crate::Trap;
 use crate::VMExternRef;
 use crate::VMFuncRef;
-use derivative::Derivative;
 use std::cell::UnsafeCell;
 use std::convert::TryFrom;
 use std::fmt;
@@ -21,7 +20,7 @@ use wasmer_types::{TableType, TrapCode, Type as ValType};
 /// A reference stored in a table. Can be either an externref or a funcref.
 #[derive(Debug, Clone)]
 pub enum TableElement {
-    /// Opaque pointer to arbitrary host data.
+    /// Opaque pointer to arbitrary hostdata.
     ExternRef(Option<VMExternRef>),
     /// Pointer to function: contains enough information to call it.
     FuncRef(Option<VMFuncRef>),
@@ -70,17 +69,14 @@ impl Default for TableElement {
 }
 
 /// A table instance.
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct VMTable {
-    #[derivative(Debug = "ignore")]
     vec: Vec<RawTableElement>,
     maximum: Option<u32>,
     /// The WebAssembly table description.
     table: TableType,
     /// Our chosen implementation style.
     style: TableStyle,
-    #[derivative(Debug = "ignore")]
     vm_table_definition: MaybeInstanceOwned<VMTableDefinition>,
 }
 
@@ -123,8 +119,7 @@ impl VMTable {
             ValType::FuncRef | ValType::ExternRef => (),
             ty => {
                 return Err(format!(
-                    "tables of types other than funcref or externref ({})",
-                    ty
+                    "tables of types other than funcref or externref ({ty})",
                 ))
             }
         };
@@ -196,7 +191,7 @@ impl VMTable {
     pub fn grow(&mut self, delta: u32, init_value: TableElement) -> Option<u32> {
         let size = self.size();
         let new_len = size.checked_add(delta)?;
-        if self.maximum.map_or(false, |max| new_len > max) {
+        if self.maximum.is_some_and(|max| new_len > max) {
             return None;
         }
         if new_len == size {
@@ -247,10 +242,7 @@ impl VMTable {
                     // This path should never be hit by the generated code due to Wasm
                     // validation.
                     (ty, v) => {
-                        panic!(
-                            "Attempted to set a table of type {} with the value {:?}",
-                            ty, v
-                        )
+                        panic!("Attempted to set a table of type {ty} with the value {v:?}")
                     }
                 };
 
@@ -315,7 +307,7 @@ impl VMTable {
     pub fn copy_on_write(&self) -> Result<Self, String> {
         let mut ret = Self::new(&self.table, &self.style)?;
         ret.copy(self, 0, 0, self.size())
-            .map_err(|trap| format!("failed to copy the table - {:?}", trap))?;
+            .map_err(|trap| format!("failed to copy the table - {trap:?}"))?;
         Ok(ret)
     }
 

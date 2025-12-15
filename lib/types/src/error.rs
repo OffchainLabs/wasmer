@@ -294,7 +294,7 @@ mod tests {
                 assert_eq!(name, "manipulator3000");
                 assert_eq!(message, "foo");
             }
-            err => panic!("Unexpected error: {:?}", err),
+            err => panic!("Unexpected error: {err:?}"),
         }
     }
 }

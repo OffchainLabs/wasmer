@@ -5,9 +5,10 @@ use std::{
 };
 
 use rkyv::{
-    ser::{ScratchSpace, Serializer},
+    rancor::Fallible,
+    ser::{Allocator, WriterExt},
     vec::{ArchivedVec, VecResolver},
-    Archive, Archived, Serialize,
+    Archive, Archived,
 };
 
 /// An aligned COW vector of bytes which avoids copying data
@@ -92,7 +93,7 @@ where
 }
 
 #[allow(clippy::from_over_into)]
-impl<'a> Into<Vec<u8>> for AlignedCowVec<'a, u8> {
+impl Into<Vec<u8>> for AlignedCowVec<'_, u8> {
     fn into(self) -> Vec<u8> {
         self.inner.into_owned()
     }
@@ -197,17 +198,19 @@ where
     type Resolver = VecResolver;
 
     #[inline]
-    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
-        ArchivedVec::resolve_from_len(self.len(), pos, resolver, out);
+    fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        ArchivedVec::resolve_from_len(self.len(), resolver, out);
     }
 }
 
-impl<'a, S: ScratchSpace + Serializer + ?Sized> Serialize<S> for AlignedCowVec<'a, u8> {
+impl<S> rkyv::Serialize<S> for AlignedCowVec<'_, u8>
+where
+    S: Fallible + WriterExt<S::Error> + Allocator + ?Sized,
+    S::Error: rkyv::rancor::Source,
+{
     #[inline]
     fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
         serializer.align(Self::ALIGNMENT)?;
-        unsafe {
-            ArchivedVec::<Archived<u8>>::serialize_copy_from_slice(self.as_slice(), serializer)
-        }
+        ArchivedVec::<Archived<u8>>::serialize_from_slice(self.as_slice(), serializer)
     }
 }

@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 use wasmer_config::package::{
     Manifest, NamedPackageId, NamedPackageIdent, PackageBuilder, PackageHash, PackageIdent,
 };
@@ -154,7 +154,7 @@ impl PackageTag {
         client: &WasmerClient,
         id: &NamedPackageId,
         manifest: Option<&Manifest>,
-        package_release_id: &wasmer_api::types::Id,
+        package_release_id: &wasmer_backend_api::types::Id,
     ) -> anyhow::Result<()> {
         tracing::info!(
             "Tagging package with registry id {:?} and specifier {:?}",
@@ -200,7 +200,19 @@ impl PackageTag {
             None
         };
 
-        let r = wasmer_api::query::tag_package_release(
+        let maybe_readme_content = match maybe_readme {
+            Some(readme) => {
+                let readme_path = self.package_path.join(&readme);
+                if readme_path.exists() {
+                    Some(tokio::fs::read_to_string(readme_path).await?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        let r = wasmer_backend_api::query::tag_package_release(
             client,
             maybe_description.as_deref(),
             maybe_homepage.as_deref(),
@@ -211,7 +223,7 @@ impl PackageTag {
             None,
             package_release_id,
             private,
-            maybe_readme.as_deref(),
+            maybe_readme_content.as_deref(),
             maybe_repository.as_deref(),
             &version,
         );
@@ -219,7 +231,7 @@ impl PackageTag {
         match r.await? {
             Some(r) => {
                 if r.success {
-                    spinner_ok!(pb, format!("Successfully tagged package {id}",));
+                    spinner_ok!(pb, format!("Successfully tagged package {id}"));
                     if let Some(package_version) = r.package_version {
                         wait_package(client, self.wait, package_version.id, self.timeout).await?;
                     }
@@ -241,7 +253,7 @@ impl PackageTag {
         client: &WasmerClient,
         hash: &PackageHash,
         check_package_exists: bool,
-    ) -> anyhow::Result<wasmer_api::types::Id> {
+    ) -> anyhow::Result<wasmer_backend_api::types::Id> {
         let pb = make_spinner!(
             self.quiet || check_package_exists,
             "Checking if the package exists.."
@@ -249,7 +261,9 @@ impl PackageTag {
 
         tracing::debug!("Searching for package with hash: {hash}");
 
-        let pkg = match wasmer_api::query::get_package_release(client, &hash.to_string()).await? {
+        let pkg = match wasmer_backend_api::query::get_package_release(client, &hash.to_string())
+            .await?
+        {
             Some(p) => p,
             None => {
                 spinner_err!(pb, "The package is not in the registry!");
@@ -366,7 +380,7 @@ impl PackageTag {
             anyhow::bail!("No package namespace specified: use --namespace <package_namespace>");
         }
 
-        let user = wasmer_api::query::current_user_with_namespaces(client, None).await?;
+        let user = wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
         crate::utils::prompts::prompt_for_namespace("Choose a namespace", None, Some(&user))
     }
 
@@ -403,7 +417,7 @@ impl PackageTag {
             format!("Checking if a version of {full_pkg_name} already exists..")
         );
 
-        if let Some(registry_version) = wasmer_api::query::get_package_version(
+        if let Some(registry_version) = wasmer_backend_api::query::get_package_version(
             client,
             full_pkg_name.to_string(),
             String::from("latest"),
@@ -425,7 +439,7 @@ impl PackageTag {
 
             // Must necessarily bump if there's a package with the chosen version with a different hash.
             let must_bump = {
-                let maybe_pkg = wasmer_api::query::get_package_version(
+                let maybe_pkg = wasmer_backend_api::query::get_package_version(
                     client,
                     full_pkg_name.to_string(),
                     user_version.to_string(),
@@ -590,7 +604,7 @@ impl PackageTag {
             return Ok(false);
         }
 
-        let pkg = wasmer_api::query::get_package_version(
+        let pkg = wasmer_backend_api::query::get_package_version(
             client,
             id.full_name.clone(),
             id.version.to_string(),

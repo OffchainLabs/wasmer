@@ -10,20 +10,22 @@ use crate::{net::socket::TimeType, syscalls::*};
 /// * `fd` - Socket descriptor
 /// * `opt` - Socket option to be set
 /// * `size` - Buffer size
-#[instrument(level = "debug", skip_all, fields(%sock, %opt, %size), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock, %opt, %size), ret)]
 pub fn sock_set_opt_size(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     opt: Sockoption,
     size: Filesize,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     wasi_try_ok!(sock_set_opt_size_internal(&mut ctx, sock, opt, size)?);
 
     #[cfg(feature = "journal")]
     if ctx.data().enable_journal {
         JournalEffector::save_sock_set_opt_size(&mut ctx, sock, opt, size).map_err(|err| {
             tracing::error!("failed to save sock_set_opt_size event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 

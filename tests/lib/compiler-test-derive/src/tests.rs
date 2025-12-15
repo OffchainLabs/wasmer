@@ -44,7 +44,7 @@ gen_tests! {
     } == stringify! {
         #[cfg(test)]
         mod foo {
-            use super::*;
+            use super:: * ;
 
             #[allow(unused)]
             fn foo(config: crate::Config) {
@@ -53,11 +53,11 @@ gen_tests! {
 
             #[cfg(feature = "singlepass")]
             mod singlepass {
-                use super::*;
+                use super:: * ;
                 #[test_log::test]
                 #[cold]
-                #[cfg(feature = "universal")]
-                fn universal() {
+                #[cfg(feature = "singlepass")]
+                fn singlepass() {
                     foo(crate::Config::new(
                         crate::Compiler::Singlepass
                     ))
@@ -66,11 +66,11 @@ gen_tests! {
 
             #[cfg(feature = "cranelift")]
             mod cranelift {
-                use super::*;
+                use super:: * ;
                 #[test_log::test]
                 #[cold]
-                #[cfg(feature = "universal")]
-                fn universal() {
+                #[cfg(feature = "cranelift")]
+                fn cranelift() {
                     foo(crate::Config::new(
                         crate::Compiler::Cranelift
                     ))
@@ -79,11 +79,11 @@ gen_tests! {
 
             #[cfg(feature = "llvm")]
             mod llvm {
-                use super::*;
+                use super:: * ;
                 #[test_log::test]
                 #[cold]
-                #[cfg(feature = "universal")]
-                fn universal() {
+                #[cfg(feature = "llvm")]
+                fn llvm() {
                     foo(crate::Config::new(
                         crate::Compiler::LLVM
                     ))

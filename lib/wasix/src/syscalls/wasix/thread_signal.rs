@@ -7,7 +7,7 @@ use crate::syscalls::*;
 /// Inputs:
 /// - `Signal`
 ///   Signal to be raised for this process
-#[instrument(level = "debug", skip_all, fields(%tid, ?sig), ret)]
+#[instrument(level = "trace", skip_all, fields(%tid, ?sig), ret)]
 pub fn thread_signal(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     tid: Tid,
@@ -20,7 +20,7 @@ pub fn thread_signal(
 
     let env = ctx.data();
 
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     Ok(Errno::Success)
 }

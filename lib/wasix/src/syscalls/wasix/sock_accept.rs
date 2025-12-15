@@ -15,14 +15,14 @@ use crate::{net::socket::TimeType, syscalls::*};
 /// ## Return
 ///
 /// New socket connection
-#[instrument(level = "debug", skip_all, fields(%sock, fd = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock, fd = field::Empty), ret)]
 pub fn sock_accept<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     fd_flags: Fdflags,
     ro_fd: WasmPtr<WasiFd, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
 
@@ -57,7 +57,7 @@ pub fn sock_accept<M: MemorySize>(
 /// ## Return
 ///
 /// New socket connection
-#[instrument(level = "debug", skip_all, fields(%sock, fd = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock, fd = field::Empty), ret)]
 pub fn sock_accept_v2<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
@@ -65,7 +65,7 @@ pub fn sock_accept_v2<M: MemorySize>(
     ro_fd: WasmPtr<WasiFd, M>,
     ro_addr: WasmPtr<__wasi_addr_port_t, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
     let (memory, state, _) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
@@ -93,7 +93,7 @@ pub fn sock_accept_v2<M: MemorySize>(
         )
         .map_err(|err| {
             tracing::error!("failed to save sock_accepted event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -126,7 +126,7 @@ pub(crate) fn sock_accept_internal(
         sock,
         Rights::SOCK_ACCEPT,
         move |socket, fd| async move {
-            if fd.flags.contains(Fdflags::NONBLOCK) {
+            if fd.inner.flags.contains(Fdflags::NONBLOCK) {
                 fd_flags.set(Fdflags::NONBLOCK, true);
                 nonblocking = true;
             }
@@ -168,10 +168,12 @@ pub(crate) fn sock_accept_internal(
     let fd = wasi_try_ok_ok!(if let Some(fd) = with_fd {
         state
             .fs
-            .with_fd(rights, rights, new_flags, 0, inode, fd)
+            .with_fd(rights, rights, new_flags, Fdflagsext::empty(), 0, inode, fd)
             .map(|_| fd)
     } else {
-        state.fs.create_fd(rights, rights, new_flags, 0, inode)
+        state
+            .fs
+            .create_fd(rights, rights, new_flags, Fdflagsext::empty(), 0, inode)
     });
     Span::current().record("fd", fd);
 
