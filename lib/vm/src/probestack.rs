@@ -55,10 +55,17 @@ cfg_if::cfg_if! {
         /// A default probestack for other architectures
         pub const PROBESTACK: unsafe extern "C" fn() = empty_probestack;
     } else {
-        extern "C" {
-            pub fn __rust_probestack();
+        cfg_if::cfg_if! {
+            if #[cfg(not(missing_rust_probestack))] {
+                extern "C" {
+                    pub fn __rust_probestack();
+                }
+                /// The probestack based on the Rust probestack
+                pub static PROBESTACK: unsafe extern "C" fn() = __rust_probestack;
+            } else if #[cfg(missing_rust_probestack)] {
+                /// The probestack based on the Rust probestack
+                pub static PROBESTACK: unsafe extern "C" fn() = crate::compiler_builtins::__rust_probestack;
+            }
         }
-        /// The probestack based on the Rust probestack
-        pub static PROBESTACK: unsafe extern "C" fn() = __rust_probestack;
     }
 }

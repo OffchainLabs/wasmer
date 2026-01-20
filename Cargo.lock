@@ -7091,6 +7091,7 @@ dependencies = [
  "memoffset 0.9.1",
  "more-asserts",
  "region",
+ "rustversion",
  "scopeguard",
  "serde",
  "thiserror",

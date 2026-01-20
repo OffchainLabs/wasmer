@@ -15,6 +15,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod compiler_builtins;
 mod export;
 mod extern_ref;
 mod function_env;
