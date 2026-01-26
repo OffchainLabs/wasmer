@@ -4,10 +4,10 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::RawWaker;
@@ -17,18 +17,19 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::BytesMut;
-use derivative::Derivative;
-use futures_util::future::BoxFuture;
-use futures_util::stream::FuturesOrdered;
 use futures_util::Sink;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesOrdered;
+#[cfg(feature = "hyper")]
 use hyper_util::rt::tokio::TokioIo;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio_serde::SymmetricallyFramed;
 use tokio_serde::formats::SymmetricalBincode;
 #[cfg(feature = "cbor")]
 use tokio_serde::formats::SymmetricalCbor;
@@ -36,19 +37,12 @@ use tokio_serde::formats::SymmetricalCbor;
 use tokio_serde::formats::SymmetricalJson;
 #[cfg(feature = "messagepack")]
 use tokio_serde::formats::SymmetricalMessagePack;
-use tokio_serde::SymmetricallyFramed;
 use tokio_util::codec::FramedRead;
 use tokio_util::codec::FramedWrite;
 use tokio_util::codec::LengthDelimitedCodec;
-use virtual_mio::InlineWaker;
 use virtual_mio::InterestType;
+use virtual_mio::block_on;
 
-use crate::meta;
-use crate::meta::FrameSerializationFormat;
-use crate::meta::RequestType;
-use crate::meta::ResponseType;
-use crate::meta::SocketId;
-use crate::meta::{MessageRequest, MessageResponse};
 use crate::IpCidr;
 use crate::IpRoute;
 use crate::NetworkError;
@@ -63,11 +57,17 @@ use crate::VirtualSocket;
 use crate::VirtualTcpListener;
 use crate::VirtualTcpSocket;
 use crate::VirtualUdpSocket;
+use crate::meta;
+use crate::meta::FrameSerializationFormat;
+use crate::meta::RequestType;
+use crate::meta::ResponseType;
+use crate::meta::SocketId;
+use crate::meta::{MessageRequest, MessageResponse};
 
+use crate::Result;
 use crate::rx_tx::RemoteRx;
 use crate::rx_tx::RemoteTx;
 use crate::rx_tx::RemoteTxWakers;
-use crate::Result;
 
 #[derive(Debug, Clone)]
 pub struct RemoteNetworkingClient {
@@ -314,10 +314,13 @@ impl Future for RemoteNetworkingClientDriver {
                     not_stalled_guard.take();
                 }
                 Poll::Pending if not_stalled_guard.is_none() => {
-                    if let Ok(guard) = self.common.stall.clone().try_lock_owned() {
-                        not_stalled_guard.replace(guard);
-                    } else {
-                        return Poll::Pending;
+                    match self.common.stall.clone().try_lock_owned() {
+                        Ok(guard) => {
+                            not_stalled_guard.replace(guard);
+                        }
+                        _ => {
+                            return Poll::Pending;
+                        }
                     }
                 }
                 Poll::Pending => {}
@@ -529,12 +532,11 @@ struct SocketWithAddr {
 }
 type SocketMap<T> = HashMap<SocketId, T>;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug)]
 struct RemoteCommon {
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     tx: RemoteTx<MessageRequest>,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     rx: Mutex<RemoteRx<MessageResponse>>,
     request_seed: AtomicU64,
     requests: Mutex<HashMap<u64, RequestTx>>,
@@ -543,7 +545,7 @@ struct RemoteCommon {
     recv_with_addr_tx: Mutex<SocketMap<mpsc::Sender<DataWithAddr>>>,
     accept_tx: Mutex<SocketMap<mpsc::Sender<SocketWithAddr>>>,
     sent_tx: Mutex<SocketMap<mpsc::Sender<u64>>>,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     handlers: Mutex<SocketMap<Box<dyn virtual_mio::InterestHandler + Send + Sync>>>,
 
     // The stall guard will prevent reads while its held and there are background tasks running
@@ -1004,7 +1006,7 @@ impl VirtualSocket for RemoteSocket {
     }
 
     fn ttl(&self) -> Result<u32> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetTtl)) {
+        match block_on(self.io_socket(RequestType::GetTtl)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Ttl(ttl) => Ok(ttl),
             res => {
@@ -1015,7 +1017,7 @@ impl VirtualSocket for RemoteSocket {
     }
 
     fn addr_local(&self) -> Result<SocketAddr> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetAddrLocal)) {
+        match block_on(self.io_socket(RequestType::GetAddrLocal)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::SocketAddr(addr) => Ok(addr),
             res => {
@@ -1026,7 +1028,7 @@ impl VirtualSocket for RemoteSocket {
     }
 
     fn status(&self) -> Result<crate::SocketStatus> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetStatus)) {
+        match block_on(self.io_socket(RequestType::GetStatus)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Status(status) => Ok(status),
             res => {
@@ -1066,10 +1068,10 @@ impl VirtualTcpListener for RemoteSocket {
         // server as the constructor invokes this method and we invoke it here after
         // receiving a child connection.
         let mut rx_recv = None;
-        if let Some((rx_socket, existing_rx_recv)) = self.pending_accept.take() {
-            if accepted.socket == rx_socket {
-                rx_recv.replace(existing_rx_recv);
-            }
+        if let Some((rx_socket, existing_rx_recv)) = self.pending_accept.take()
+            && accepted.socket == rx_socket
+        {
+            rx_recv.replace(existing_rx_recv);
         }
         let rx_recv = match rx_recv {
             Some(rx_recv) => rx_recv,
@@ -1131,7 +1133,7 @@ impl VirtualTcpListener for RemoteSocket {
     }
 
     fn addr_local(&self) -> Result<SocketAddr> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetAddrLocal)) {
+        match block_on(self.io_socket(RequestType::GetAddrLocal)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::SocketAddr(addr) => Ok(addr),
             res => {
@@ -1146,7 +1148,7 @@ impl VirtualTcpListener for RemoteSocket {
     }
 
     fn ttl(&self) -> Result<u8> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetTtl)) {
+        match block_on(self.io_socket(RequestType::GetTtl)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Ttl(val) => Ok(val.try_into().map_err(|_| NetworkError::InvalidData)?),
             res => {
@@ -1196,13 +1198,15 @@ impl VirtualRawSocket for RemoteSocket {
         }
     }
 
-    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>]) -> Result<usize> {
+    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>], peek: bool) -> Result<usize> {
         loop {
             if !self.rx_buffer.is_empty() {
                 let amt = self.rx_buffer.len().min(buf.len());
                 let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
                 buf[..amt].copy_from_slice(&self.rx_buffer[..amt]);
-                self.rx_buffer.advance(amt);
+                if !peek {
+                    self.rx_buffer.advance(amt);
+                }
                 return Ok(amt);
             }
             match self.rx_recv.try_recv() {
@@ -1218,7 +1222,7 @@ impl VirtualRawSocket for RemoteSocket {
     }
 
     fn promiscuous(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetPromiscuous)) {
+        match block_on(self.io_socket(RequestType::GetPromiscuous)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1254,7 +1258,15 @@ impl VirtualConnectionlessSocket for RemoteSocket {
     fn try_recv_from(
         &mut self,
         buf: &mut [std::mem::MaybeUninit<u8>],
+        peek: bool,
     ) -> Result<(usize, SocketAddr)> {
+        // FIXME: A proper peek implementation would require correct use of a
+        // buffer. We don't use this implementation AFAIK, so I'll skip over it
+        // for the time being.
+        if peek {
+            return Err(NetworkError::Unsupported);
+        }
+
         match self.rx_recv_with_addr.try_recv() {
             Ok(received) => {
                 let amt = buf.len().min(received.data.len());
@@ -1274,7 +1286,7 @@ impl VirtualUdpSocket for RemoteSocket {
     }
 
     fn broadcast(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetBroadcast)) {
+        match block_on(self.io_socket(RequestType::GetBroadcast)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1289,7 +1301,7 @@ impl VirtualUdpSocket for RemoteSocket {
     }
 
     fn multicast_loop_v4(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetMulticastLoopV4)) {
+        match block_on(self.io_socket(RequestType::GetMulticastLoopV4)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1304,7 +1316,7 @@ impl VirtualUdpSocket for RemoteSocket {
     }
 
     fn multicast_loop_v6(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetMulticastLoopV6)) {
+        match block_on(self.io_socket(RequestType::GetMulticastLoopV6)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1319,7 +1331,7 @@ impl VirtualUdpSocket for RemoteSocket {
     }
 
     fn multicast_ttl_v4(&self) -> Result<u32> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetMulticastTtlV4)) {
+        match block_on(self.io_socket(RequestType::GetMulticastTtlV4)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Ttl(ttl) => Ok(ttl),
             res => {
@@ -1354,7 +1366,7 @@ impl VirtualUdpSocket for RemoteSocket {
     }
 
     fn addr_peer(&self) -> Result<Option<SocketAddr>> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetAddrPeer)) {
+        match block_on(self.io_socket(RequestType::GetAddrPeer)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::None => Ok(None),
             ResponseType::SocketAddr(addr) => Ok(Some(addr)),
@@ -1374,7 +1386,7 @@ impl VirtualConnectedSocket for RemoteSocket {
     }
 
     fn linger(&self) -> Result<Option<Duration>> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetLinger)) {
+        match block_on(self.io_socket(RequestType::GetLinger)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::None => Ok(None),
             ResponseType::Duration(val) => Ok(Some(val)),
@@ -1422,13 +1434,15 @@ impl VirtualConnectedSocket for RemoteSocket {
         self.io_socket_fire_and_forget(RequestType::Close)
     }
 
-    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>]) -> Result<usize> {
+    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>], peek: bool) -> Result<usize> {
         loop {
             if !self.rx_buffer.is_empty() {
                 let amt = self.rx_buffer.len().min(buf.len());
                 let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
                 buf[..amt].copy_from_slice(&self.rx_buffer[..amt]);
-                self.rx_buffer.advance(amt);
+                if !peek {
+                    self.rx_buffer.advance(amt);
+                }
                 return Ok(amt);
             }
             match self.rx_recv.try_recv() {
@@ -1446,7 +1460,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn recv_buf_size(&self) -> Result<usize> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetRecvBufSize)) {
+        match block_on(self.io_socket(RequestType::GetRecvBufSize)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Amount(amt) => Ok(amt.try_into().map_err(|_| NetworkError::IOError)?),
             res => {
@@ -1461,7 +1475,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn send_buf_size(&self) -> Result<usize> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetSendBufSize)) {
+        match block_on(self.io_socket(RequestType::GetSendBufSize)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Amount(val) => Ok(val.try_into().map_err(|_| NetworkError::IOError)?),
             res => {
@@ -1476,7 +1490,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn nodelay(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetNoDelay)) {
+        match block_on(self.io_socket(RequestType::GetNoDelay)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1491,7 +1505,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn keepalive(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetKeepAlive)) {
+        match block_on(self.io_socket(RequestType::GetKeepAlive)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1506,7 +1520,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn dontroute(&self) -> Result<bool> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetDontRoute)) {
+        match block_on(self.io_socket(RequestType::GetDontRoute)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::Flag(val) => Ok(val),
             res => {
@@ -1517,7 +1531,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn addr_peer(&self) -> Result<SocketAddr> {
-        match InlineWaker::block_on(self.io_socket(RequestType::GetAddrPeer)) {
+        match block_on(self.io_socket(RequestType::GetAddrPeer)) {
             ResponseType::Err(err) => Err(err),
             ResponseType::SocketAddr(addr) => Ok(addr),
             res => {
@@ -1537,7 +1551,7 @@ impl VirtualTcpSocket for RemoteSocket {
     }
 
     fn is_closed(&self) -> bool {
-        match InlineWaker::block_on(self.io_socket(RequestType::IsClosed)) {
+        match block_on(self.io_socket(RequestType::IsClosed)) {
             ResponseType::Flag(val) => val,
             _ => false,
         }

@@ -9,7 +9,12 @@
     rustdoc::broken_intra_doc_links
 )]
 #![warn(unused_import_braces)]
-#![allow(clippy::new_without_default, clippy::vtable_address_comparisons)]
+#![allow(
+    clippy::new_without_default,
+    ambiguous_wide_pointer_comparisons,
+    unreachable_patterns,
+    unused
+)]
 #![warn(
     clippy::float_arithmetic,
     clippy::mut_mut,
@@ -19,13 +24,11 @@
     clippy::unicode_not_nfc,
     clippy::use_self
 )]
-#![allow(deprecated_cfg_attr_crate_type_name)]
-#![cfg_attr(feature = "js", crate_type = "cdylib")]
 
 //! [`Wasmer`](https://wasmer.io/) is the most popular
 //! [WebAssembly](https://webassembly.org/) runtime for Rust. It supports
 //! JIT (Just In Time) and AOT (Ahead Of Time) compilation as well as
-//! pluggable compilers suited to your needs.
+//! pluggable compilers suited to your needs and interpreters.
 //!
 //! It's designed to be safe and secure, and runnable in any kind of environment.
 //!
@@ -42,7 +45,7 @@
 //!     (module
 //!       (type $t0 (func (param i32) (result i32)))
 //!       (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
-//!         get_local $p0
+//!         local.get $p0
 //!         i32.const 1
 //!         i32.add))
 //!     "#;
@@ -69,12 +72,16 @@
 //!
 //! * **Pluggable compilers** — A compiler is used by the engine to
 //!   transform WebAssembly into executable code:
-//!   * [`wasmer-compiler-singlepass`] provides a fast compilation-time
+//!   * [`wasmer-compiler-singlepass`](https://docs.rs/wasmer-compiler-singlepass/) provides a fast compilation-time
 //!     but an unoptimized runtime speed,
-//!   * [`wasmer-compiler-cranelift`] provides the right balance between
+//!   * [`wasmer-compiler-cranelift`](https://docs.rs/wasmer-compiler-cranelift/) provides the right balance between
 //!     compilation-time and runtime performance, useful for development,
-//!   * [`wasmer-compiler-llvm`] provides a deeply optimized executable
+//!   * [`wasmer-compiler-llvm`](https://docs.rs/wasmer-compiler-llvm/) provides a deeply optimized executable
 //!     code with the fastest runtime speed, ideal for production.
+//!
+//! * **Interpreters** - Wasmer supports interpeters such as [`wamr`] and [`wasmi`].
+//!
+//! * **Other runtimes** - Wasmer supports [`v8`].
 //!
 //! * **Headless mode** — Once a WebAssembly module has been compiled, it
 //!   is possible to serialize it in a file for example, and later execute
@@ -227,8 +234,6 @@
 //! on top of this API that you may be interested in using, including:
 //!
 //! - [`wasmer-cache`] for caching compiled Wasm modules,
-//! - [`wasmer-emscripten`] for running Wasm modules compiled to the
-//!   Emscripten ABI,
 //! - [`wasmer-wasix`] for running Wasm modules compiled to the WASI ABI.
 //!
 //! The Wasmer project has two major abstractions:
@@ -243,30 +248,40 @@
 //! The engine is a system that uses a compiler to make a WebAssembly
 //! module executable.
 //!
-//! ## Compilers
+//! ## Runtimes
 //!
-//! A compiler is a system that handles the details of making a Wasm
-//! module executable. For example, by generating native machine code
-//! for each Wasm function.
+//! A runtime is a system that handles the details of making a Wasm module executable. We support
+//! multiple kinds of runtimes: compilers, which generate native machine code for each Wasm
+//! function and interpreter, in which no native machine code is generated and can be used on
+//! platforms where JIT compilation is not allowed, such as iOS.
 //!
 //! # Cargo Features
-//!
-//! This crate comes in 2 flavors:
 //!
 //! 1. `sys`
 #![cfg_attr(feature = "sys", doc = "(enabled),")]
 #![cfg_attr(not(feature = "sys"), doc = "(disabled),")]
 //!    where `wasmer` will be compiled to a native executable
 //!    which provides compilers, engines, a full VM etc.
-//! 2. `js`
+//!    By default, the `singlepass` and `cranelift` backends are enabled.
+//!
+//! 2. `v8`
+#![cfg_attr(feature = "v8", doc = "(enabled),")]
+#![cfg_attr(not(feature = "v8"), doc = "(disabled),")]
+//!   where `wasmer` will be compiled to a native executable
+//!   where the `v8` runtime is used for execution.
+//!
+//! 3. `wamr`
+#![cfg_attr(feature = "wamr", doc = "(enabled),")]
+#![cfg_attr(not(feature = "wamr"), doc = "(disabled),")]
+//!   where `wasmer` will be compiled to a native executable
+//!   where `wamr` (in interpreter mode) is used for execution.
+//!
+//! 4. `js`
 #![cfg_attr(feature = "js", doc = "(enabled),")]
 #![cfg_attr(not(feature = "js"), doc = "(disabled),")]
 //!    where `wasmer` will be compiled to WebAssembly to run in a
 //!    JavaScript host (see [Using Wasmer in a JavaScript
 //!    environment](#using-wasmer-in-a-javascript-environment)).
-//!
-//! Consequently, we can group the features by the `sys` or `js`
-//! features.
 //!
 #![cfg_attr(
     feature = "sys",
@@ -287,15 +302,15 @@
 //! - `cranelift`
 #![cfg_attr(feature = "cranelift", doc = "(enabled),")]
 #![cfg_attr(not(feature = "cranelift"), doc = "(disabled),")]
-//!   enables Wasmer's [Cranelift compiler][wasmer-compiler-cranelift],
+//!   enables Wasmer's [`Cranelift` compiler](https://docs.rs/wasmer-compiler-cranelift),
 //! - `llvm`
 #![cfg_attr(feature = "llvm", doc = "(enabled),")]
 #![cfg_attr(not(feature = "llvm"), doc = "(disabled),")]
-//!   enables Wasmer's [LLVM compiler][wasmer-compiler-lvm],
+//!   enables Wasmer's [`LLVM` compiler](https://docs.rs/wasmer-compiler-llvm),
 //! - `singlepass`
 #![cfg_attr(feature = "singlepass", doc = "(enabled),")]
 #![cfg_attr(not(feature = "singlepass"), doc = "(disabled),")]
-//!   enables Wasmer's [Singlepass compiler][wasmer-compiler-singlepass],
+//!   enables Wasmer's [`Singlepass` compiler](https://docs.rs/wasmer-compiler-singlepass),
 //! - `wat`
 #![cfg_attr(feature = "wat", doc = "(enabled),")]
 #![cfg_attr(not(feature = "wat"), doc = "(disabled),")]
@@ -304,6 +319,10 @@
 #![cfg_attr(feature = "compiler", doc = "(enabled),")]
 #![cfg_attr(not(feature = "compiler"), doc = "(disabled),")]
 //!   enables compilation with the wasmer engine.
+//!
+//! Notice that the `sys`, `wamr` and `v8` features are composable together,
+//! so a single build of Wasmer using `llvm`, `cranelift`, `singlepass`, `wamr`, and `v8`
+//! (or any combination of them) is possible.
 //!
 #![cfg_attr(
     feature = "js",
@@ -355,7 +374,7 @@
 //!     (module
 //!       (type $t0 (func (param i32) (result i32)))
 //!       (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
-//!         get_local $p0
+//!         local.get $p0
 //!         i32.const 1
 //!         i32.add))
 //!     "#;
@@ -383,150 +402,165 @@
 //! [wasmer-examples]: https://github.com/wasmerio/wasmer/tree/main/examples
 //! [`wasmer-cache`]: https://docs.rs/wasmer-cache/
 //! [wasmer-compiler]: https://docs.rs/wasmer-compiler/
-//! [`wasmer-emscripten`]: https://docs.rs/wasmer-emscripten/
 //! [`wasmer-compiler-singlepass`]: https://docs.rs/wasmer-compiler-singlepass/
 //! [`wasmer-compiler-llvm`]: https://docs.rs/wasmer-compiler-llvm/
 //! [`wasmer-compiler-cranelift`]: https://docs.rs/wasmer-compiler-cranelift/
 //! [`wasmer-wasix`]: https://docs.rs/wasmer-wasix/
 //! [`wasm-pack`]: https://github.com/rustwasm/wasm-pack/
 //! [`wasm-bindgen`]: https://github.com/rustwasm/wasm-bindgen
+//! [`v8`]: https://v8.dev/
+//! [`wamr`]: https://github.com/bytecodealliance/wasm-micro-runtime
+//! [`wasmi`]: https://github.com/wasmi-labs/wasmi
 
-#[cfg(all(not(feature = "sys"), not(feature = "js"), not(feature = "jsc")))]
-compile_error!("One of: `sys`, `js` or `jsc` features must be enabled. Please, pick one.");
+macro_rules! cfg_compiler {
+    ($($item:item)*) => {
+        $(
+            #[cfg(any(
+                feature = "cranelift",
+                feature = "singlepass",
+                feature = "llvm",
+                feature = "js",
+                feature = "jsc",
+                feature = "wamr",
+                feature = "v8",
+                feature = "wasmi",
+                feature = "headless"
+            ))]
+            $item
+        )*
+    };
+}
 
-#[cfg(all(feature = "sys", feature = "js"))]
+#[cfg(not(any(
+    feature = "singlepass",
+    feature = "cranelift",
+    feature = "llvm",
+    feature = "wamr",
+    feature = "wasmi",
+    feature = "v8",
+    feature = "js",
+    feature = "jsc",
+    feature = "headless",
+)))]
 compile_error!(
-    "Cannot have both `sys` and `js` features enabled at the same time. Please, pick one."
+    "wasmer requires enabling at least one backend feature: `singlepass`, `cranelift`, `llvm`, `wamr`, `wasmi`, `v8`, `js`, `jsc` or `headless`."
 );
 
-#[cfg(all(feature = "js", feature = "jsc"))]
+#[cfg(all(
+    feature = "sys",
+    not(any(
+        feature = "singlepass",
+        feature = "cranelift",
+        feature = "llvm",
+        feature = "headless"
+    ))
+))]
 compile_error!(
-    "Cannot have both `js` and `jsc` features enabled at the same time. Please, pick one."
+    "the `sys` feature requires enabling at least one compiler backend: `singlepass`, `cranelift`, `llvm`, or `headless`."
 );
 
-#[cfg(all(feature = "sys", feature = "jsc"))]
-compile_error!(
-    "Cannot have both `sys` and `jsc` features enabled at the same time. Please, pick one."
-);
+cfg_compiler! {
+    mod utils;
+    pub use utils::*;
+    pub use entities::memory::{MemoryView, location::MemoryLocation};
+    mod error;
+    pub use error::*;
+    pub use entities::*;
+    mod backend;
+    pub use backend::*;
+    mod vm;
+}
 
-#[cfg(all(feature = "sys", target_arch = "wasm32"))]
-compile_error!("The `sys` feature must be enabled only for non-`wasm32` target.");
+// TODO: cannot be placed into cfg_compiler due to: error: `inner` is ambiguous
+#[cfg(any(
+    feature = "cranelift",
+    feature = "singlepass",
+    feature = "llvm",
+    feature = "js",
+    feature = "jsc",
+    feature = "wamr",
+    feature = "v8",
+    feature = "wasmi",
+    feature = "headless",
+))]
+mod entities;
 
-#[cfg(all(feature = "jsc", target_arch = "wasm32"))]
-compile_error!("The `jsc` feature must be enabled only for non-`wasm32` target.");
-
-#[cfg(all(feature = "js", not(target_arch = "wasm32")))]
-compile_error!(
-    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasi`)."
-);
-
-mod access;
-mod engine;
-mod errors;
-mod exports;
-mod extern_ref;
-mod externals;
-mod function_env;
-mod imports;
-mod instance;
-mod into_bytes;
-mod mem_access;
-mod module;
-mod native_type;
-mod ptr;
-mod store;
-mod typed_function;
-mod value;
-pub mod vm;
-
-#[cfg(any(feature = "wasm-types-polyfill", feature = "jsc"))]
-mod module_info_polyfill;
-
-#[cfg(feature = "sys")]
-/// sys
-pub mod sys;
-
-#[cfg(feature = "sys")]
-pub use sys::*;
-
-#[cfg(feature = "sys")]
-#[deprecated(note = "wasmer::Artifact is deprecated, use wasmer::sys::Artifact instead")]
-/// A compiled wasm module, ready to be instantiated.
-pub type Artifact = sys::Artifact;
-#[cfg(feature = "sys")]
-#[deprecated(note = "wasmer::EngineBuilder is deprecated, use wasmer::sys::EngineBuilder instead")]
-/// The Builder contents of `Engine`
-pub type EngineBuilder = sys::EngineBuilder;
-#[cfg(feature = "sys")]
-#[deprecated(note = "wasmer::Features is deprecated, use wasmer::sys::Features instead")]
-/// Controls which experimental features will be enabled.
-pub type Features = sys::Features;
-#[cfg(feature = "sys")]
-#[deprecated(note = "wasmer::BaseTunables is deprecated, use wasmer::sys::BaseTunables instead")]
-/// Tunable parameters for WebAssembly compilation.
-/// This is the reference implementation of the `Tunables` trait,
-/// used by default.
-pub type BaseTunables = sys::BaseTunables;
-#[cfg(feature = "sys")]
-#[deprecated(note = "wasmer::VMConfig is deprecated, use wasmer::sys::VMConfig instead")]
-/// Configuration for the runtime VM
-/// Currently only the stack size is configurable
-pub type VMConfig = sys::VMConfig;
-
-#[cfg(feature = "js")]
-mod js;
-
-#[cfg(feature = "js")]
-pub use js::*;
-
-#[cfg(feature = "jsc")]
-mod jsc;
-
-#[cfg(feature = "jsc")]
-pub use jsc::*;
-
-pub use crate::externals::{
-    Extern, Function, Global, HostFunction, Memory, MemoryLocation, MemoryView, SharedMemory, Table,
-};
-pub use access::WasmSliceAccess;
-pub use engine::{AsEngineRef, Engine, EngineRef};
-pub use errors::{AtomicsError, InstantiationError, LinkError, RuntimeError};
-pub use exports::{ExportError, Exportable, Exports, ExportsIterator};
-pub use extern_ref::ExternRef;
-pub use function_env::{FunctionEnv, FunctionEnvMut};
-pub use imports::Imports;
-pub use instance::Instance;
-pub use into_bytes::IntoBytes;
-pub use mem_access::{MemoryAccessError, WasmRef, WasmSlice, WasmSliceIter};
-pub use module::{IoCompileError, Module};
-pub use native_type::{FromToNativeWasmType, NativeWasmTypeInto, WasmTypeList};
-pub use ptr::{Memory32, Memory64, MemorySize, WasmPtr, WasmPtr64};
-pub use store::{
-    AsStoreMut, AsStoreRef, OnCalledHandler, Store, StoreId, StoreMut, StoreObjects, StoreRef,
-};
-#[cfg(feature = "sys")]
-pub use store::{TrapHandlerFn, Tunables};
-#[cfg(any(feature = "sys", feature = "jsc"))]
-pub use target_lexicon::{Architecture, CallingConvention, OperatingSystem, Triple, HOST};
-pub use typed_function::TypedFunction;
-pub use value::Value;
-
-// Reexport from other modules
-
-pub use wasmer_derive::ValueType;
-// TODO: OnCalledAction is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
 pub use wasmer_types::{
-    is_wasm, Bytes, CompileError, CpuFeature, DeserializeError, ExportIndex, ExportType,
-    ExternType, FrameInfo, FunctionType, GlobalInit, GlobalType, ImportType, LocalFunctionIndex,
-    MemoryError, MemoryType, MiddlewareError, Mutability, OnCalledAction, Pages,
-    ParseCpuFeatureError, SerializeError, TableType, Target, Type, ValueType, WasmError,
-    WasmResult, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE,
+    Bytes, CompileError, DeserializeError, ExportIndex, ExportType, ExternType, FrameInfo,
+    FunctionType, GlobalInit, GlobalType, ImportType, LocalFunctionIndex, MemoryError, MemoryStyle,
+    MemoryType, Mutability, OnCalledAction, Pages, ParseCpuFeatureError, SerializeError,
+    TableStyle, TableType, TagKind, TagType, Type, ValueType, WASM_MAX_PAGES, WASM_MIN_PAGES,
+    WASM_PAGE_SIZE, WasmError, WasmResult, is_wasm,
 };
-#[cfg(feature = "wat")]
-pub use wat::parse_bytes as wat2wasm;
 
 #[cfg(feature = "wasmparser")]
 pub use wasmparser;
 
-/// Version number of this crate.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "wat")]
+pub use wat::parse_bytes as wat2wasm;
+
+pub use wasmer_derive::ValueType;
+
+#[cfg(any(
+    all(
+        feature = "sys-default",
+        any(
+            feature = "js-default",
+            feature = "jsc-default",
+            feature = "wamr-default",
+            feature = "v8-default",
+            feature = "wasmi-default"
+        )
+    ),
+    all(
+        feature = "js-default",
+        any(
+            feature = "sys-default",
+            feature = "jsc-default",
+            feature = "wamr-default",
+            feature = "v8-default",
+            feature = "wasmi-default"
+        )
+    ),
+    all(
+        feature = "jsc-default",
+        any(
+            feature = "sys-default",
+            feature = "js-default",
+            feature = "wamr-default",
+            feature = "v8-default",
+            feature = "wasmi-default"
+        )
+    ),
+    all(
+        feature = "wamr-default",
+        any(
+            feature = "sys-default",
+            feature = "js-default",
+            feature = "jsc-default",
+            feature = "v8-default",
+            feature = "wasmi-default"
+        )
+    ),
+    all(
+        feature = "v8-default",
+        any(
+            feature = "sys-default",
+            feature = "js-default",
+            feature = "jsc-default",
+            feature = "wasmi-default",
+            feature = "wasmi-default"
+        )
+    ),
+    all(
+        feature = "wasmi-default",
+        any(
+            feature = "sys-default",
+            feature = "js-default",
+            feature = "jsc-default",
+            feature = "v8-default",
+            feature = "wamr-default"
+        )
+    )
+))]
+compile_error!("Multiple *-default features selected. Please, pick one only!");

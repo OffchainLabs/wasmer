@@ -116,7 +116,7 @@ fn wasmer_init_publish() {
         .arg("build")
         .arg("--release")
         .arg("--target")
-        .arg("wasm32-wasi")
+        .arg("wasm32-wasip1")
         .arg("--manifest-path")
         .arg(path.join("randomversion").join("Cargo.toml"))
         .assert()
@@ -133,7 +133,7 @@ fn wasmer_init_publish() {
         .assert()
         .success();
 
-    let s = std::fs::read_to_string(path.join("randomversion").join("wasmer.toml")).unwrap();
+    let _s = std::fs::read_to_string(path.join("randomversion").join("wasmer.toml")).unwrap();
 
     // publish
     let mut cmd = std::process::Command::new(get_wasmer_path());
@@ -180,7 +180,7 @@ fn wasmer_publish_and_run() {
     .unwrap();
 
     let package_name =
-        format!("{username}/largewasmfile@{random_major}.{random_minor}.{random_patch}",);
+        format!("{username}/largewasmfile@{random_major}.{random_minor}.{random_patch}");
 
     let mut cmd = std::process::Command::new(get_wasmer_path());
     cmd.arg("publish")

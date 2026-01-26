@@ -2,10 +2,10 @@
 // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Module for Windows x64 ABI unwind registry.
+use crate::types::unwind::CompiledFunctionUnwindInfoReference;
 use std::collections::HashMap;
-use wasmer_types::CompiledFunctionUnwindInfoReference;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    RtlAddFunctionTable, RtlDeleteFunctionTable, IMAGE_RUNTIME_FUNCTION_ENTRY,
+    IMAGE_RUNTIME_FUNCTION_ENTRY, RtlAddFunctionTable, RtlDeleteFunctionTable,
 };
 
 /// Represents a registry of function unwind information for Windows x64 ABI.
@@ -49,7 +49,7 @@ impl UnwindRegistry {
         // The unwind information should be immediately following the function
         // with padding for 4 byte alignment
         entry.Anonymous.UnwindInfoAddress = (entry.EndAddress + 3) & !3;
-        let entries = self.functions.entry(base_address).or_insert_with(Vec::new);
+        let entries = self.functions.entry(base_address).or_default();
 
         entries.push(entry);
 
@@ -57,7 +57,7 @@ impl UnwindRegistry {
     }
 
     /// Publishes all registered functions.
-    pub fn publish(&mut self, _eh_frame: Option<&[u8]>) -> Result<(), String> {
+    pub fn publish_eh_frame(&mut self, _eh_frame: Option<&[u8]>) -> Result<(), String> {
         if self.published {
             return Err("unwind registry has already been published".to_string());
         }
@@ -73,12 +73,11 @@ impl UnwindRegistry {
                     "function table allocation was not aligned"
                 );
                 unsafe {
-                    if RtlAddFunctionTable(
+                    if !RtlAddFunctionTable(
                         functions.as_mut_ptr(),
                         functions.len() as u32,
                         *base_address as u64,
-                    ) == 0
-                    {
+                    ) {
                         return Err("failed to register function tables".to_string());
                     }
                 }

@@ -1,5 +1,5 @@
 //! The WebAssembly possible errors
-use crate::{ExternType, Pages};
+use crate::{ExternType, Pages, progress::UserAbort};
 use std::io;
 use thiserror::Error;
 
@@ -142,13 +142,12 @@ use crate::lib::std::string::String;
 /// The WebAssembly.CompileError object indicates an error during
 /// WebAssembly decoding or validation.
 ///
-/// This is based on the [Wasm Compile Error][compile-error] API.
-///
-/// [compiler-error]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/CompileError
+/// This mirrors the WebAssembly `CompileError` API described at
+/// <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/CompileError>.
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum CompileError {
-    /// A Wasm translation error occured.
+    /// A Wasm translation error occurred.
     #[cfg_attr(feature = "std", error("WebAssembly translation error: {0}"))]
     Wasm(WasmError),
 
@@ -179,11 +178,21 @@ pub enum CompileError {
     /// Middleware error occurred.
     #[cfg_attr(feature = "std", error("Middleware error: {0}"))]
     MiddlewareError(String),
+
+    /// Compilation aborted by a user callback.
+    #[cfg_attr(feature = "std", error("Compilation aborted: {0}"))]
+    Aborted(UserAbort),
 }
 
 impl From<WasmError> for CompileError {
     fn from(original: WasmError) -> Self {
         Self::Wasm(original)
+    }
+}
+
+impl From<UserAbort> for CompileError {
+    fn from(abort: UserAbort) -> Self {
+        Self::Aborted(abort)
     }
 }
 
@@ -262,7 +271,7 @@ impl From<MiddlewareError> for WasmError {
 }
 
 /// The error that can happen while parsing a `str`
-/// to retrieve a [`CpuFeature`](crate::CpuFeature).
+/// to retrieve a [`CpuFeature`](crate::target::CpuFeature).
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum ParseCpuFeatureError {
@@ -294,7 +303,7 @@ mod tests {
                 assert_eq!(name, "manipulator3000");
                 assert_eq!(message, "foo");
             }
-            err => panic!("Unexpected error: {:?}", err),
+            err => panic!("Unexpected error: {err:?}"),
         }
     }
 }

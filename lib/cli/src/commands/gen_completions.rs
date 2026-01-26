@@ -1,6 +1,6 @@
 use super::WasmerCmd;
 use clap::CommandFactory;
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use std::fs::OpenOptions;
 
 #[derive(Debug, Clone, clap::Parser)]
@@ -17,7 +17,7 @@ impl CmdGenCompletions {
     pub fn execute(&self) -> anyhow::Result<()> {
         let mut cmd = WasmerCmd::command();
 
-        let name = cmd.get_name().to_string();
+        let name = std::env::args().next().unwrap();
         if let Some(out) = &self.out {
             let mut f = OpenOptions::new()
                 .truncate(true)

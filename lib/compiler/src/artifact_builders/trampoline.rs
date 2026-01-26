@@ -3,10 +3,14 @@
 //! This is needed because the target of libcall relocations are not reachable
 //! through normal branch instructions.
 
-use enum_iterator::IntoEnumIterator;
-use wasmer_types::{
-    Architecture, CustomSection, CustomSectionProtection, LibCall, Relocation, RelocationKind,
-    RelocationTarget, SectionBody, Target,
+#![cfg_attr(not(feature = "compiler"), allow(dead_code))]
+
+use wasmer_types::LibCall;
+use wasmer_types::target::{Architecture, Target};
+
+use crate::types::{
+    relocation::{Relocation, RelocationKind, RelocationTarget},
+    section::{CustomSection, CustomSectionProtection, SectionBody},
 };
 
 // SystemV says that both x16 and x17 are available as intra-procedural scratch
@@ -33,6 +37,23 @@ const X86_64_TRAMPOLINE: [u8; 16] = [
 // JMPADDR        00 00 00 00 00 00 00 00
 const RISCV64_TRAMPOLINE: [u8; 24] = [
     0x17, 0x03, 0x00, 0x00, 0x03, 0x33, 0x03, 0x01, 0x67, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0,
+];
+
+// AUIPC t1,0     17 03 00 00
+// LW t1, 12(t1)  03 a3 c2 00
+// JR t1          67 00 03 00
+// JMPADDR        00 00 00 00
+const RISCV32_TRAMPOLINE: [u8; 16] = [
+    0x17, 0x03, 0x00, 0x00, 0x03, 0xa3, 0xc2, 0x00, 0x67, 0x00, 0x03, 0x00, 0, 0, 0, 0,
+];
+
+// PCADDI r12, 0      0c 00 00 18
+// LD.D r12, r12, 16  8c 41 c0 28
+// JR r12             80 01 00 4c [00 00 00 00]
+// JMPADDR            00 00 00 00 00 00 00 00
+const LOONGARCH64_TRAMPOLINE: [u8; 24] = [
+    0x0c, 0x00, 0x00, 0x18, 0x8c, 0x41, 0xc0, 0x28, 0x80, 0x01, 0x00, 0x4c, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0,
 ];
 
@@ -70,7 +91,25 @@ fn make_trampoline(
                 addend: 0,
             });
         }
-        arch => panic!("Unsupported architecture: {}", arch),
+        Architecture::Riscv32(_) => {
+            code.extend(RISCV32_TRAMPOLINE);
+            relocations.push(Relocation {
+                kind: RelocationKind::Abs4,
+                reloc_target: RelocationTarget::LibCall(libcall),
+                offset: code.len() as u32 - 4,
+                addend: 0,
+            });
+        }
+        Architecture::LoongArch64 => {
+            code.extend(LOONGARCH64_TRAMPOLINE);
+            relocations.push(Relocation {
+                kind: RelocationKind::Abs8,
+                reloc_target: RelocationTarget::LibCall(libcall),
+                offset: code.len() as u32 - 8,
+                addend: 0,
+            });
+        }
+        arch => panic!("Unsupported architecture: {arch}"),
     };
 }
 
@@ -80,7 +119,9 @@ pub fn libcall_trampoline_len(target: &Target) -> usize {
         Architecture::Aarch64(_) => AARCH64_TRAMPOLINE.len(),
         Architecture::X86_64 => X86_64_TRAMPOLINE.len(),
         Architecture::Riscv64(_) => RISCV64_TRAMPOLINE.len(),
-        arch => panic!("Unsupported architecture: {}", arch),
+        Architecture::Riscv32(_) => RISCV32_TRAMPOLINE.len(),
+        Architecture::LoongArch64 => LOONGARCH64_TRAMPOLINE.len(),
+        arch => panic!("Unsupported architecture: {arch}"),
     }
 }
 
@@ -88,11 +129,12 @@ pub fn libcall_trampoline_len(target: &Target) -> usize {
 pub fn make_libcall_trampolines(target: &Target) -> CustomSection {
     let mut code = vec![];
     let mut relocations = vec![];
-    for libcall in LibCall::into_enum_iter() {
+    for libcall in enum_iterator::all::<LibCall>() {
         make_trampoline(target, libcall, &mut code, &mut relocations);
     }
     CustomSection {
         protection: CustomSectionProtection::ReadExecute,
+        alignment: None,
         bytes: SectionBody::new_with_vec(code),
         relocations,
     }

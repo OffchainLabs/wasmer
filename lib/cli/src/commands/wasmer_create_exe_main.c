@@ -14,7 +14,7 @@
 
 static void print_wasmer_error() {
   int error_len = wasmer_last_error_length();
-  printf("Error len: `%d`\n", error_len);
+  //printf("Error len: `%d`\n", error_len);
   char *error_str = (char *)malloc(error_len);
   wasmer_last_error_message(error_str, error_len);
   printf("%s\n", error_str);
@@ -43,6 +43,8 @@ static void pass_mapdir_arg(wasi_config_t *wasi_config, char *mapdir) {
   free(alias);
   free(dir);
 }
+
+// TODO: port to new --volume option if we want to use it in the future
 
 // We try to parse out `--dir` and `--mapdir` ahead of time and process those
 // specially. All other arguments are passed to the guest program.
@@ -124,7 +126,7 @@ int main(int argc, char *argv[]) {
       }
     }
     
-    // select the --command only if if was given before a "--", such 
+    // select the --command only if it was given before a "--", such 
     for (int i = 1; i < argc; i++) {
       if ((strcmp(argv[i], "--command") == 0 || strcmp(argv[i], "-c") == 0) && dash_dash_position > i) {
         // next arg is a command

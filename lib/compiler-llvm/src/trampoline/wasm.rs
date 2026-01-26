@@ -1,40 +1,74 @@
-use crate::abi::{get_abi, Abi};
-use crate::config::{CompiledKind, LLVM};
-use crate::object_file::{load_object_file, CompiledFunction};
-use crate::translator::intrinsics::{type_to_llvm, type_to_llvm_ptr, Intrinsics};
-use inkwell::values::BasicMetadataValueEnum;
+// TODO: Remove
+#![allow(unused)]
+
+use crate::{
+    abi::{Abi, G0M0FunctionKind, get_abi},
+    config::LLVM,
+    error::{err, err_nt},
+    object_file::{CompiledFunction, load_object_file},
+    translator::intrinsics::{Intrinsics, type_to_llvm, type_to_llvm_ptr},
+};
 use inkwell::{
+    AddressSpace, DLLStorageClass,
     attributes::{Attribute, AttributeLoc},
     context::Context,
     module::{Linkage, Module},
-    passes::PassManager,
+    passes::PassBuilderOptions,
     targets::{FileType, TargetMachine},
-    types::{BasicType, FunctionType},
-    values::FunctionValue,
-    AddressSpace, DLLStorageClass,
+    types::FunctionType,
+    values::{BasicMetadataValueEnum, FunctionValue},
 };
-use std::cmp;
-use std::convert::TryInto;
+use std::{cmp, convert::TryInto};
+use target_lexicon::{BinaryFormat, Triple};
+use wasmer_compiler::{
+    misc::CompiledKind,
+    types::{
+        function::FunctionBody,
+        module::CompileModuleInfo,
+        relocation::{Relocation, RelocationTarget},
+        section::{CustomSection, CustomSectionProtection, SectionBody, SectionIndex},
+    },
+};
 use wasmer_types::{
-    CompileError, FunctionBody, FunctionType as FuncType, LocalFunctionIndex, RelocationTarget,
+    CompileError, FunctionIndex, FunctionType as FuncType, LocalFunctionIndex, entity::PrimaryMap,
 };
+use wasmer_vm::MemoryStyle;
 
 pub struct FuncTrampoline {
     ctx: Context,
     target_machine: TargetMachine,
+    target_triple: Triple,
     abi: Box<dyn Abi>,
+    binary_fmt: BinaryFormat,
+    func_section: String,
 }
 
-const FUNCTION_SECTION: &str = "__TEXT,wasmer_trmpl"; // Needs to be between 1 and 16 chars
+const FUNCTION_SECTION_ELF: &str = "__TEXT,wasmer_trmpl"; // Needs to be between 1 and 16 chars
+const FUNCTION_SECTION_MACHO: &str = "wasmer_trmpl"; // Needs to be between 1 and 16 chars
 
 impl FuncTrampoline {
-    pub fn new(target_machine: TargetMachine) -> Self {
+    pub fn new(
+        target_machine: TargetMachine,
+        target_triple: Triple,
+        binary_fmt: BinaryFormat,
+    ) -> Result<Self, CompileError> {
         let abi = get_abi(&target_machine);
-        Self {
+        Ok(Self {
             ctx: Context::create(),
             target_machine,
+            target_triple,
             abi,
-        }
+            func_section: match binary_fmt {
+                BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
+                BinaryFormat::Macho => FUNCTION_SECTION_MACHO.to_string(),
+                _ => {
+                    return Err(CompileError::UnsupportedTarget(format!(
+                        "Unsupported binary format: {binary_fmt:?}",
+                    )));
+                }
+            },
+            binary_fmt,
+        })
     }
 
     pub fn trampoline_to_module(
@@ -42,25 +76,38 @@ impl FuncTrampoline {
         ty: &FuncType,
         config: &LLVM,
         name: &str,
-    ) -> Result<Module, CompileError> {
+        compile_info: &CompileModuleInfo,
+    ) -> Result<Module<'_>, CompileError> {
         // The function type, used for the callbacks.
         let function = CompiledKind::FunctionCallTrampoline(ty.clone());
         let module = self.ctx.create_module("");
         let target_machine = &self.target_machine;
         let target_triple = target_machine.get_triple();
-        let target_data = target_machine.get_target_data();
+        let target_data: inkwell::targets::TargetData = target_machine.get_target_data();
         module.set_triple(&target_triple);
         module.set_data_layout(&target_data.get_data_layout());
-        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data);
+        let intrinsics = Intrinsics::declare(
+            &module,
+            &self.ctx,
+            &target_data,
+            &self.target_triple,
+            &self.binary_fmt,
+        );
+
+        let func_kind = if config.enable_g0m0_opt {
+            Some(G0M0FunctionKind::Local)
+        } else {
+            None
+        };
 
         let (callee_ty, callee_attrs) =
             self.abi
-                .func_type_to_llvm(&self.ctx, &intrinsics, None, ty)?;
+                .func_type_to_llvm(&self.ctx, &intrinsics, None, ty, func_kind)?;
         let trampoline_ty = intrinsics.void_ty.fn_type(
             &[
-                intrinsics.ctx_ptr_ty.into(),                       // vmctx ptr
-                callee_ty.ptr_type(AddressSpace::default()).into(), // callee function address
-                intrinsics.i128_ptr_ty.into(),                      // in/out values ptr
+                intrinsics.ptr_ty.into(), // vmctx ptr
+                intrinsics.ptr_ty.into(), // callee function address
+                intrinsics.ptr_ty.into(), // in/out values ptr
             ],
             false,
         );
@@ -68,14 +115,18 @@ impl FuncTrampoline {
         let trampoline_func = module.add_function(name, trampoline_ty, Some(Linkage::External));
         trampoline_func
             .as_global_value()
-            .set_section(Some(FUNCTION_SECTION));
+            .set_section(Some(&self.func_section));
         trampoline_func
             .as_global_value()
             .set_linkage(Linkage::DLLExport);
         trampoline_func
             .as_global_value()
             .set_dll_storage_class(DLLStorageClass::Export);
+        trampoline_func.add_attribute(AttributeLoc::Function, intrinsics.uwtable);
+        trampoline_func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
         self.generate_trampoline(
+            config,
+            compile_info,
             trampoline_func,
             ty,
             callee_ty,
@@ -85,23 +136,27 @@ impl FuncTrampoline {
         )?;
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.preopt_ir(&function, &module);
+            callbacks.preopt_ir(&function, &compile_info.module.hash_string(), &module);
         }
 
-        let pass_manager = PassManager::create(());
+        let mut passes = vec![];
 
         if config.enable_verifier {
-            pass_manager.add_verifier_pass();
+            passes.push("verify");
         }
 
-        pass_manager.add_early_cse_pass();
-
-        pass_manager.run_on(&module);
+        passes.push("instcombine");
+        module
+            .run_passes(
+                passes.join(",").as_str(),
+                target_machine,
+                PassBuilderOptions::create(),
+            )
+            .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.postopt_ir(&function, &module);
+            callbacks.postopt_ir(&function, &compile_info.module.hash_string(), &module);
         }
-
         Ok(module)
     }
 
@@ -110,8 +165,9 @@ impl FuncTrampoline {
         ty: &FuncType,
         config: &LLVM,
         name: &str,
+        compile_info: &CompileModuleInfo,
     ) -> Result<FunctionBody, CompileError> {
-        let module = self.trampoline_to_module(ty, config, name)?;
+        let module = self.trampoline_to_module(ty, config, name, compile_info)?;
         let function = CompiledKind::FunctionCallTrampoline(ty.clone());
         let target_machine = &self.target_machine;
 
@@ -120,32 +176,53 @@ impl FuncTrampoline {
             .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.obj_memory_buffer(&function, &memory_buffer);
+            let module_hash = compile_info.module.hash_string();
+            callbacks.obj_memory_buffer(&function, &module_hash, &memory_buffer);
+            let asm_buffer = target_machine
+                .write_to_memory_buffer(&module, FileType::Assembly)
+                .unwrap();
+            callbacks.asm_memory_buffer(&function, &module_hash, &asm_buffer);
         }
 
         let mem_buf_slice = memory_buffer.as_slice();
+
+        // Use a dummy function index to detect relocations against the trampoline
+        // function's address, which shouldn't exist and are not supported.
+        // Note, we just drop all custom sections, and verify that the function
+        // body itself has no relocations at all. This value should never be
+        // touched at all. However, it is set up so that if we do touch it (maybe
+        // due to someone changing the code later on), it'll explode, which is desirable!
+        let dummy_reloc_target =
+            RelocationTarget::DynamicTrampoline(FunctionIndex::from_u32(u32::MAX - 1));
+
+        // Note: we don't count .gcc_except_table here because native-to-wasm
+        // trampolines are not supposed to generate any LSDA sections. We *want* them
+        // to terminate libunwind's stack searches.
         let CompiledFunction {
             compiled_function,
             custom_sections,
             eh_frame_section_indices,
+            mut compact_unwind_section_indices,
+            ..
         } = load_object_file(
             mem_buf_slice,
-            FUNCTION_SECTION,
-            RelocationTarget::LocalFunc(LocalFunctionIndex::from_u32(0)),
+            &self.func_section,
+            dummy_reloc_target,
             |name: &str| {
                 Err(CompileError::Codegen(format!(
-                    "trampoline generation produced reference to unknown function {}",
-                    name
+                    "trampoline generation produced reference to unknown function {name}",
                 )))
             },
+            self.binary_fmt,
         )?;
         let mut all_sections_are_eh_sections = true;
-        if eh_frame_section_indices.len() != custom_sections.len() {
+        let mut unwind_section_indices = eh_frame_section_indices;
+        unwind_section_indices.append(&mut compact_unwind_section_indices);
+        if unwind_section_indices.len() != custom_sections.len() {
             all_sections_are_eh_sections = false;
         } else {
-            let mut eh_frame_section_indices = eh_frame_section_indices;
-            eh_frame_section_indices.sort_unstable();
-            for (idx, section_idx) in eh_frame_section_indices.iter().enumerate() {
+            unwind_section_indices.sort_unstable();
+            for (idx, section_idx) in unwind_section_indices.iter().enumerate() {
                 if idx as u32 != section_idx.as_u32() {
                     all_sections_are_eh_sections = false;
                     break;
@@ -175,7 +252,8 @@ impl FuncTrampoline {
         ty: &FuncType,
         config: &LLVM,
         name: &str,
-    ) -> Result<Module, CompileError> {
+        module_hash: &Option<String>,
+    ) -> Result<Module<'_>, CompileError> {
         // The function type, used for the callbacks
         let function = CompiledKind::DynamicFunctionTrampoline(ty.clone());
         let module = self.ctx.create_module("");
@@ -184,18 +262,26 @@ impl FuncTrampoline {
         let target_triple = target_machine.get_triple();
         module.set_triple(&target_triple);
         module.set_data_layout(&target_data.get_data_layout());
-        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data);
+        let intrinsics = Intrinsics::declare(
+            &module,
+            &self.ctx,
+            &target_data,
+            &self.target_triple,
+            &self.binary_fmt,
+        );
 
         let (trampoline_ty, trampoline_attrs) =
             self.abi
-                .func_type_to_llvm(&self.ctx, &intrinsics, None, ty)?;
+                .func_type_to_llvm(&self.ctx, &intrinsics, None, ty, None)?;
         let trampoline_func = module.add_function(name, trampoline_ty, Some(Linkage::External));
+        trampoline_func.set_personality_function(intrinsics.personality);
+        trampoline_func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
         for (attr, attr_loc) in trampoline_attrs {
             trampoline_func.add_attribute(attr_loc, attr);
         }
         trampoline_func
             .as_global_value()
-            .set_section(Some(FUNCTION_SECTION));
+            .set_section(Some(&self.func_section));
         trampoline_func
             .as_global_value()
             .set_linkage(Linkage::DLLExport);
@@ -205,42 +291,60 @@ impl FuncTrampoline {
         self.generate_dynamic_trampoline(trampoline_func, ty, &self.ctx, &intrinsics)?;
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.preopt_ir(&function, &module);
+            callbacks.preopt_ir(&function, module_hash, &module);
         }
 
-        let pass_manager = PassManager::create(());
+        let mut passes = vec![];
 
         if config.enable_verifier {
-            pass_manager.add_verifier_pass();
+            passes.push("verify");
         }
 
-        pass_manager.add_early_cse_pass();
-
-        pass_manager.run_on(&module);
+        passes.push("early-cse");
+        module
+            .run_passes(
+                passes.join(",").as_str(),
+                target_machine,
+                PassBuilderOptions::create(),
+            )
+            .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.postopt_ir(&function, &module);
+            callbacks.postopt_ir(&function, module_hash, &module);
         }
 
         Ok(module)
     }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn dynamic_trampoline(
         &self,
         ty: &FuncType,
         config: &LLVM,
         name: &str,
+        dynamic_trampoline_index: u32,
+        final_module_custom_sections: &mut PrimaryMap<SectionIndex, CustomSection>,
+        eh_frame_section_bytes: &mut Vec<u8>,
+        eh_frame_section_relocations: &mut Vec<Relocation>,
+        compact_unwind_section_bytes: &mut Vec<u8>,
+        compact_unwind_section_relocations: &mut Vec<Relocation>,
+        module_hash: &Option<String>,
     ) -> Result<FunctionBody, CompileError> {
         let function = CompiledKind::DynamicFunctionTrampoline(ty.clone());
         let target_machine = &self.target_machine;
 
-        let module = self.dynamic_trampoline_to_module(ty, config, name)?;
+        let module = self.dynamic_trampoline_to_module(ty, config, name, module_hash)?;
 
         let memory_buffer = target_machine
             .write_to_memory_buffer(&module, FileType::Object)
             .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.obj_memory_buffer(&function, &memory_buffer);
+            callbacks.obj_memory_buffer(&function, module_hash, &memory_buffer);
+            let asm_buffer = target_machine
+                .write_to_memory_buffer(&module, FileType::Assembly)
+                .unwrap();
+            callbacks.asm_memory_buffer(&function, module_hash, &asm_buffer)
         }
 
         let mem_buf_slice = memory_buffer.as_slice();
@@ -248,35 +352,21 @@ impl FuncTrampoline {
             compiled_function,
             custom_sections,
             eh_frame_section_indices,
+            compact_unwind_section_indices,
+            gcc_except_table_section_indices,
+            data_dw_ref_personality_section_indices,
         } = load_object_file(
             mem_buf_slice,
-            FUNCTION_SECTION,
-            RelocationTarget::LocalFunc(LocalFunctionIndex::from_u32(0)),
+            &self.func_section,
+            RelocationTarget::DynamicTrampoline(FunctionIndex::from_u32(dynamic_trampoline_index)),
             |name: &str| {
                 Err(CompileError::Codegen(format!(
-                    "trampoline generation produced reference to unknown function {}",
-                    name
+                    "trampoline generation produced reference to unknown function {name}",
                 )))
             },
+            self.binary_fmt,
         )?;
-        let mut all_sections_are_eh_sections = true;
-        if eh_frame_section_indices.len() != custom_sections.len() {
-            all_sections_are_eh_sections = false;
-        } else {
-            let mut eh_frame_section_indices = eh_frame_section_indices;
-            eh_frame_section_indices.sort_unstable();
-            for (idx, section_idx) in eh_frame_section_indices.iter().enumerate() {
-                if idx as u32 != section_idx.as_u32() {
-                    all_sections_are_eh_sections = false;
-                    break;
-                }
-            }
-        }
-        if !all_sections_are_eh_sections {
-            return Err(CompileError::Codegen(
-                "trampoline generation produced non-eh custom sections".into(),
-            ));
-        }
+
         if !compiled_function.relocations.is_empty() {
             return Err(CompileError::Codegen(
                 "trampoline generation produced relocations".into(),
@@ -284,14 +374,78 @@ impl FuncTrampoline {
         }
         // Ignore CompiledFunctionFrameInfo. Extra frame info isn't a problem.
 
+        // Also append EH-related sections to the final module, since we expect
+        // dynamic trampolines to participate in unwinding
+        {
+            let first_section = final_module_custom_sections.len() as u32;
+            for (section_index, mut custom_section) in custom_sections.into_iter() {
+                for reloc in &mut custom_section.relocations {
+                    if let RelocationTarget::CustomSection(index) = reloc.reloc_target {
+                        reloc.reloc_target = RelocationTarget::CustomSection(
+                            SectionIndex::from_u32(first_section + index.as_u32()),
+                        )
+                    }
+
+                    if reloc.kind.needs_got() {
+                        return Err(CompileError::Codegen(
+                            "trampoline generation produced GOT relocation".into(),
+                        ));
+                    }
+                }
+
+                if eh_frame_section_indices.contains(&section_index) {
+                    let offset = eh_frame_section_bytes.len() as u32;
+                    for reloc in &mut custom_section.relocations {
+                        reloc.offset += offset;
+                    }
+                    eh_frame_section_bytes.extend_from_slice(custom_section.bytes.as_slice());
+                    // Terminate the eh_frame info with a zero-length CIE.
+                    eh_frame_section_bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    eh_frame_section_relocations.extend(custom_section.relocations);
+                    // TODO: we do this to keep the count right, remove it.
+                    final_module_custom_sections.push(CustomSection {
+                        protection: CustomSectionProtection::Read,
+                        alignment: None,
+                        bytes: SectionBody::new_with_vec(vec![]),
+                        relocations: vec![],
+                    });
+                } else if compact_unwind_section_indices.contains(&section_index) {
+                    let offset = compact_unwind_section_bytes.len() as u32;
+                    for reloc in &mut custom_section.relocations {
+                        reloc.offset += offset;
+                    }
+                    compact_unwind_section_bytes.extend_from_slice(custom_section.bytes.as_slice());
+                    compact_unwind_section_relocations.extend(custom_section.relocations);
+                    // TODO: we do this to keep the count right, remove it.
+                    final_module_custom_sections.push(CustomSection {
+                        protection: CustomSectionProtection::Read,
+                        alignment: None,
+                        bytes: SectionBody::new_with_vec(vec![]),
+                        relocations: vec![],
+                    });
+                } else if gcc_except_table_section_indices.contains(&section_index)
+                    || data_dw_ref_personality_section_indices.contains(&section_index)
+                {
+                    final_module_custom_sections.push(custom_section);
+                } else {
+                    return Err(CompileError::Codegen(
+                        "trampoline generation produced non-eh custom sections".into(),
+                    ));
+                }
+            }
+        }
+
         Ok(FunctionBody {
             body: compiled_function.body.body,
             unwind_info: compiled_function.body.unwind_info,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_trampoline<'ctx>(
         &self,
+        config: &LLVM,
+        compile_info: &CompileModuleInfo,
         trampoline_func: FunctionValue,
         func_sig: &FuncType,
         llvm_func_type: FunctionType,
@@ -313,12 +467,16 @@ impl FuncTrampoline {
                 _ => {
                     return Err(CompileError::Codegen(
                         "trampoline function unimplemented".to_string(),
-                    ))
+                    ));
                 }
             };
 
         let mut args_vec: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(func_sig.params().len() + 1);
+            Vec::with_capacity(if config.enable_g0m0_opt {
+                func_sig.params().len() + 3
+            } else {
+                func_sig.params().len() + 1
+            });
 
         if self.abi.is_sret(func_sig)? {
             let basic_types: Vec<_> = func_sig
@@ -328,53 +486,169 @@ impl FuncTrampoline {
                 .collect::<Result<_, _>>()?;
 
             let sret_ty = context.struct_type(&basic_types, false);
-            args_vec.push(builder.build_alloca(sret_ty, "sret").into());
+            args_vec.push(err!(builder.build_alloca(sret_ty, "sret")).into());
         }
 
         args_vec.push(callee_vmctx_ptr.into());
 
+        if config.enable_g0m0_opt {
+            let wasm_module = &compile_info.module;
+            let memory_styles = &compile_info.memory_styles;
+            let callee_vmctx_ptr_value = callee_vmctx_ptr.into_pointer_value();
+            // get value of G0, get a pointer to M0's base
+
+            let offsets = wasmer_vm::VMOffsets::new(8, wasm_module);
+
+            let global_index = wasmer_types::GlobalIndex::from_u32(0);
+            let global_type = wasm_module.globals[global_index];
+            let global_value_type = global_type.ty;
+            let global_mutability = global_type.mutability;
+
+            let offset =
+                if let Some(local_global_index) = wasm_module.local_global_index(global_index) {
+                    offsets.vmctx_vmglobal_definition(local_global_index)
+                } else {
+                    offsets.vmctx_vmglobal_import(global_index)
+                };
+            let offset = intrinsics.i32_ty.const_int(offset.into(), false);
+            let global_ptr = {
+                let global_ptr_ptr = unsafe {
+                    err!(builder.build_gep(intrinsics.i8_ty, callee_vmctx_ptr_value, &[offset], ""))
+                };
+                let global_ptr_ptr =
+                    err!(builder.build_bit_cast(global_ptr_ptr, intrinsics.ptr_ty, ""))
+                        .into_pointer_value();
+
+                err!(builder.build_load(intrinsics.ptr_ty, global_ptr_ptr, "")).into_pointer_value()
+            };
+
+            let global_ptr = err!(builder.build_bit_cast(
+                global_ptr,
+                type_to_llvm_ptr(intrinsics, global_value_type)?,
+                "",
+            ))
+            .into_pointer_value();
+
+            let global_value = match global_mutability {
+                wasmer_types::Mutability::Const => {
+                    err!(builder.build_load(
+                        type_to_llvm(intrinsics, global_value_type)?,
+                        global_ptr,
+                        "g0",
+                    ))
+                }
+                wasmer_types::Mutability::Var => {
+                    err!(builder.build_load(
+                        type_to_llvm(intrinsics, global_value_type)?,
+                        global_ptr,
+                        ""
+                    ))
+                }
+            };
+
+            global_value.set_name("trmpl_g0");
+            args_vec.push(global_value.into());
+
+            // load mem
+            let memory_index = wasmer_types::MemoryIndex::from_u32(0);
+            let memory_definition_ptr = if let Some(local_memory_index) =
+                wasm_module.local_memory_index(memory_index)
+            {
+                let offset = offsets.vmctx_vmmemory_definition(local_memory_index);
+                let offset = intrinsics.i32_ty.const_int(offset.into(), false);
+                unsafe {
+                    err!(builder.build_gep(intrinsics.i8_ty, callee_vmctx_ptr_value, &[offset], ""))
+                }
+            } else {
+                let offset = offsets.vmctx_vmmemory_import(memory_index);
+                let offset = intrinsics.i32_ty.const_int(offset.into(), false);
+                let memory_definition_ptr_ptr = unsafe {
+                    err!(builder.build_gep(intrinsics.i8_ty, callee_vmctx_ptr_value, &[offset], ""))
+                };
+                let memory_definition_ptr_ptr =
+                    err!(builder.build_bit_cast(memory_definition_ptr_ptr, intrinsics.ptr_ty, "",))
+                        .into_pointer_value();
+
+                err!(builder.build_load(intrinsics.ptr_ty, memory_definition_ptr_ptr, ""))
+                    .into_pointer_value()
+            };
+            let memory_definition_ptr =
+                err!(builder.build_bit_cast(memory_definition_ptr, intrinsics.ptr_ty, "",))
+                    .into_pointer_value();
+            let base_ptr = err!(builder.build_struct_gep(
+                intrinsics.vmmemory_definition_ty,
+                memory_definition_ptr,
+                intrinsics.vmmemory_definition_base_element,
+                "",
+            ));
+
+            let memory_style = &memory_styles[memory_index];
+            let base_ptr = if let MemoryStyle::Dynamic { .. } = memory_style {
+                base_ptr
+            } else {
+                err!(builder.build_load(intrinsics.ptr_ty, base_ptr, "")).into_pointer_value()
+            };
+
+            base_ptr.set_name("trmpl_m0_base_ptr");
+
+            args_vec.push(base_ptr.into());
+        }
+
         for (i, param_ty) in func_sig.params().iter().enumerate() {
             let index = intrinsics.i32_ty.const_int(i as _, false);
             let item_pointer = unsafe {
-                builder.build_in_bounds_gep(intrinsics.i128_ty, args_rets_ptr, &[index], "arg_ptr")
+                err!(builder.build_in_bounds_gep(
+                    intrinsics.i128_ty,
+                    args_rets_ptr,
+                    &[index],
+                    "arg_ptr"
+                ))
             };
 
             let casted_type = type_to_llvm(intrinsics, *param_ty)?;
             let casted_pointer_type = type_to_llvm_ptr(intrinsics, *param_ty)?;
 
-            let typed_item_pointer =
-                builder.build_pointer_cast(item_pointer, casted_pointer_type, "typed_arg_pointer");
+            let typed_item_pointer = err!(builder.build_pointer_cast(
+                item_pointer,
+                casted_pointer_type,
+                "typed_arg_pointer"
+            ));
 
-            let arg = builder.build_load(casted_type, typed_item_pointer, "arg");
+            let arg = err!(builder.build_load(casted_type, typed_item_pointer, "arg"));
             args_vec.push(arg.into());
         }
 
-        let call_site =
-            builder.build_indirect_call(llvm_func_type, func_ptr, args_vec.as_slice(), "call");
+        let call_site = err!(builder.build_indirect_call(
+            llvm_func_type,
+            func_ptr,
+            args_vec.as_slice(),
+            "call"
+        ));
         for (attr, attr_loc) in func_attrs {
             call_site.add_attribute(*attr_loc, *attr);
         }
 
         let rets = self
             .abi
-            .rets_from_call(&builder, intrinsics, call_site, func_sig);
-        let mut idx = 0;
-        rets.iter().for_each(|v| {
+            .rets_from_call(&builder, intrinsics, call_site, func_sig)?;
+        for (idx, v) in rets.into_iter().enumerate() {
             let ptr = unsafe {
-                builder.build_gep(
+                err!(builder.build_gep(
                     intrinsics.i128_ty,
                     args_rets_ptr,
-                    &[intrinsics.i32_ty.const_int(idx, false)],
+                    &[intrinsics.i32_ty.const_int(idx as u64, false)],
                     "",
-                )
+                ))
             };
-            let ptr =
-                builder.build_pointer_cast(ptr, v.get_type().ptr_type(AddressSpace::default()), "");
-            builder.build_store(ptr, *v);
-            idx += 1;
-        });
+            let ptr = err!(builder.build_pointer_cast(
+                ptr,
+                self.ctx.ptr_type(AddressSpace::default()),
+                ""
+            ));
+            err!(builder.build_store(ptr, v));
+        }
 
-        builder.build_return(None);
+        err!(builder.build_return(None));
         Ok(())
     }
 
@@ -390,61 +664,65 @@ impl FuncTrampoline {
         builder.position_at_end(entry_block);
 
         // Allocate stack space for the params and results.
-        let values = builder.build_alloca(
+        let values = err!(builder.build_alloca(
             intrinsics.i128_ty.array_type(cmp::max(
                 func_sig.params().len().try_into().unwrap(),
                 func_sig.results().len().try_into().unwrap(),
             )),
             "",
-        );
+        ));
 
         // Copy params to 'values'.
         let first_user_param = if self.abi.is_sret(func_sig)? { 2 } else { 1 };
         for i in 0..func_sig.params().len() {
             let ptr = unsafe {
-                builder.build_in_bounds_gep(
+                err!(builder.build_in_bounds_gep(
                     intrinsics.i128_ty,
                     values,
                     &[intrinsics.i32_ty.const_int(i.try_into().unwrap(), false)],
                     "args",
-                )
+                ))
             };
-            let ptr = builder
-                .build_bitcast(ptr, type_to_llvm_ptr(intrinsics, func_sig.params()[i])?, "")
-                .into_pointer_value();
-            builder.build_store(
+            let ptr = err!(builder.build_bit_cast(
                 ptr,
-                trampoline_func
-                    .get_nth_param(i as u32 + first_user_param)
-                    .unwrap(),
+                type_to_llvm_ptr(intrinsics, func_sig.params()[i])?,
+                ""
+            ))
+            .into_pointer_value();
+            err!(
+                builder.build_store(
+                    ptr,
+                    trampoline_func
+                        .get_nth_param(i as u32 + first_user_param)
+                        .unwrap(),
+                )
             );
         }
 
         let callee_ptr_ty = intrinsics.void_ty.fn_type(
             &[
-                intrinsics.ctx_ptr_ty.into(),  // vmctx ptr
-                intrinsics.i128_ptr_ty.into(), // in/out values ptr
+                intrinsics.ptr_ty.into(), // vmctx ptr
+                intrinsics.ptr_ty.into(), // in/out values ptr
             ],
             false,
         );
-        let callee_ty = callee_ptr_ty.ptr_type(AddressSpace::default());
         let vmctx = self.abi.get_vmctx_ptr_param(&trampoline_func);
         let callee_ty =
-            builder.build_bitcast(vmctx, callee_ty.ptr_type(AddressSpace::default()), "");
-        let callee = builder
-            .build_load(intrinsics.ctx_ptr_ty, callee_ty.into_pointer_value(), "")
-            .into_pointer_value();
+            err!(builder.build_bit_cast(vmctx, self.ctx.ptr_type(AddressSpace::default()), ""));
+        let callee =
+            err!(builder.build_load(intrinsics.ptr_ty, callee_ty.into_pointer_value(), ""))
+                .into_pointer_value();
 
-        let values_ptr = builder.build_pointer_cast(values, intrinsics.i128_ptr_ty, "");
-        builder.build_indirect_call(
+        let values_ptr = err!(builder.build_pointer_cast(values, intrinsics.ptr_ty, ""));
+        err!(builder.build_indirect_call(
             callee_ptr_ty,
             callee,
             &[vmctx.into(), values_ptr.into()],
             "",
-        );
+        ));
 
         if func_sig.results().is_empty() {
-            builder.build_return(None);
+            err!(builder.build_return(None));
         } else {
             let results = func_sig
                 .results()
@@ -452,16 +730,19 @@ impl FuncTrampoline {
                 .enumerate()
                 .map(|(idx, ty)| {
                     let ptr = unsafe {
-                        builder.build_gep(
+                        err!(builder.build_gep(
                             intrinsics.i128_ty,
                             values,
                             &[intrinsics.i32_ty.const_int(idx.try_into().unwrap(), false)],
                             "",
-                        )
+                        ))
                     };
-                    let ptr =
-                        builder.build_pointer_cast(ptr, type_to_llvm_ptr(intrinsics, *ty)?, "");
-                    Ok(builder.build_load(type_to_llvm(intrinsics, *ty)?, ptr, ""))
+                    let ptr = err!(builder.build_pointer_cast(
+                        ptr,
+                        type_to_llvm_ptr(intrinsics, *ty)?,
+                        ""
+                    ));
+                    err_nt!(builder.build_load(type_to_llvm(intrinsics, *ty)?, ptr, ""))
                 })
                 .collect::<Result<Vec<_>, CompileError>>()?;
 
@@ -479,25 +760,26 @@ impl FuncTrampoline {
                 let mut struct_value = context.struct_type(&basic_types, false).get_undef();
 
                 for (idx, value) in results.iter().enumerate() {
-                    let value = builder.build_bitcast(
+                    let value = err!(builder.build_bit_cast(
                         *value,
                         type_to_llvm(intrinsics, func_sig.results()[idx])?,
                         "",
-                    );
-                    struct_value = builder
-                        .build_insert_value(struct_value, value, idx as u32, "")
-                        .unwrap()
-                        .into_struct_value();
+                    ));
+                    struct_value =
+                        err!(builder.build_insert_value(struct_value, value, idx as u32, ""))
+                            .into_struct_value();
                 }
-                builder.build_store(sret, struct_value);
-                builder.build_return(None);
+                err!(builder.build_store(sret, struct_value));
+                err!(builder.build_return(None));
             } else {
-                builder.build_return(Some(&self.abi.pack_values_for_register_return(
-                    intrinsics,
-                    &builder,
-                    results.as_slice(),
-                    &trampoline_func.get_type(),
-                )?));
+                err!(
+                    builder.build_return(Some(&self.abi.pack_values_for_register_return(
+                        intrinsics,
+                        &builder,
+                        results.as_slice(),
+                        &trampoline_func.get_type(),
+                    )?))
+                );
             }
         }
 

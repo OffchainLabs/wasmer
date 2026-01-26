@@ -68,9 +68,20 @@ impl InMemorySource {
     }
 
     /// Add a new [`PackageSummary`] to the [`InMemorySource`].
+    ///
+    /// Named packages are also made accessible by their hash.
     pub fn add(&mut self, summary: PackageSummary) {
         match summary.pkg.id.clone() {
             PackageId::Named(ident) => {
+                // Also add the package as a hashed package.
+                let pkg_hash = PackageHash::Sha256(wasmer_config::hash::Sha256Hash(
+                    summary.dist.webc_sha256.as_bytes(),
+                ));
+                self.hash_packages
+                    .entry(pkg_hash)
+                    .or_insert_with(|| summary.clone());
+
+                // Add the named package.
                 let summaries = self
                     .named_packages
                     .entry(ident.full_name.clone())
@@ -107,6 +118,17 @@ impl InMemorySource {
             PackageId::Hash(hash) => self.hash_packages.get(hash),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.named_packages.is_empty() && self.hash_packages.is_empty()
+    }
+
+    /// Returns the number of packages in the source.
+    pub fn len(&self) -> usize {
+        // Only need to count the hash packages,
+        // as the named packages are also always added as hashed.
+        self.hash_packages.len()
+    }
 }
 
 #[async_trait::async_trait]
@@ -135,13 +157,16 @@ impl Source for InMemorySource {
 
                         if matches.is_empty() {
                             return Err(QueryError::NoMatches {
+                                query: package.clone(),
                                 archived_versions: Vec::new(),
                             });
                         }
 
                         Ok(matches)
                     }
-                    None => Err(QueryError::NotFound),
+                    None => Err(QueryError::NotFound {
+                        query: package.clone(),
+                    }),
                 }
             }
             PackageSource::Ident(PackageIdent::Hash(hash)) => self
@@ -149,9 +174,12 @@ impl Source for InMemorySource {
                 .get(hash)
                 .map(|x| vec![x.clone()])
                 .ok_or_else(|| QueryError::NoMatches {
+                    query: package.clone(),
                     archived_versions: Vec::new(),
                 }),
-            PackageSource::Url(_) | PackageSource::Path(_) => Err(QueryError::Unsupported),
+            PackageSource::Url(_) | PackageSource::Path(_) => Err(QueryError::Unsupported {
+                query: package.clone(),
+            }),
         }
     }
 }
@@ -161,16 +189,22 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::runtime::resolver::{
-        inputs::{DistributionInfo, FileSystemMapping, PackageInfo},
         Dependency, WebcHash,
+        inputs::{DistributionInfo, FileSystemMapping, PackageInfo},
     };
 
     use super::*;
 
     const PYTHON: &[u8] = include_bytes!("../../../../c-api/examples/assets/python-0.1.0.wasmer");
-    const COREUTILS_16: &[u8] = include_bytes!("../../../../../tests/integration/cli/tests/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc");
-    const COREUTILS_11: &[u8] = include_bytes!("../../../../../tests/integration/cli/tests/webc/coreutils-1.0.11-9d7746ca-694f-11ed-b932-dead3543c068.webc");
-    const BASH: &[u8] = include_bytes!("../../../../../tests/integration/cli/tests/webc/bash-1.0.16-f097441a-a80b-4e0d-87d7-684918ef4bb6.webc");
+    const COREUTILS_16: &[u8] = include_bytes!(
+        "../../../../../tests/integration/cli/tests/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc"
+    );
+    const COREUTILS_11: &[u8] = include_bytes!(
+        "../../../../../tests/integration/cli/tests/webc/coreutils-1.0.11-9d7746ca-694f-11ed-b932-dead3543c068.webc"
+    );
+    const BASH: &[u8] = include_bytes!(
+        "../../../../../tests/integration/cli/tests/webc/bash-1.0.16-f097441a-a80b-4e0d-87d7-684918ef4bb6.webc"
+    );
 
     #[test]
     fn load_a_directory_tree() {

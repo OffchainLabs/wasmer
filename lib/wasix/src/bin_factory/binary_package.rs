@@ -1,28 +1,32 @@
 use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
-use derivative::*;
 use once_cell::sync::OnceCell;
 use sha2::Digest;
-use virtual_fs::FileSystem;
-use wasmer_config::package::{PackageHash, PackageId, PackageSource};
-use webc::{compat::SharedBytes, Container};
+use virtual_fs::UnionFileSystem;
+use wasmer_config::package::{
+    PackageHash, PackageId, PackageSource, SuggestedCompilerOptimizations,
+};
+use wasmer_package::package::Package;
+use webc::Container;
+use webc::compat::SharedBytes;
 
 use crate::{
+    Runtime,
     runners::MappedDirectory,
     runtime::resolver::{PackageInfo, ResolveError},
-    Runtime,
 };
 use wasmer_types::ModuleHash;
 
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug, Clone)]
 pub struct BinaryPackageCommand {
     name: String,
     metadata: webc::metadata::Command,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     pub(crate) atom: SharedBytes,
     hash: ModuleHash,
+    features: Option<wasmer_types::Features>,
+    pub suggested_compiler_optimizations: SuggestedCompilerOptimizations,
 }
 
 impl BinaryPackageCommand {
@@ -31,12 +35,16 @@ impl BinaryPackageCommand {
         metadata: webc::metadata::Command,
         atom: SharedBytes,
         hash: ModuleHash,
+        features: Option<wasmer_types::Features>,
+        suggested_compiler_optimizations: SuggestedCompilerOptimizations,
     ) -> Self {
         Self {
             name,
             metadata,
             atom,
             hash,
+            features,
+            suggested_compiler_optimizations,
         }
     }
 
@@ -48,22 +56,36 @@ impl BinaryPackageCommand {
         &self.metadata
     }
 
-    /// Get a reference to this [`BinaryPackageCommand`]'s atom.
-    ///
-    /// The address of the returned slice is guaranteed to be stable and live as
-    /// long as the [`BinaryPackageCommand`].
-    pub fn atom(&self) -> &[u8] {
+    /// Get a reference to this [`BinaryPackageCommand`]'s atom as a cheap
+    /// clone of the internal OwnedBuffer.
+    pub fn atom(&self) -> SharedBytes {
+        self.atom.clone()
+    }
+
+    /// Get a reference to this [`BinaryPackageCommand`]'s atom as a cheap
+    /// clone of the internal OwnedBuffer.
+    pub fn atom_ref(&self) -> &SharedBytes {
         &self.atom
     }
 
     pub fn hash(&self) -> &ModuleHash {
         &self.hash
     }
+
+    /// Get the WebAssembly features required by this command's module
+    pub fn wasm_features(&self) -> Option<wasmer_types::Features> {
+        // Return only the pre-computed features from the container manifest
+        if let Some(features) = &self.features {
+            return Some(features.clone());
+        }
+
+        // If no annotations were found, return None
+        None
+    }
 }
 
 /// A WebAssembly package that has been loaded into memory.
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(Debug, Clone)]
 pub struct BinaryPackage {
     pub id: PackageId,
     /// Includes the ids of all the packages in the tree
@@ -74,7 +96,10 @@ pub struct BinaryPackage {
     /// entrypoint.
     pub entrypoint_cmd: Option<String>,
     pub hash: OnceCell<ModuleHash>,
-    pub webc_fs: Arc<dyn FileSystem + Send + Sync>,
+    // TODO: using a UnionFileSystem here directly is suboptimal, since cloning
+    // it is expensive. Should instead store an immutable map that can easily
+    // be converted into a dashmap.
+    pub webc_fs: Option<Arc<UnionFileSystem>>,
     pub commands: Vec<BinaryPackageCommand>,
     pub uses: Vec<String>,
     pub file_system_memory_footprint: u64,
@@ -96,7 +121,7 @@ impl BinaryPackage {
         let id = PackageId::Hash(PackageHash::from_sha256_bytes(hash));
 
         let manifest_path = dir.join("wasmer.toml");
-        let webc = webc::wasmer_package::Package::from_manifest(&manifest_path)?;
+        let webc = Package::from_manifest(&manifest_path)?;
         let container = Container::from(webc);
         let manifest = container.manifest();
 
@@ -205,10 +230,10 @@ impl BinaryPackage {
 
     /// Get the bytes for the entrypoint command.
     #[deprecated(
-        note = "Use BinaryPackage::get_entrypoint_cmd instead",
+        note = "Use BinaryPackage::get_entrypoint_command instead",
         since = "0.22.0"
     )]
-    pub fn entrypoint_bytes(&self) -> Option<&[u8]> {
+    pub fn entrypoint_bytes(&self) -> Option<SharedBytes> {
         self.get_entrypoint_command().map(|entry| entry.atom())
     }
 
@@ -220,9 +245,27 @@ impl BinaryPackage {
             if let Some(cmd) = self.get_entrypoint_command() {
                 cmd.hash
             } else {
-                ModuleHash::xxhash(self.id.to_string())
+                ModuleHash::new(self.id.to_string())
             }
         })
+    }
+
+    pub fn infer_entrypoint(&self) -> Result<&str, anyhow::Error> {
+        if let Some(entrypoint) = self.entrypoint_cmd.as_deref() {
+            return Ok(entrypoint);
+        }
+
+        match self.commands.as_slice() {
+            [] => anyhow::bail!("The package doesn't contain any executable commands"),
+            [one] => Ok(one.name()),
+            [..] => {
+                let mut commands: Vec<_> = self.commands.iter().map(|cmd| cmd.name()).collect();
+                commands.sort();
+                anyhow::bail!(
+                    "Unable to determine the package's entrypoint. Please choose one of {commands:?}"
+                );
+            }
+        }
     }
 }
 
@@ -230,11 +273,12 @@ impl BinaryPackage {
 mod tests {
     use sha2::Digest;
     use tempfile::TempDir;
-    use virtual_fs::AsyncReadExt;
+    use virtual_fs::{AsyncReadExt, FileSystem as _};
+    use wasmer_package::utils::from_disk;
 
     use crate::{
-        runtime::{package_loader::BuiltinPackageLoader, task_manager::VirtualTaskManager},
         PluggableRuntime,
+        runtime::{package_loader::BuiltinPackageLoader, task_manager::VirtualTaskManager},
     };
 
     use super::*;
@@ -278,12 +322,12 @@ mod tests {
                 .with_shared_http_client(runtime.http_client().unwrap().clone()),
         );
 
-        let pkg = webc::wasmer_package::Package::from_manifest(&manifest).unwrap();
+        let pkg = Package::from_manifest(&manifest).unwrap();
         let data = pkg.serialize().unwrap();
         let webc_path = temp.path().join("package.webc");
         std::fs::write(&webc_path, data).unwrap();
 
-        let pkg = BinaryPackage::from_webc(&Container::from_disk(&webc_path).unwrap(), &runtime)
+        let pkg = BinaryPackage::from_webc(&from_disk(&webc_path).unwrap(), &runtime)
             .await
             .unwrap();
 
@@ -291,6 +335,8 @@ mod tests {
         // "/public/file.txt" on the guest.
         let mut f = pkg
             .webc_fs
+            .as_ref()
+            .expect("no webc fs")
             .new_open_options()
             .read(true)
             .open("/public/file.txt")
@@ -317,10 +363,10 @@ mod tests {
             name = "foo"
             source = "foo.wasm"
             abi = "wasi"
-            
+
             [[command]]
             name = "cmd"
-            module = "foo"     
+            module = "foo"
         "#;
         let manifest = temp.path().join("wasmer.toml");
         std::fs::write(&manifest, wasmer_toml).unwrap();
@@ -328,9 +374,7 @@ mod tests {
         let atom_path = temp.path().join("foo.wasm");
         std::fs::write(&atom_path, b"").unwrap();
 
-        let webc: Container = webc::wasmer_package::Package::from_manifest(&manifest)
-            .unwrap()
-            .into();
+        let webc: Container = Package::from_manifest(&manifest).unwrap().into();
 
         let tasks = task_manager();
         let mut runtime = PluggableRuntime::new(tasks);
@@ -345,8 +389,8 @@ mod tests {
 
         assert_eq!(pkg.commands.len(), 1);
         let command = pkg.get_command("cmd").unwrap();
-        let atom_sha256_hash: [u8; 32] = sha2::Sha256::digest(webc.get_atom("foo").unwrap()).into();
-        let module_hash = ModuleHash::sha256_from_bytes(atom_sha256_hash);
+        let atom_sha256_hash = sha2::Sha256::digest(webc.get_atom("foo").unwrap()).into();
+        let module_hash = ModuleHash::from_bytes(atom_sha256_hash);
         assert_eq!(command.hash(), &module_hash);
     }
 }

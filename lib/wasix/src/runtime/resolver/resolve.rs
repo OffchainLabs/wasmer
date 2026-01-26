@@ -11,9 +11,9 @@ use semver::Version;
 use wasmer_config::package::{PackageId, PackageSource};
 
 use crate::runtime::resolver::{
-    outputs::{Edge, Node},
     DependencyGraph, ItemLocation, PackageInfo, PackageSummary, QueryError, Resolution,
     ResolvedPackage, Source,
+    outputs::{Edge, Node},
 };
 
 use super::ResolvedFileSystemMapping;
@@ -59,7 +59,7 @@ fn registry_error_message(specifier: &PackageSource) -> String {
         }
         PackageSource::Url(url) => format!("Unable to resolve \"{url}\""),
         PackageSource::Path(path) => {
-            format!("Unable to load \"{}\" from disk", path)
+            format!("Unable to load \"{path}\" from disk")
         }
     }
 }
@@ -290,16 +290,16 @@ fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage
         let pkg = &node.pkg;
 
         // update the entrypoint, if necessary
-        if entrypoint.is_none() {
-            if let Some(entry) = &pkg.entrypoint {
-                tracing::trace!(
-                    entrypoint = entry.as_str(),
-                    parent=%id,
-                    "Inheriting the entrypoint",
-                );
+        if entrypoint.is_none()
+            && let Some(entry) = &pkg.entrypoint
+        {
+            tracing::trace!(
+                entrypoint = entry.as_str(),
+                parent=%id,
+                "Inheriting the entrypoint",
+            );
 
-                entrypoint = Some(entry.clone());
-            }
+            entrypoint = Some(entry.clone());
         }
 
         for cmd in &pkg.commands {
@@ -385,8 +385,8 @@ mod tests {
     use wasmer_config::package::NamedPackageIdent;
 
     use crate::runtime::resolver::{
-        inputs::{DistributionInfo, FileSystemMapping, PackageInfo},
         Dependency, InMemorySource, MultiSource,
+        inputs::{DistributionInfo, FileSystemMapping, PackageInfo},
     };
 
     use super::*;
@@ -421,7 +421,7 @@ mod tests {
         }
 
         fn finish(&self) -> MultiSource {
-            let mut registry = MultiSource::new();
+            let mut registry = MultiSource::default();
             registry.add_source(self.0.clone());
             registry
         }
@@ -449,7 +449,7 @@ mod tests {
         summary: PackageSummary,
     }
 
-    impl<'builder> AddPackageVersion<'builder> {
+    impl AddPackageVersion<'_> {
         fn with_dependency(&mut self, name: &str, version_constraint: &str) -> &mut Self {
             self.with_aliased_dependency(name, name, version_constraint)
         }
@@ -520,7 +520,7 @@ mod tests {
         }
     }
 
-    impl<'builder> Drop for AddPackageVersion<'builder> {
+    impl Drop for AddPackageVersion<'_> {
         fn drop(&mut self) {
             let summary = self.summary.clone();
             self.builder.add(summary);
@@ -592,7 +592,7 @@ mod tests {
         dependencies: BTreeMap<String, PackageId>,
     }
 
-    impl<'source, 'builder> DependencyGraphEntryBuilder<'source, 'builder> {
+    impl DependencyGraphEntryBuilder<'_, '_> {
         fn with_dependency(&mut self, id: &PackageId) -> &mut Self {
             let name = &id.as_named().unwrap().full_name;
             self.with_aliased_dependency(name, id)
@@ -605,7 +605,7 @@ mod tests {
         }
     }
 
-    impl<'source, 'builder> Drop for DependencyGraphEntryBuilder<'source, 'builder> {
+    impl Drop for DependencyGraphEntryBuilder<'_, '_> {
         fn drop(&mut self) {
             self.builder
                 .dependencies

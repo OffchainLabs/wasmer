@@ -8,7 +8,7 @@ use http_body_util::BodyExt;
 use hyper::body::Frame;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::Instrument;
-use virtual_mio::InlineWaker;
+use virtual_mio::block_on;
 use wasmer::Module;
 use wasmer_wasix_types::wasi::ExitCode;
 use wcgi_host::CgiDialect;
@@ -16,17 +16,17 @@ use wcgi_host::CgiDialect;
 use super::super::Body;
 
 use crate::{
+    Runtime, VirtualTaskManager, WasiEnvBuilder,
     bin_factory::run_exec,
     os::task::OwnedTaskStatus,
     runners::{
         body_from_data, body_from_stream,
         wcgi::{
-            callbacks::{CreateEnvConfig, RecycleEnvConfig},
             Callbacks,
+            callbacks::{CreateEnvConfig, RecycleEnvConfig},
         },
     },
     runtime::task_manager::{TaskWasm, TaskWasmRecycleProperties},
-    Runtime, VirtualTaskManager, WasiEnvBuilder,
 };
 use wasmer_types::ModuleHash;
 
@@ -91,7 +91,7 @@ impl Handler {
         let recycle = {
             let callbacks = callbacks.clone();
             move |props: TaskWasmRecycleProperties| {
-                InlineWaker::block_on(callbacks.recycle_env(RecycleEnvConfig {
+                block_on(callbacks.recycle_env(RecycleEnvConfig {
                     env: props.env,
                     store: props.store,
                     memory: props.memory,
@@ -126,7 +126,7 @@ impl Handler {
         // threading, etc...
         task_manager
             .task_wasm(
-                TaskWasm::new(Box::new(run_exec), env, module, false)
+                TaskWasm::new(Box::new(run_exec), env, module, false, false)
                     //.with_optional_memory(spawn_type)
                     .with_recycle(Box::new(recycle)),
             )
@@ -158,12 +158,12 @@ impl Handler {
         // will cause the stderr pipe to be read to the end
         // before transmitting the body
         if propagate_stderr {
-            if let Some(stderr) = work_consume_stderr.await {
-                if !stderr.is_empty() {
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(body_from_data(stderr))?);
-                }
+            if let Some(stderr) = work_consume_stderr.await
+                && !stderr.is_empty()
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(body_from_data(stderr))?);
             }
         } else {
             task_manager
@@ -205,7 +205,7 @@ impl Handler {
 
         let chunks = futures::stream::try_unfold(res_body_receiver, |mut r| async move {
             match r.fill_buf().await {
-                Ok(chunk) if chunk.is_empty() => Ok(None),
+                Ok([]) => Ok(None),
                 Ok(chunk) => {
                     let chunk: bytes::Bytes = chunk.to_vec().into();
                     r.consume(chunk.len());
@@ -292,7 +292,7 @@ async fn consume_stderr(
     // able to show users the partial result.
     loop {
         match stderr.fill_buf().await {
-            Ok(chunk) if chunk.is_empty() => {
+            Ok([]) => {
                 // EOF - the instance's side of the pipe was closed.
                 break;
             }
@@ -318,19 +318,16 @@ async fn consume_stderr(
 
 pub type SetupBuilder = Arc<dyn Fn(&mut WasiEnvBuilder) -> Result<(), anyhow::Error> + Send + Sync>;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug)]
 pub(crate) struct SharedState {
     pub(crate) module: Module,
     pub(crate) module_hash: ModuleHash,
     pub(crate) dialect: CgiDialect,
     pub(crate) program_name: String,
     pub(crate) propagate_stderr: bool,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     pub(crate) setup_builder: SetupBuilder,
-    #[derivative(Debug = "ignore")]
     pub(crate) callbacks: Arc<dyn Callbacks>,
-    #[derivative(Debug = "ignore")]
     pub(crate) runtime: Arc<dyn Runtime + Send + Sync>,
 }
 

@@ -48,7 +48,7 @@ impl JournalEffector {
     }
 
     pub fn apply_sock_send_to<M: MemorySize>(
-        ctx: &FunctionEnvMut<'_, WasiEnv>,
+        ctx: &mut FunctionEnvMut<'_, WasiEnv>,
         sock: Fd,
         si_data: Cow<'_, [u8]>,
         si_flags: SiFlags,
@@ -64,11 +64,7 @@ impl JournalEffector {
         )?
         .map_err(|err| {
             anyhow::format_err!(
-                "journal restore error: failed to send_to on socket (fd={}, data.len={}) - {}",
-                sock,
-                data_len,
-                err
-            )
+                "journal restore error: failed to send_to on socket (fd={sock}, data.len={data_len}) - {err}")
         })?;
         Ok(())
     }

@@ -1,8 +1,10 @@
 //! Edge app commands.
 
 pub mod create;
+pub mod database;
 pub mod delete;
 pub mod deploy;
+mod deployments;
 pub mod get;
 pub mod info;
 pub mod list;
@@ -14,6 +16,7 @@ pub mod version;
 pub mod volumes;
 
 mod util;
+pub use util::AppIdentArgOpts;
 
 use crate::commands::AsyncCliCommand;
 
@@ -36,6 +39,10 @@ pub enum CmdApp {
     Region(regions::CmdAppRegions),
     #[clap(subcommand, alias = "volumes")]
     Volume(volumes::CmdAppVolumes),
+    #[clap(subcommand, alias = "databases")]
+    Database(database::CmdAppDatabase),
+    #[clap(subcommand, alias = "deployments")]
+    Deployment(deployments::CmdAppDeployment),
 }
 
 #[async_trait::async_trait]
@@ -65,6 +72,8 @@ impl AsyncCliCommand for CmdApp {
             Self::Secret(cmd) => cmd.run_async().await,
             Self::Region(cmd) => cmd.run_async().await,
             Self::Volume(cmd) => cmd.run_async().await,
+            Self::Database(cmd) => cmd.run_async().await,
+            Self::Deployment(cmd) => cmd.run_async().await,
         }
     }
 }

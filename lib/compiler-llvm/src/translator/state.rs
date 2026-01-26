@@ -3,10 +3,14 @@ use inkwell::{
     values::{BasicValue, BasicValueEnum, PhiValue},
 };
 use smallvec::SmallVec;
-use std::ops::{BitAnd, BitOr, BitOrAssign};
+use std::{
+    collections::VecDeque,
+    ops::{BitAnd, BitOr, BitOrAssign},
+};
 use wasmer_types::CompileError;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ControlFrame<'ctx> {
     Block {
         next: BasicBlock<'ctx>,
@@ -30,6 +34,11 @@ pub enum ControlFrame<'ctx> {
         stack_size_snapshot: usize,
         if_else_state: IfElseState,
     },
+    Landingpad {
+        next: BasicBlock<'ctx>,
+        next_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        stack_size_snapshot: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -41,35 +50,36 @@ pub enum IfElseState {
 impl<'ctx> ControlFrame<'ctx> {
     pub fn code_after(&self) -> &BasicBlock<'ctx> {
         match self {
-            ControlFrame::Block { ref next, .. }
-            | ControlFrame::Loop { ref next, .. }
-            | ControlFrame::IfElse { ref next, .. } => next,
+            ControlFrame::Block { next, .. }
+            | ControlFrame::Loop { next, .. }
+            | ControlFrame::Landingpad { next, .. }
+            | ControlFrame::IfElse { next, .. } => next,
         }
     }
 
     pub fn br_dest(&self) -> &BasicBlock<'ctx> {
         match self {
-            ControlFrame::Block { ref next, .. } | ControlFrame::IfElse { ref next, .. } => next,
-            ControlFrame::Loop { ref body, .. } => body,
+            ControlFrame::Block { next, .. }
+            | ControlFrame::IfElse { next, .. }
+            | ControlFrame::Landingpad { next, .. } => next,
+            ControlFrame::Loop { body, .. } => body,
         }
     }
 
     pub fn phis(&self) -> &[PhiValue<'ctx>] {
         match self {
-            ControlFrame::Block { ref phis, .. } | ControlFrame::Loop { ref phis, .. } => {
-                phis.as_slice()
+            ControlFrame::Block { phis, .. } | ControlFrame::Loop { phis, .. } => phis.as_slice(),
+            ControlFrame::IfElse { next_phis, .. } | ControlFrame::Landingpad { next_phis, .. } => {
+                next_phis.as_slice()
             }
-            ControlFrame::IfElse { ref next_phis, .. } => next_phis.as_slice(),
         }
     }
 
     /// PHI nodes for stack values in the loop body.
     pub fn loop_body_phis(&self) -> &[PhiValue<'ctx>] {
         match self {
-            ControlFrame::Block { .. } | ControlFrame::IfElse { .. } => &[],
-            ControlFrame::Loop {
-                ref loop_body_phis, ..
-            } => loop_body_phis.as_slice(),
+            ControlFrame::Loop { loop_body_phis, .. } => loop_body_phis.as_slice(),
+            _ => &[],
         }
     }
 
@@ -140,12 +150,16 @@ impl ExtraInfo {
 
 // Union two ExtraInfos.
 impl BitOr for ExtraInfo {
-    type Output = Self;
+    type Output = Result<Self, CompileError>;
 
-    fn bitor(self, other: Self) -> Self {
-        debug_assert!(!(self.has_pending_f32_nan() && other.has_pending_f64_nan()));
-        debug_assert!(!(self.has_pending_f64_nan() && other.has_pending_f32_nan()));
-        ExtraInfo {
+    fn bitor(self, other: Self) -> Self::Output {
+        if (self.has_pending_f32_nan() && other.has_pending_f64_nan())
+            || (self.has_pending_f64_nan() && other.has_pending_f32_nan())
+        {
+            return Err(CompileError::Codegen("Can't produce bitwise or of two different states if there are two different kinds of nan canonicalizations at the same time".to_string()));
+        }
+
+        Ok(ExtraInfo {
             state: if self.is_arithmetic_f32() || other.is_arithmetic_f32() {
                 ExtraInfo::arithmetic_f32().state
             } else if self.has_pending_f32_nan() || other.has_pending_f32_nan() {
@@ -159,19 +173,19 @@ impl BitOr for ExtraInfo {
             } else {
                 0
             },
-        }
+        })
     }
 }
 impl BitOrAssign for ExtraInfo {
     fn bitor_assign(&mut self, other: Self) {
-        *self = *self | other;
+        *self = (*self | other).unwrap();
     }
 }
 
 // Intersection for ExtraInfo.
 impl BitAnd for ExtraInfo {
-    type Output = Self;
-    fn bitand(self, other: Self) -> Self {
+    type Output = Result<Self, CompileError>;
+    fn bitand(self, other: Self) -> Self::Output {
         // Pending canonicalizations are not safe to discard, or even reorder.
         debug_assert!(
             self.has_pending_f32_nan() == other.has_pending_f32_nan()
@@ -190,10 +204,10 @@ impl BitAnd for ExtraInfo {
             (false, false) => Default::default(),
             (true, false) => ExtraInfo::arithmetic_f32(),
             (false, true) => ExtraInfo::arithmetic_f64(),
-            (true, true) => ExtraInfo::arithmetic_f32() | ExtraInfo::arithmetic_f64(),
+            (true, true) => (ExtraInfo::arithmetic_f32() | ExtraInfo::arithmetic_f64())?,
         };
         match (self.has_pending_f32_nan(), self.has_pending_f64_nan()) {
-            (false, false) => info,
+            (false, false) => Ok(info),
             (true, false) => info | ExtraInfo::pending_f32_nan(),
             (false, true) => info | ExtraInfo::pending_f64_nan(),
             (true, true) => unreachable!("Can't form ExtraInfo with two pending canonicalizations"),
@@ -201,11 +215,31 @@ impl BitAnd for ExtraInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TagCatchInfo<'ctx> {
+    pub tag: u32,
+    // The catch block
+    pub catch_block: BasicBlock<'ctx>,
+    // The PHI node to receive the exnref, if needed; catch_all
+    // blocks don't need the exnref.
+    pub exnref_phi: Option<PhiValue<'ctx>>,
+}
+
+#[derive(Debug)]
+pub struct Landingpad<'ctx> {
+    // The block that has the landingpad instruction.
+    // Will be None for catch-less try_table instructions
+    // with no outer landingpads.
+    pub lpad_block: Option<BasicBlock<'ctx>>,
+    // The tags that this landingpad can catch
+    pub tags: Vec<TagCatchInfo<'ctx>>,
+}
+
 #[derive(Debug)]
 pub struct State<'ctx> {
     pub stack: Vec<(BasicValueEnum<'ctx>, ExtraInfo)>,
-    control_stack: Vec<ControlFrame<'ctx>>,
-
+    pub control_stack: Vec<ControlFrame<'ctx>>,
+    pub landingpads: VecDeque<Landingpad<'ctx>>,
     pub reachable: bool,
 }
 
@@ -215,6 +249,7 @@ impl<'ctx> State<'ctx> {
             stack: vec![],
             control_stack: vec![],
             reachable: true,
+            landingpads: VecDeque::new(),
         }
     }
 
@@ -235,13 +270,17 @@ impl<'ctx> State<'ctx> {
             | ControlFrame::IfElse {
                 stack_size_snapshot,
                 ..
+            }
+            | ControlFrame::Landingpad {
+                stack_size_snapshot,
+                ..
             } => *stack_size_snapshot,
         };
         self.stack.truncate(stack_size_snapshot);
     }
 
     pub fn outermost_frame(&self) -> Result<&ControlFrame<'ctx>, CompileError> {
-        self.control_stack.get(0).ok_or_else(|| {
+        self.control_stack.first().ok_or_else(|| {
             CompileError::Codegen("outermost_frame: invalid control stack depth".to_string())
         })
     }
@@ -392,11 +431,20 @@ impl<'ctx> State<'ctx> {
         Ok(())
     }
 
-    pub fn push_block(&mut self, next: BasicBlock<'ctx>, phis: SmallVec<[PhiValue<'ctx>; 1]>) {
+    pub fn push_block(
+        &mut self,
+        next: BasicBlock<'ctx>,
+        phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        num_inputs: usize,
+    ) {
         self.control_stack.push(ControlFrame::Block {
             next,
             phis,
-            stack_size_snapshot: self.stack.len(),
+            stack_size_snapshot: self
+                .stack
+                .len()
+                .checked_sub(num_inputs)
+                .expect("Internal codegen error: not enough inputs on stack"),
         });
     }
 
@@ -406,16 +454,22 @@ impl<'ctx> State<'ctx> {
         next: BasicBlock<'ctx>,
         loop_body_phis: SmallVec<[PhiValue<'ctx>; 1]>,
         phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        num_inputs: usize,
     ) {
         self.control_stack.push(ControlFrame::Loop {
             body,
             next,
             loop_body_phis,
             phis,
-            stack_size_snapshot: self.stack.len(),
+            stack_size_snapshot: self
+                .stack
+                .len()
+                .checked_sub(num_inputs)
+                .expect("Internal codegen error: not enough inputs on stack"),
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_if(
         &mut self,
         if_then: BasicBlock<'ctx>,
@@ -424,6 +478,7 @@ impl<'ctx> State<'ctx> {
         then_phis: SmallVec<[PhiValue<'ctx>; 1]>,
         else_phis: SmallVec<[PhiValue<'ctx>; 1]>,
         next_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        num_inputs: usize,
     ) {
         self.control_stack.push(ControlFrame::IfElse {
             if_then,
@@ -432,8 +487,53 @@ impl<'ctx> State<'ctx> {
             then_phis,
             else_phis,
             next_phis,
-            stack_size_snapshot: self.stack.len(),
             if_else_state: IfElseState::If,
+            stack_size_snapshot: self
+                .stack
+                .len()
+                .checked_sub(num_inputs)
+                .expect("Internal codegen error: not enough inputs on stack"),
         });
+    }
+
+    pub fn push_landingpad(
+        &mut self,
+        lpad_block: Option<BasicBlock<'ctx>>,
+        next: BasicBlock<'ctx>,
+        next_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        tags: &[TagCatchInfo<'ctx>],
+        num_inputs: usize,
+    ) {
+        self.control_stack.push(ControlFrame::Landingpad {
+            next,
+            next_phis,
+            stack_size_snapshot: self
+                .stack
+                .len()
+                .checked_sub(num_inputs)
+                .expect("Internal codegen error: not enough inputs on stack"),
+        });
+
+        self.landingpads.push_back(Landingpad {
+            lpad_block,
+            tags: tags.to_vec(),
+        })
+    }
+
+    // Throws and function calls need to be turned into invokes targeting this
+    // landingpad if it exists; otherwise, there is no landingpad within this
+    // frame. Note that the innermost landing pad has catch clauses for *all*
+    // the tags that are active in this frame, including the ones from outer
+    // landingpads, so there's never a reason to target any other landingpad.
+    pub(crate) fn get_innermost_landingpad(&mut self) -> Option<BasicBlock<'ctx>> {
+        self.landingpads
+            .iter()
+            .rev()
+            .filter_map(|v| v.lpad_block)
+            .next()
+    }
+
+    pub(crate) fn pop_landingpad(&mut self) -> bool {
+        self.landingpads.pop_back().is_some()
     }
 }

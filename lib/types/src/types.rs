@@ -6,7 +6,6 @@ use crate::lib::std::string::{String, ToString};
 use crate::lib::std::vec::Vec;
 use crate::units::Pages;
 
-use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -18,8 +17,9 @@ use serde::{Deserialize, Serialize};
 /// A list of all possible value types in WebAssembly.
 #[derive(Copy, Debug, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[derive(RkyvSerialize, RkyvDeserialize, Archive, rkyv::CheckBytes)]
-#[archive(as = "Self")]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u8)]
 pub enum Type {
     /// Signed 32 bit integer.
@@ -36,6 +36,8 @@ pub enum Type {
     ExternRef, /* = 128 */
     /// A reference to a Wasm function.
     FuncRef,
+    /// A reference to a Wasm exception.
+    ExceptionRef,
 }
 
 impl Type {
@@ -50,22 +52,29 @@ impl Type {
 
     /// Returns true if `Type` matches either of the reference types.
     pub fn is_ref(self) -> bool {
-        matches!(self, Self::ExternRef | Self::FuncRef)
+        matches!(self, Self::ExternRef | Self::FuncRef | Self::ExceptionRef)
     }
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
 /// The WebAssembly V128 type
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, CheckBytes)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 #[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive(as = "Self")]
+#[rkyv(derive(Debug), compare(PartialEq))]
 pub struct V128(pub(crate) [u8; 16]);
+
+#[cfg(feature = "artifact-size")]
+impl loupe::MemoryUsage for V128 {
+    fn size_of_val(&self, _tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        16 * 8
+    }
+}
 
 impl V128 {
     /// Get the bytes corresponding to the V128 value
@@ -121,6 +130,8 @@ pub enum ExternType {
     Table(TableType),
     /// This external type is the type of a WebAssembly memory.
     Memory(MemoryType),
+    /// This external type is the type of a WebAssembly tag.
+    Tag(TagType),
 }
 
 fn is_global_compatible(exported: GlobalType, imported: GlobalType) -> bool {
@@ -227,6 +238,7 @@ impl ExternType {
             (Self::Global(a), Self::Global(b)) => is_global_compatible(*a, *b),
             (Self::Table(a), Self::Table(b)) => is_table_compatible(a, b, runtime_size),
             (Self::Memory(a), Self::Memory(b)) => is_memory_compatible(a, b, runtime_size),
+            (Self::Tag(a), Self::Tag(b)) => a == b,
             // The rest of possibilities, are not compatible
             _ => false,
         }
@@ -241,8 +253,9 @@ impl ExternType {
 /// WebAssembly functions can have 0 or more parameters and results.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(CheckBytes, Debug))]
+#[rkyv(derive(Debug))]
 pub struct FunctionType {
     /// The parameters of the function
     params: Box<[Type]>,
@@ -279,16 +292,16 @@ impl fmt::Display for FunctionType {
         let params = self
             .params
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| format!("{p:?}"))
             .collect::<Vec<_>>()
             .join(", ");
         let results = self
             .results
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| format!("{p:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "[{}] -> [{}]", params, results)
+        write!(f, "[{params}] -> [{results}]")
     }
 }
 
@@ -326,10 +339,10 @@ impl From<&Self> for FunctionType {
 }
 
 /// Indicator of whether a global is mutable or not
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, CheckBytes)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive(as = "Self")]
+#[rkyv(derive(Debug), compare(PartialOrd, PartialEq))]
 #[repr(u8)]
 pub enum Mutability {
     /// The global is constant and its value does not change
@@ -347,11 +360,7 @@ impl Mutability {
 
 impl From<bool> for Mutability {
     fn from(value: bool) -> Self {
-        if value {
-            Self::Var
-        } else {
-            Self::Const
-        }
+        if value { Self::Var } else { Self::Const }
     }
 }
 
@@ -365,10 +374,10 @@ impl From<Mutability> for bool {
 }
 
 /// WebAssembly global.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, CheckBytes)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive(as = "Self")]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug), compare(PartialEq))]
 pub struct GlobalType {
     /// The type of the value stored in the global.
     pub ty: Type,
@@ -410,10 +419,10 @@ impl fmt::Display for GlobalType {
 }
 
 /// Globals are initialized via the `const` operators or by referring to another import.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[derive(RkyvSerialize, RkyvDeserialize, Archive, rkyv::CheckBytes)]
-#[archive(as = "Self")]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u8)]
 pub enum GlobalInit {
     /// An `i32.const`.
@@ -437,6 +446,67 @@ pub enum GlobalInit {
     RefFunc(FunctionIndex),
 }
 
+// Tag Types
+
+/// The kind of a tag.
+///
+/// Currently, tags can only express exceptions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug))]
+pub enum TagKind {
+    /// This tag's event is an exception.
+    Exception,
+}
+
+/// The signature of a tag that is either implemented
+/// in a Wasm module or exposed to Wasm by the host.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug))]
+pub struct TagType {
+    /// The kind of the tag.
+    pub kind: TagKind,
+    /// The parameters of the function
+    pub params: Box<[Type]>,
+}
+
+impl TagType {
+    /// Creates a new [`TagType`] with the given kind, parameter and return types.
+    pub fn new<Params>(kind: TagKind, params: Params) -> Self
+    where
+        Params: Into<Box<[Type]>>,
+    {
+        Self {
+            kind,
+            params: params.into(),
+        }
+    }
+
+    /// Parameter types.
+    pub fn params(&self) -> &[Type] {
+        &self.params
+    }
+
+    /// Create a new [`TagType`] with the given kind and the associated type.
+    pub fn from_fn_type(kind: TagKind, ty: FunctionType) -> Self {
+        Self {
+            kind,
+            params: ty.params().into(),
+        }
+    }
+}
+
+impl fmt::Display for TagType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({:?}) {:?}", self.kind, self.params(),)
+    }
+}
+
 // Table Types
 
 /// A descriptor for a table in a WebAssembly module.
@@ -446,8 +516,9 @@ pub enum GlobalInit {
 /// which `call_indirect` can invoke other functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(CheckBytes, Debug))]
+#[rkyv(derive(Debug))]
 pub struct TableType {
     /// The type of data stored in elements of the table.
     pub ty: Type,
@@ -487,8 +558,9 @@ impl fmt::Display for TableType {
 /// chunks of addressable memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(CheckBytes, Debug))]
+#[rkyv(derive(Debug))]
 pub struct MemoryType {
     /// The minimum number of pages in the memory.
     pub minimum: Pages,

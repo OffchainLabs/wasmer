@@ -12,7 +12,7 @@ use crate::syscalls::*;
 ///     Last modified time
 /// - `Fstflags fst_flags`
 ///     Bit-vector for controlling which times get set
-#[instrument(level = "debug", skip_all, fields(%fd, %st_atim, %st_mtim), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, %st_atim, %st_mtim), ret)]
 pub fn fd_filestat_set_times(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
@@ -20,6 +20,8 @@ pub fn fd_filestat_set_times(
     st_mtim: Timestamp,
     fst_flags: Fstflags,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     wasi_try_ok!(fd_filestat_set_times_internal(
         &mut ctx, fd, st_atim, st_mtim, fst_flags
     ));
@@ -30,7 +32,7 @@ pub fn fd_filestat_set_times(
         JournalEffector::save_fd_set_times(&mut ctx, fd, st_atim, st_mtim, fst_flags).map_err(
             |err| {
                 tracing::error!("failed to save file set times event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             },
         )?;
     }
@@ -49,7 +51,11 @@ pub(crate) fn fd_filestat_set_times_internal(
     let (_, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
     let fd_entry = state.fs.get_fd(fd)?;
 
-    if !fd_entry.rights.contains(Rights::FD_FILESTAT_SET_TIMES) {
+    if !fd_entry
+        .inner
+        .rights
+        .contains(Rights::FD_FILESTAT_SET_TIMES)
+    {
         return Err(Errno::Access);
     }
 

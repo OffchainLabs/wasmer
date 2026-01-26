@@ -17,35 +17,29 @@ use crate::syscalls::*;
 ///     Pointer to characters containing the path that the symlink points to
 /// - `u32 buf_used`
 ///     The number of bytes written to `buf`
-#[instrument(level = "debug", skip_all, fields(%dir_fd, path = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%dir_fd, path = field::Empty), ret)]
 pub fn path_readlink<M: MemorySize>(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     dir_fd: WasiFd,
     path: WasmPtr<u8, M>,
     path_len: M::Offset,
     buf: WasmPtr<u8, M>,
     buf_len: M::Offset,
     buf_used: WasmPtr<M::Offset, M>,
-) -> Errno {
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let base_dir = wasi_try!(state.fs.get_fd(dir_fd));
-    if !base_dir.rights.contains(Rights::PATH_READLINK) {
-        return Errno::Access;
+    let base_dir = wasi_try_ok!(state.fs.get_fd(dir_fd));
+    if !base_dir.inner.rights.contains(Rights::PATH_READLINK) {
+        return Ok(Errno::Access);
     }
-    let mut path_str = unsafe { get_input_str!(&memory, path, path_len) };
+    let mut path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_str.as_str());
 
-    // Convert relative paths into absolute paths
-    if path_str.starts_with("./") {
-        path_str = ctx.data().state.fs.relative_path_to_absolute(path_str);
-        trace!(
-            %path_str
-        );
-    }
-
-    let inode = wasi_try!(state.fs.get_inode_at_path(inodes, dir_fd, &path_str, false));
+    let inode = wasi_try_ok!(state.fs.get_inode_at_path(inodes, dir_fd, &path_str, false));
 
     {
         let guard = inode.read();
@@ -54,21 +48,22 @@ pub fn path_readlink<M: MemorySize>(
             let buf_len: u64 = buf_len.into();
             let bytes = rel_path_str.bytes();
             if bytes.len() as u64 >= buf_len {
-                return Errno::Overflow;
+                return Ok(Errno::Overflow);
             }
             let bytes: Vec<_> = bytes.collect();
 
-            let out = wasi_try_mem!(buf.slice(&memory, wasi_try!(to_offset::<M>(bytes.len()))));
-            wasi_try_mem!(out.write_slice(&bytes));
+            let out =
+                wasi_try_mem_ok!(buf.slice(&memory, wasi_try_ok!(to_offset::<M>(bytes.len()))));
+            wasi_try_mem_ok!(out.write_slice(&bytes));
             // should we null terminate this?
 
             let bytes_len: M::Offset =
-                wasi_try!(bytes.len().try_into().map_err(|_| Errno::Overflow));
-            wasi_try_mem!(buf_used.deref(&memory).write(bytes_len));
+                wasi_try_ok!(bytes.len().try_into().map_err(|_| Errno::Overflow));
+            wasi_try_mem_ok!(buf_used.deref(&memory).write(bytes_len));
         } else {
-            return Errno::Inval;
+            return Ok(Errno::Inval);
         }
     }
 
-    Errno::Success
+    Ok(Errno::Success)
 }

@@ -10,14 +10,14 @@ use crate::syscalls::*;
 /// TODO: figure out which errors this should return
 /// - `Errno::Perm`
 /// - `Errno::Notcapable`
-#[instrument(level = "debug", skip_all, fields(%fd), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd), ret)]
 pub fn fd_sync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
     let (_, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
     let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-    if !fd_entry.rights.contains(Rights::FD_SYNC) {
+    if !fd_entry.inner.rights.contains(Rights::FD_SYNC) {
         return Ok(Errno::Access);
     }
     let inode = fd_entry.inode;
@@ -63,7 +63,9 @@ pub fn fd_sync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno
             Kind::Buffer { .. }
             | Kind::Symlink { .. }
             | Kind::Socket { .. }
-            | Kind::Pipe { .. }
+            | Kind::PipeTx { .. }
+            | Kind::PipeRx { .. }
+            | Kind::DuplexPipe { .. }
             | Kind::EventNotifications { .. }
             | Kind::Epoll { .. } => return Ok(Errno::Inval),
         }

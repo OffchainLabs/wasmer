@@ -1,4 +1,4 @@
-use enum_iterator::IntoEnumIterator;
+use enum_iterator::Sequence;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -8,20 +8,11 @@ use std::fmt;
 ///
 /// This list is likely to grow over time.
 #[derive(
-    Copy,
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    IntoEnumIterator,
-    RkyvSerialize,
-    RkyvDeserialize,
-    Archive,
-    rkyv::CheckBytes,
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Sequence, RkyvSerialize, RkyvDeserialize, Archive,
 )]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive(as = "Self")]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug, Hash, PartialEq, Eq), compare(PartialEq))]
 #[repr(u16)]
 pub enum LibCall {
     /// ceil.f32
@@ -133,8 +124,28 @@ pub enum LibCall {
     /// memory.atomic.notify for local memories
     Memory32AtomicNotify,
 
-    /// memory.atomic.botify for imported memories
+    /// memory.atomic.notify for imported memories
     ImportedMemory32AtomicNotify,
+
+    /// throw
+    Throw,
+
+    /// allocate exception object and get an exnref for it
+    AllocException,
+    /// Get the values buffer pointer out of an exnref
+    ReadExnRef,
+    /// Given a caught native exception pointer, get the exnref and delete the exception itself
+    LibunwindExceptionIntoExnRef,
+
+    /// The personality function
+    EHPersonality,
+    /// The second stage of the EH personality function
+    EHPersonality2,
+
+    /// debug_usize
+    DebugUsize,
+    /// debug_str
+    DebugStr,
 }
 
 impl LibCall {
@@ -183,6 +194,14 @@ impl LibCall {
             Self::ImportedMemory32AtomicWait64 => "wasmer_vm_imported_memory32_atomic_wait64",
             Self::Memory32AtomicNotify => "wasmer_vm_memory32_atomic_notify",
             Self::ImportedMemory32AtomicNotify => "wasmer_vm_imported_memory32_atomic_notify",
+            Self::Throw => "wasmer_vm_throw",
+            Self::EHPersonality => "wasmer_eh_personality",
+            Self::EHPersonality2 => "wasmer_eh_personality2",
+            Self::AllocException => "wasmer_vm_alloc_exception",
+            Self::ReadExnRef => "wasmer_vm_read_exnref",
+            Self::LibunwindExceptionIntoExnRef => "wasmer_vm_exception_into_exnref",
+            Self::DebugUsize => "wasmer_vm_dbg_usize",
+            Self::DebugStr => "wasmer_vm_dbg_str",
         }
     }
 }

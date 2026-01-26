@@ -12,7 +12,6 @@ use crate::{
 };
 use more_asserts::assert_lt;
 use std::convert::TryFrom;
-use std::mem::size_of;
 
 /// An index type for builtin functions.
 #[derive(Copy, Clone, Debug)]
@@ -136,13 +135,50 @@ impl VMBuiltinFunctionIndex {
     pub const fn get_memory_atomic_notify_index() -> Self {
         Self(28)
     }
+
     /// Returns an index for wasm's imported `memory.atomic.notify` builtin function.
     pub const fn get_imported_memory_atomic_notify_index() -> Self {
         Self(29)
     }
+
+    /// Returns an index for wasm's imported `debug_usize` builtin function.
+    pub const fn get_imported_debug_usize_index() -> Self {
+        Self(30)
+    }
+
+    /// Returns an index for wasm's imported `debug_str` builtin function.
+    pub const fn get_imported_debug_str_index() -> Self {
+        Self(31)
+    }
+
+    /// Returns an index for wasm's imported `wasmer_eh_personality2` builtin function.
+    pub const fn get_imported_personality2_index() -> Self {
+        Self(32)
+    }
+
+    /// Returns an index for wasm's imported `alloc_exception` builtin function.
+    pub const fn get_imported_alloc_exception_index() -> Self {
+        Self(33)
+    }
+
+    /// Returns an index for wasm's imported `throw` builtin function.
+    pub const fn get_imported_throw_index() -> Self {
+        Self(34)
+    }
+
+    /// Returns an index for wasm's imported `read_exnref` builtin function.
+    pub const fn get_imported_read_exnref_index() -> Self {
+        Self(35)
+    }
+
+    /// Returns an index for wasm's imported `exception_into_exnref` builtin function.
+    pub const fn get_imported_exception_into_exnref_index() -> Self {
+        Self(36)
+    }
+
     /// Returns the total number of builtin functions.
     pub const fn builtin_functions_total_number() -> u32 {
-        30
+        37
     }
 
     /// Return the index as an u32 number.
@@ -163,7 +199,7 @@ fn cast_to_u32(sz: usize) -> u32 {
 /// Align an offset used in this module to a specific byte-width by rounding up
 #[inline]
 const fn align(offset: u32, width: u32) -> u32 {
-    (offset + (width - 1)) / width * width
+    offset.div_ceil(width) * width
 }
 
 /// This class computes offsets to fields within VMContext and other
@@ -180,6 +216,8 @@ pub struct VMOffsets {
     num_imported_tables: u32,
     /// The number of imported memories in the module.
     num_imported_memories: u32,
+    /// The number of tags in the module.
+    num_tag_ids: u32,
     /// The number of imported globals in the module.
     num_imported_globals: u32,
     /// The number of defined tables in the module.
@@ -193,6 +231,7 @@ pub struct VMOffsets {
     vmctx_imported_functions_begin: u32,
     vmctx_imported_tables_begin: u32,
     vmctx_imported_memories_begin: u32,
+    vmctx_tag_ids_begin: u32,
     vmctx_imported_globals_begin: u32,
     vmctx_tables_begin: u32,
     vmctx_memories_begin: u32,
@@ -214,6 +253,7 @@ impl VMOffsets {
             num_imported_functions: cast_to_u32(module.num_imported_functions),
             num_imported_tables: cast_to_u32(module.num_imported_tables),
             num_imported_memories: cast_to_u32(module.num_imported_memories),
+            num_tag_ids: cast_to_u32(module.tags.len()),
             num_imported_globals: cast_to_u32(module.num_imported_globals),
             num_local_tables: cast_to_u32(module.tables.len()),
             num_local_memories: cast_to_u32(module.memories.len()),
@@ -222,6 +262,7 @@ impl VMOffsets {
             vmctx_imported_functions_begin: 0,
             vmctx_imported_tables_begin: 0,
             vmctx_imported_memories_begin: 0,
+            vmctx_tag_ids_begin: 0,
             vmctx_imported_globals_begin: 0,
             vmctx_tables_begin: 0,
             vmctx_memories_begin: 0,
@@ -248,6 +289,7 @@ impl VMOffsets {
             num_imported_functions: 0,
             num_imported_tables: 0,
             num_imported_memories: 0,
+            num_tag_ids: 0,
             num_imported_globals: 0,
             num_local_tables: 0,
             num_local_memories: 0,
@@ -256,6 +298,7 @@ impl VMOffsets {
             vmctx_imported_functions_begin: 0,
             vmctx_imported_tables_begin: 0,
             vmctx_imported_memories_begin: 0,
+            vmctx_tag_ids_begin: 0,
             vmctx_imported_globals_begin: 0,
             vmctx_tables_begin: 0,
             vmctx_memories_begin: 0,
@@ -285,16 +328,17 @@ impl VMOffsets {
             base.checked_add(num_items.checked_mul(item_size).unwrap())
                 .unwrap()
         }
-        /// Offset base by num_items items of size item_size, panicking on overflow
-        /// Also, will align the value on pointer size boundary,
-        /// to avoid misalignement issue
-        fn offset_by_aligned(base: u32, num_items: u32, item_size: u32) -> u32 {
+        // Offset base by num_items items of size item_size, panicking on overflow
+        // Also, will align the value on pointer size boundary,
+        // to avoid misalignement issue
+        let pointer_size = self.pointer_size as u32;
+        let offset_by_aligned = |base: u32, num_items: u32, item_size: u32| -> u32 {
             align(
                 base.checked_add(num_items.checked_mul(item_size).unwrap())
                     .unwrap(),
-                size_of::<&u32>() as u32,
+                pointer_size,
             )
-        }
+        };
 
         self.vmctx_signature_ids_begin = 0;
         self.vmctx_imported_functions_begin = offset_by_aligned(
@@ -312,11 +356,19 @@ impl VMOffsets {
             self.num_imported_tables,
             u32::from(self.size_of_vmtable_import()),
         );
-        self.vmctx_imported_globals_begin = offset_by_aligned(
+
+        self.vmctx_tag_ids_begin = offset_by_aligned(
             self.vmctx_imported_memories_begin,
             self.num_imported_memories,
             u32::from(self.size_of_vmmemory_import()),
         );
+
+        self.vmctx_imported_globals_begin = offset_by_aligned(
+            self.vmctx_tag_ids_begin,
+            self.num_tag_ids,
+            u32::from(self.size_of_vmshared_tag_index()),
+        );
+
         self.vmctx_tables_begin = offset_by_aligned(
             self.vmctx_imported_globals_begin,
             self.num_imported_globals,
@@ -589,6 +641,14 @@ impl VMOffsets {
     }
 }
 
+/// Offsets for `VMSharedTagIndex`.
+impl VMOffsets {
+    /// Return the size of `VMSharedTagIndex`.
+    pub const fn size_of_vmshared_tag_index(&self) -> u8 {
+        4
+    }
+}
+
 /// Offsets for `VMContext`.
 impl VMOffsets {
     /// The offset of the `signature_ids` array.
@@ -616,6 +676,11 @@ impl VMOffsets {
     /// The offset of the `globals` array.
     pub fn vmctx_imported_globals_begin(&self) -> u32 {
         self.vmctx_imported_globals_begin
+    }
+
+    /// The offset of the `tags` array.
+    pub fn vmctx_tag_ids_begin(&self) -> u32 {
+        self.vmctx_tag_ids_begin
     }
 
     /// The offset of the `tables` array.
@@ -785,7 +850,7 @@ mod tests {
     #[test]
     fn alignment() {
         fn is_aligned(x: u32) -> bool {
-            x % 16 == 0
+            x.is_multiple_of(16)
         }
         assert!(is_aligned(align(0, 16)));
         assert!(is_aligned(align(32, 16)));

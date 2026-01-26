@@ -1,27 +1,27 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc};
 
 use super::super::Body;
 use anyhow::{Context, Error};
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 use http::{Request, Response};
 use tower::ServiceBuilder;
 use tower_http::{catch_panic::CatchPanicLayer, cors::CorsLayer, trace::TraceLayer};
 use wcgi_host::CgiDialect;
 use webc::metadata::{
-    annotations::{Wasi, Wcgi},
     Command,
+    annotations::{Wasi, Wcgi},
 };
 
 use crate::{
+    Runtime, WasiEnvBuilder,
     bin_factory::BinaryPackage,
     capabilities::Capabilities,
     runners::{
+        MappedDirectory,
         wasi_common::CommonWasiOptions,
         wcgi::handler::{Handler, SharedState},
-        MappedDirectory,
     },
-    runtime::task_manager::VirtualTaskManagerExt,
-    Runtime, WasiEnvBuilder,
+    runtime::{ModuleInput, task_manager::VirtualTaskManagerExt},
 };
 
 use super::Callbacks;
@@ -62,7 +62,8 @@ impl WcgiRunner {
             .annotation("wasi")?
             .unwrap_or_else(|| Wasi::new(command_name));
 
-        let module = runtime.load_module_sync(cmd.atom())?;
+        let input = ModuleInput::Command(Cow::Borrowed(cmd));
+        let module = runtime.resolve_module_sync(input, None, None)?;
 
         let Wcgi { dialect, .. } = metadata.annotation("wcgi")?.unwrap_or_default();
         let dialect = match dialect {
@@ -70,12 +71,13 @@ impl WcgiRunner {
             None => default_dialect,
         };
 
-        let container_fs = Arc::clone(&pkg.webc_fs);
+        let container_fs = pkg.webc_fs.clone();
 
         let wasi_common = self.config.wasi.clone();
         let rt = Arc::clone(&runtime);
         let setup_builder = move |builder: &mut WasiEnvBuilder| {
-            wasi_common.prepare_webc_env(builder, Some(Arc::clone(&container_fs)), &wasi, None)?;
+            let container_fs = container_fs.as_ref().map(|x| x.duplicate());
+            wasi_common.prepare_webc_env(builder, container_fs, &wasi, None)?;
             builder.set_runtime(Arc::clone(&rt));
             Ok(())
         };
@@ -101,13 +103,13 @@ impl WcgiRunner {
     ) -> Result<(), Error>
     where
         S: tower::Service<
-            Request<hyper::body::Incoming>,
-            Response = http::Response<Body>,
-            Error = anyhow::Error,
-            Future = std::pin::Pin<
-                Box<dyn futures::Future<Output = Result<Response<Body>, Error>> + Send>,
+                Request<hyper::body::Incoming>,
+                Response = http::Response<Body>,
+                Error = anyhow::Error,
+                Future = std::pin::Pin<
+                    Box<dyn futures::Future<Output = Result<Response<Body>, Error>> + Send>,
+                >,
             >,
-        >,
         S: Clone + Send + Sync + 'static,
     {
         let service = ServiceBuilder::new()
@@ -154,7 +156,7 @@ impl WcgiRunner {
                         let fut = graceful.watch(conn);
                         futs.push(async move {
                             if let Err(e) = fut.await {
-                                eprintln!("Error serving connection: {:?}", e);
+                                eprintln!("Error serving connection: {e:?}");
                             }
                         });
                     },
@@ -193,19 +195,17 @@ impl crate::runners::Runner for WcgiRunner {
             command_name,
             pkg,
             false,
-            CgiDialect::Wcgi,
+            CgiDialect::Rfc3875,
             Arc::clone(&runtime),
         )?;
         self.run_command_with_handler(handler, runtime)
     }
 }
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct Config {
     pub(crate) wasi: CommonWasiOptions,
     pub(crate) addr: SocketAddr,
-    #[derivative(Debug = "ignore")]
     pub(crate) callbacks: Arc<dyn Callbacks>,
 }
 
@@ -273,7 +273,7 @@ impl Config {
 
     /// Set callbacks that will be triggered at various points in the runner's
     /// lifecycle.
-    pub fn callbacks(&mut self, callbacks: impl Callbacks + Send + Sync + 'static) -> &mut Self {
+    pub fn callbacks(&mut self, callbacks: impl Callbacks + 'static) -> &mut Self {
         self.callbacks = Arc::new(callbacks);
         self
     }
@@ -314,7 +314,7 @@ impl Config {
 
     #[cfg(feature = "journal")]
     pub fn has_snapshot_trigger(&self, on: crate::journal::SnapshotTrigger) -> bool {
-        self.wasi.snapshot_on.iter().any(|t| *t == on)
+        self.wasi.snapshot_on.contains(&on)
     }
 
     #[cfg(feature = "journal")]
@@ -327,8 +327,22 @@ impl Config {
     }
 
     #[cfg(feature = "journal")]
-    pub fn add_journal(&mut self, journal: Arc<crate::journal::DynJournal>) -> &mut Self {
-        self.wasi.journals.push(journal);
+    pub fn with_stop_running_after_snapshot(&mut self, stop_running: bool) {
+        self.wasi.stop_running_after_snapshot = stop_running;
+    }
+
+    #[cfg(feature = "journal")]
+    pub fn add_read_only_journal(
+        &mut self,
+        journal: Arc<crate::journal::DynReadableJournal>,
+    ) -> &mut Self {
+        self.wasi.read_only_journals.push(journal);
+        self
+    }
+
+    #[cfg(feature = "journal")]
+    pub fn add_writable_journal(&mut self, journal: Arc<crate::journal::DynJournal>) -> &mut Self {
+        self.wasi.writable_journals.push(journal);
         self
     }
 }

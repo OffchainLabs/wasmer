@@ -2,7 +2,7 @@ use std::{
     fmt::{self, Display, Formatter},
     fs::File,
     io::{BufRead, BufReader, Read},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::Error;
@@ -10,10 +10,8 @@ use semver::VersionReq;
 use sha2::{Digest, Sha256};
 use url::Url;
 use wasmer_config::package::{NamedPackageId, PackageHash, PackageId, PackageSource};
-use webc::{
-    metadata::{annotations::Wapm as WapmAnnotations, Manifest, UrlOrManifest},
-    Container,
-};
+use wasmer_package::utils::from_disk;
+use webc::metadata::{Manifest, UrlOrManifest, annotations::Wapm as WapmAnnotations};
 
 /// A dependency constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +51,7 @@ impl PackageSummary {
 
     pub fn from_webc_file(path: impl AsRef<Path>) -> Result<PackageSummary, Error> {
         let path = path.as_ref().canonicalize()?;
-        let container = Container::from_disk(&path)?;
+        let container = from_disk(&path)?;
         let webc_sha256 = WebcHash::for_file(&path)?;
         let url = crate::runtime::resolver::utils::url_from_file_path(&path).ok_or_else(|| {
             anyhow::anyhow!("Unable to turn \"{}\" into a file:// URL", path.display())
@@ -290,16 +288,16 @@ impl WebcHash {
         Ok(Self(hash))
     }
 
-    pub fn for_file(path: &PathBuf) -> Result<Self, std::io::Error> {
+    pub fn for_file(path: &Path) -> Result<Self, std::io::Error> {
         // check for a hash at the file location
-        let mut path_hash = path.clone();
+        let mut path_hash = path.to_owned();
         path_hash.set_extension("webc.sha256");
         if let Ok(mut file) = File::open(&path_hash) {
             let mut hash = Vec::new();
-            if let Ok(amt) = file.read_to_end(&mut hash) {
-                if amt == 32 {
-                    return Ok(WebcHash::from_bytes(hash[0..32].try_into().unwrap()));
-                }
+            if let Ok(amt) = file.read_to_end(&mut hash)
+                && amt == 32
+            {
+                return Ok(WebcHash::from_bytes(hash[0..32].try_into().unwrap()));
             }
         }
 
@@ -352,11 +350,7 @@ impl From<[u8; 32]> for WebcHash {
 
 impl Display for WebcHash {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02X}")?;
-        }
-
-        Ok(())
+        write!(f, "{}", hex::encode_upper(self.0))
     }
 }
 

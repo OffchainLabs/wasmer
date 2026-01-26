@@ -20,7 +20,7 @@ use crate::{net::socket::SocketProperties, syscalls::*};
 /// ## Return
 ///
 /// The file descriptor of the socket that has been opened.
-#[instrument(level = "debug", skip_all, fields(?af, ?ty, ?pt, sock = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(?af, ?ty, ?pt, sock = field::Empty), ret)]
 pub fn sock_open<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     af: Addressfamily,
@@ -28,6 +28,8 @@ pub fn sock_open<M: MemorySize>(
     pt: SockProto,
     ro_sock: WasmPtr<WasiFd, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     // only certain combinations are supported
     match pt {
         SockProto::Tcp => {
@@ -49,7 +51,7 @@ pub fn sock_open<M: MemorySize>(
     if ctx.data().enable_journal {
         JournalEffector::save_sock_open(&mut ctx, af, ty, pt, fd).map_err(|err| {
             tracing::error!("failed to save sock_open event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -105,12 +107,25 @@ pub(crate) fn sock_open_internal(
     let fd = wasi_try_ok_ok!(if let Some(fd) = with_fd {
         state
             .fs
-            .with_fd(rights, rights, Fdflags::empty(), 0, inode, fd)
+            .with_fd(
+                rights,
+                rights,
+                Fdflags::empty(),
+                Fdflagsext::empty(),
+                0,
+                inode,
+                fd,
+            )
             .map(|_| fd)
     } else {
-        state
-            .fs
-            .create_fd(rights, rights, Fdflags::empty(), 0, inode)
+        state.fs.create_fd(
+            rights,
+            rights,
+            Fdflags::empty(),
+            Fdflagsext::empty(),
+            0,
+            inode,
+        )
     });
     Span::current().record("sock", fd);
 

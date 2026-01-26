@@ -3,9 +3,9 @@
 
 //! Densely numbered entity references as mapping keys.
 
+use crate::entity::EntityRef;
 use crate::entity::iter::{Iter, IterMut};
 use crate::entity::keys::Keys;
-use crate::entity::EntityRef;
 use crate::lib::std::cmp::min;
 use crate::lib::std::marker::PhantomData;
 use crate::lib::std::ops::{Index, IndexMut};
@@ -14,9 +14,9 @@ use crate::lib::std::vec::Vec;
 use rkyv::{Archive, Archived, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{
+    Deserialize, Serialize,
     de::{Deserializer, SeqAccess, Visitor},
     ser::{SerializeSeq, Serializer},
-    Deserialize, Serialize,
 };
 
 /// A mapping `K -> V` for densely indexed entity references.
@@ -28,7 +28,6 @@ use serde::{
 /// The map does not track if an entry for a key has been inserted or not. Instead it behaves as if
 /// all keys have a default entry from the beginning.
 #[derive(Debug, Clone, RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(rkyv::CheckBytes))]
 pub struct SecondaryMap<K, V>
 where
     K: EntityRef,
@@ -37,6 +36,22 @@ where
     pub(crate) elems: Vec<V>,
     pub(crate) default: V,
     pub(crate) unused: PhantomData<K>,
+}
+
+#[cfg(feature = "artifact-size")]
+impl<K, V> loupe::MemoryUsage for SecondaryMap<K, V>
+where
+    K: EntityRef,
+    V: Clone + loupe::MemoryUsage,
+{
+    fn size_of_val(&self, tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        std::mem::size_of_val(self)
+            + self
+                .elems
+                .iter()
+                .map(|value| value.size_of_val(tracker) - std::mem::size_of_val(value))
+                .sum::<usize>()
+    }
 }
 
 /// Shared `SecondaryMap` implementation for all value types.
@@ -106,12 +121,12 @@ where
     }
 
     /// Iterate over all the keys and values in this map.
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter::new(self.elems.iter())
     }
 
     /// Iterate over all the keys and values in this map, mutable edition.
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut::new(self.elems.iter_mut())
     }
 
@@ -121,12 +136,12 @@ where
     }
 
     /// Iterate over all the values in this map.
-    pub fn values(&self) -> slice::Iter<V> {
+    pub fn values(&self) -> slice::Iter<'_, V> {
         self.elems.iter()
     }
 
     /// Iterate over all the values in this map, mutable edition.
-    pub fn values_mut(&mut self) -> slice::IterMut<V> {
+    pub fn values_mut(&mut self) -> slice::IterMut<'_, V> {
         self.elems.iter_mut()
     }
 
@@ -147,12 +162,12 @@ where
     }
 
     /// Iterator over all values in the `ArchivedPrimaryMap`
-    pub fn values(&self) -> slice::Iter<Archived<V>> {
+    pub fn values(&self) -> slice::Iter<'_, Archived<V>> {
         self.elems.iter()
     }
 
     /// Iterate over all the keys and values in this map.
-    pub fn iter(&self) -> Iter<K, Archived<V>> {
+    pub fn iter(&self) -> Iter<'_, K, Archived<V>> {
         Iter::new(self.elems.iter())
     }
 }

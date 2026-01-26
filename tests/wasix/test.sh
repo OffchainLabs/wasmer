@@ -1,91 +1,42 @@
 #!/bin/bash
 
-if [[ -z "${WASI_SDK}" ]]; then
-    echo "WASI_SDK is not found"
-    exit 1
-fi
-
-if [[ -z "${WASIX_SYSROOT}" ]]; then
-    echo "WASIX_SYSROOT is not found"
-    exit 1
-fi
-
-export RANLIB="$WASI_SDK/bin/ranlib"
-export AR="$WASI_SDK/bin/ar"
-export NM="$WASI_SDK/bin/nm"
-export CC="$WASI_SDK/bin/clang"
-export CXX="$WASI_SDK/bin/clang"
-export CFLAGS="\
---sysroot=$WASIX_SYSROOT \
--matomics \
--mbulk-memory \
--mmutable-globals \
--pthread \
--mthread-model posix \
--ftls-model=local-exec \
--fno-trapping-math \
--D_WASI_EMULATED_MMAN \
--D_WASI_EMULATED_SIGNAL \
--D_WASI_EMULATED_PROCESS_CLOCKS \
--O3 \
--g \
--flto"
-export LD="$WASI_SDK/bin/wasm-ld"
-export LDFLAGS="\
--Wl,--shared-memory \
--Wl,--max-memory=4294967296 \
--Wl,--import-memory \
--Wl,--export-dynamic \
--Wl,--export=__heap_base \
--Wl,--export=__stack_pointer \
--Wl,--export=__data_end \
--Wl,--export=__wasm_init_tls \
--Wl,--export=__wasm_signal \
--Wl,--export=__tls_size \
--Wl,--export=__tls_align \
--Wl,--export=__tls_base \
--lwasi-emulated-mman \
--O3 \
--g \
--flto"
-export LIBS="\
--Wl,--shared-memory \
--Wl,--max-memory=4294967296 \
--Wl,--import-memory \
--Wl,--export-dynamic \
--Wl,--export=__heap_base \
--Wl,--export=__stack_pointer \
--Wl,--export=__data_end \
--Wl,--export=__wasm_init_tls \
--Wl,--export=__wasm_signal \
--Wl,--export=__tls_size \
--Wl,--export=__tls_align \
--Wl,--export=__tls_base \
--lwasi-emulated-mman \
--O3 \
--g \
--flto"
-
-export WASMER=$(realpath "../../target/release/wasmer")
-
-printf "\n\nStarting WASIX Test Suite:\n"
-
+export WASMER="$(realpath "../../target/release/wasmer")"
 status=0
-while read dir; do
-    dir=$(basename "$dir")
-    printf "Testing $dir..."
+run_tests() {
+    local backend="$1"
+    export WASMER_RUN="${WASMER} run -q ${backend}"
 
-    cmd="cd $dir; \
-        $CC $CFLAGS $LDFLAGS -o main.wasm main.c; \
-        wasm-opt -O4 --asyncify -g main.wasm -o main.wasm; \
-        ./run.sh"
+    printf "\n\nStarting WASIX Test Suite ($backend):\n"
+    while read dir; do
+        dir=$(basename "$dir")
+        printf "Testing $backend: $dir...\r"
 
-    if bash -c "$cmd"; then
-        printf "\rTesting $dir ✅\n"
-    else
-        printf "\rTesting $dir ❌\n"
-        status=1
-    fi
-done < <(find . -mindepth 1 -maxdepth 1 -type d | sort)
+        if [ -e "$dir/.no-build" ]; then
+            cmd="cd $dir; \
+                find . -name 'output*' | xargs rm -f; \
+                ./run.sh"
+        else
+            cmd="cd $dir; \
+                find . -name 'output*' | xargs rm -f; \
+                find . -name '*.wasm' | xargs rm -f; \
+                if [ -f main.cc ]; \
+                  then wasix++ -fwasm-exceptions main.cc -o main.wasm; \
+                  else wasixcc main.c -o main.wasm; \
+                fi; \
+                ./run.sh"
+        fi
+
+        if bash -c "$cmd"; then
+            printf "Testing $backend: $dir ✅\n"
+        else
+            printf "Testing $backend: $dir ❌\n"
+            status=1
+        fi
+    done < <(find . -mindepth 1 -maxdepth 1 -type d | sort)
+}
+
+# Call the function with the desired backend argument
+run_tests "--llvm"
+run_tests "--cranelift"
 
 exit $status

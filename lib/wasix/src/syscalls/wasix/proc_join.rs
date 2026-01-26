@@ -5,7 +5,7 @@ use wasmer::FromToNativeWasmType;
 use wasmer_wasix_types::wasi::{JoinFlags, JoinStatus, JoinStatusType, JoinStatusUnion, OptionPid};
 
 use super::*;
-use crate::{syscalls::*, WasiProcess};
+use crate::{WasiProcess, syscalls::*};
 
 #[derive(Serialize, Deserialize)]
 enum JoinStatusResult {
@@ -22,11 +22,13 @@ enum JoinStatusResult {
 /// * `pid` - Handle of the child process to wait on
 //#[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
 pub fn proc_join<M: MemorySize + 'static>(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     pid_ptr: WasmPtr<OptionPid, M>,
     flags: JoinFlags,
     status_ptr: WasmPtr<JoinStatus, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     proc_join_internal(ctx, pid_ptr, flags, status_ptr)
 }
 
@@ -36,8 +38,6 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     flags: JoinFlags,
     status_ptr: WasmPtr<JoinStatus, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
-
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
 
     // This lambda will look at what we wrote in the status variable
@@ -93,6 +93,7 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     let option_pid = match option_pid.tag {
         OptionTag::None => None,
         OptionTag::Some => Some(option_pid.pid),
+        _ => return Ok(Errno::Inval),
     };
     tracing::trace!("filter_pid = {:?}", option_pid);
 

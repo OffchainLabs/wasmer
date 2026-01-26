@@ -10,27 +10,24 @@ use crate::syscalls::*;
 ///     Array of UTF-8 bytes representing the path
 /// - `u32 path_len`
 ///     The number of bytes in the `path` array
-#[instrument(level = "debug", skip_all, fields(%fd, path = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, path = field::Empty), ret)]
 pub fn path_unlink_file<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
     path: WasmPtr<u8, M>,
     path_len: M::Offset,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
     let base_dir = wasi_try_ok!(state.fs.get_fd(fd));
-    if !base_dir.rights.contains(Rights::PATH_UNLINK_FILE) {
+    if !base_dir.inner.rights.contains(Rights::PATH_UNLINK_FILE) {
         return Ok(Errno::Access);
     }
-    let mut path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
+    let path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_str.as_str());
-
-    // Convert relative paths into absolute paths
-    if path_str.starts_with("./") {
-        path_str = ctx.data().state.fs.relative_path_to_absolute(path_str);
-    }
 
     let ret = path_unlink_file_internal(&mut ctx, fd, &path_str)?;
     let env = ctx.data();
@@ -69,9 +66,7 @@ pub(crate) fn path_unlink_file_internal(
     let removed_inode = {
         let mut guard = parent_inode.write();
         match guard.deref_mut() {
-            Kind::Dir {
-                ref mut entries, ..
-            } => {
+            Kind::Dir { entries, .. } => {
                 let removed_inode = wasi_try_ok!(entries.remove(&childs_name).ok_or(Errno::Inval));
                 // TODO: make this a debug assert in the future
                 assert!(inode.ino() == removed_inode.ino());

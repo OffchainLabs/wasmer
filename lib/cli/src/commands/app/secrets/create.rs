@@ -1,17 +1,17 @@
 use super::utils::Secret;
 use crate::{
-    commands::{app::util::AppIdentFlag, AsyncCliCommand},
+    commands::{AsyncCliCommand, app::util::AppIdentFlag},
     config::WasmerEnv,
 };
 use anyhow::Context;
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 
 /// Create a new app secret.
 #[derive(clap::Parser, Debug)]
@@ -95,14 +95,17 @@ impl CmdAppSecretsCreate {
     ) -> anyhow::Result<Vec<Secret>> {
         let names = secrets.iter().map(|s| &s.name);
         let app_secrets =
-            wasmer_api::query::get_all_app_secrets_filtered(client, app_id, names).await?;
+            wasmer_backend_api::query::get_all_app_secrets_filtered(client, app_id, names).await?;
         let mut sset = HashSet::<String>::from_iter(app_secrets.iter().map(|s| s.name.clone()));
         let mut ret = HashMap::new();
 
         for secret in secrets {
             if sset.contains(&secret.name) {
                 if self.non_interactive {
-                    anyhow::bail!("Cannot create secret '{}' as it already exists. Use the `update` command instead.", secret.name.bold());
+                    anyhow::bail!(
+                        "Cannot create secret '{}' as it already exists. Use the `update` command instead.",
+                        secret.name.bold()
+                    );
                 } else {
                     if ret.contains_key(&secret.name) {
                         eprintln!(
@@ -121,7 +124,10 @@ impl CmdAppSecretsCreate {
                         .interact()?;
 
                     if !res {
-                        eprintln!("Cannot create secret '{}' as it already exists. Use the `update` command instead.", secret.name.bold());
+                        eprintln!(
+                            "Cannot create secret '{}' as it already exists. Use the `update` command instead.",
+                            secret.name.bold()
+                        );
                     }
                 }
             }
@@ -142,7 +148,7 @@ impl CmdAppSecretsCreate {
         app_id: &str,
         secrets: Vec<Secret>,
     ) -> Result<(), anyhow::Error> {
-        let res = wasmer_api::query::upsert_app_secrets(
+        let res = wasmer_backend_api::query::upsert_app_secrets(
             client,
             app_id,
             secrets.iter().map(|s| (s.name.as_str(), s.value.as_str())),
@@ -173,7 +179,7 @@ impl CmdAppSecretsCreate {
                 };
 
                 if should_redeploy {
-                    wasmer_api::query::redeploy_app_by_id(client, app_id).await?;
+                    wasmer_backend_api::query::redeploy_app_by_id(client, app_id).await?;
                     eprintln!("{} Deployment complete", "𖥔".yellow().bold());
                 } else {
                     eprintln!(

@@ -13,21 +13,21 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-wasmer = { path = "../api", version = "=4.3.7", default-features = false }
-hex = "0.4"
-thiserror = "1"
-blake3 = "1.0"
+wasmer = { path = "../api", version = "=7.0.0-rc.1", default-features = false }
+hex.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false }
-clap = { version = "=4.4.11" }
-clap_builder = { version = "=4.4.11" }
-clap_derive = { version = "=4.4.7" }
-clap_lex = { version = "=0.6.0" }
-tempfile = "3.6.0"
-rand = "0.8.3"
-wasmer = { path = "../api", version = "=4.3.7", default-features = false, features = ["sys", "cranelift"] }
-wasmer-compiler-singlepass = { path = "../compiler-singlepass", version = "=4.3.7" }
+criterion = { workspace = true, default-features = false }
+clap = { workspace = true, default-features = true }
+clap_builder.workspace = true
+clap_derive.workspace = true
+clap_lex.workspace = true
+tempfile.workspace = true
+rand.workspace = true
+wasmer = { path = "../api", version = "=7.0.0-rc.1", default-features = false, features = ["sys", "cranelift"] }
+wasmer-compiler-singlepass = { path = "../compiler-singlepass", version = "=7.0.0-rc.1" }
 
 [features]
 default = ["filesystem"]
@@ -35,5 +35,6 @@ filesystem = []
 blake3-pure = ["blake3/pure"]
 
 [package.metadata.docs.rs]
-features = ["wasmer/sys"]
+features = ["wasmer/sys", "wasmer/compiler", "wasmer/cranelift"]
 rustc-args = ["--cfg", "docsrs"]
+cargo-args = ["--no-deps"]

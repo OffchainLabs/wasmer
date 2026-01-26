@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use derivative::*;
 use futures::future::BoxFuture;
 use virtual_fs::{AsyncWriteExt, NullFile, VirtualFile};
 use wasmer_wasix_types::wasi::{Signal, Snapshot0Clockid};
@@ -113,8 +112,7 @@ impl TtyOptions {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct Tty {
     stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
     stdout: Box<dyn VirtualFile + Send + Sync + 'static>,
@@ -186,11 +184,12 @@ impl Tty {
                     if self.is_mobile {
                         let now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000)
                             .unwrap() as u128;
-                        if let Some((what, when)) = self.last.as_ref() {
-                            if what.as_str() == data && now - *when < TTY_MOBILE_PAUSE {
-                                self.last = None;
-                                return self;
-                            }
+                        if let Some((what, when)) = self.last.as_ref()
+                            && what.as_str() == data
+                            && now - *when < TTY_MOBILE_PAUSE
+                        {
+                            self.last = None;
+                            return self;
                         }
                         self.last = Some((data.clone(), now))
                     }
@@ -444,7 +443,7 @@ impl Default for WasiTtyState {
 }
 
 /// Provides access to a TTY.
-pub trait TtyBridge {
+pub trait TtyBridge: std::fmt::Debug {
     /// Resets the values
     fn reset(&self);
 

@@ -2,24 +2,22 @@ use std::{
     future::poll_fn,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
 };
 
-use derivative::Derivative;
 use tokio::sync::broadcast;
-use virtual_net::{tcp_pair::TcpSocketHalf, LoopbackNetworking};
+use virtual_net::{LoopbackNetworking, tcp_pair::TcpSocketHalf};
 
 pub type PollListeningFn =
     Arc<dyn Fn(&mut Context<'_>) -> Poll<SocketAddr> + Send + Sync + 'static>;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug)]
 pub struct SocketManager {
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     poll_listening: PollListeningFn,
     loopback_networking: LoopbackNetworking,
     proxy_connect_init_timeout: Duration,

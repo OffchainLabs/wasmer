@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
@@ -6,9 +7,9 @@ use std::{
 };
 
 use virtual_net::{
-    host::LocalNetworking, loopback::LoopbackNetworking, IpCidr, IpRoute, NetworkError,
-    StreamSecurity, VirtualIcmpSocket, VirtualNetworking, VirtualRawSocket, VirtualTcpListener,
-    VirtualTcpSocket, VirtualUdpSocket,
+    IpCidr, IpRoute, NetworkError, StreamSecurity, VirtualIcmpSocket, VirtualNetworking,
+    VirtualRawSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
+    host::LocalNetworking, loopback::LoopbackNetworking,
 };
 
 #[derive(Debug, Default)]
@@ -26,9 +27,7 @@ pub struct LocalWithLoopbackNetworking {
 
 impl LocalWithLoopbackNetworking {
     pub fn new() -> Self {
-        lazy_static::lazy_static! {
-            static ref LOCAL_NETWORKING: Arc<LocalNetworking> = Arc::new(LocalNetworking::default());
-        }
+        static LOCAL_NETWORKING: LazyLock<Arc<LocalNetworking>> = LazyLock::new(Arc::default);
         Self {
             local_listening: Default::default(),
             inner_networking: LOCAL_NETWORKING.clone(),

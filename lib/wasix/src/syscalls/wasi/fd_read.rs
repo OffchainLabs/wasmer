@@ -32,6 +32,8 @@ pub fn fd_read<M: MemorySize>(
     iovs_len: M::Offset,
     nread: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let pid = ctx.data().pid();
     let tid = ctx.data().tid();
 
@@ -41,7 +43,7 @@ pub fn fd_read<M: MemorySize>(
         let inodes = state.inodes.clone();
 
         let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-        fd_entry.offset.load(Ordering::Acquire) as usize
+        fd_entry.inner.offset.load(Ordering::Acquire) as usize
     };
 
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
@@ -127,8 +129,6 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
     nread: WasmPtr<M::Offset, M>,
     should_update_cursor: bool,
 ) -> WasiResult<usize> {
-    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
-
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let state = env.state();
@@ -137,13 +137,13 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
     let is_stdio = fd_entry.is_stdio;
 
     let bytes_read = {
-        if !is_stdio && !fd_entry.rights.contains(Rights::FD_READ) {
+        if !is_stdio && !fd_entry.inner.rights.contains(Rights::FD_READ) {
             // TODO: figure out the error to return when lacking rights
             return Ok(Err(Errno::Access));
         }
 
         let inode = fd_entry.inode;
-        let fd_flags = fd_entry.flags;
+        let fd_flags = fd_entry.inner.flags;
 
         let (bytes_read, can_update_cursor) = {
             let mut guard = inode.write();
@@ -184,24 +184,24 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
                                         .map_err(mem_error_to_wasi)?
                                         .access()
                                         .map_err(mem_error_to_wasi)?;
-                                    let local_read =
-                                        match handle.read(buf.as_mut()).await.map_err(|err| {
-                                            let err = From::<std::io::Error>::from(err);
-                                            match err {
-                                                Errno::Again => {
-                                                    if is_stdio {
-                                                        Errno::Badf
-                                                    } else {
-                                                        Errno::Again
-                                                    }
+                                    let r = handle.read(buf.as_mut()).await.map_err(|err| {
+                                        let err = From::<std::io::Error>::from(err);
+                                        match err {
+                                            Errno::Again => {
+                                                if is_stdio {
+                                                    Errno::Badf
+                                                } else {
+                                                    Errno::Again
                                                 }
-                                                a => a,
                                             }
-                                        }) {
-                                            Ok(s) => s,
-                                            Err(_) if total_read > 0 => break,
-                                            Err(err) => return Err(err),
-                                        };
+                                            a => a,
+                                        }
+                                    });
+                                    let local_read = match r {
+                                        Ok(s) => s,
+                                        Err(_) if total_read > 0 => break,
+                                        Err(err) => return Err(err),
+                                    };
                                     total_read += local_read;
                                     if local_read != buf.len() {
                                         break;
@@ -258,6 +258,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
                                         buf.as_mut_uninit(),
                                         Some(timeout),
                                         nonblocking,
+                                        false,
                                     )
                                     .await?;
                                 total_read += local_read;
@@ -280,9 +281,63 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
                         }
                     }
                 }
-                Kind::Pipe { pipe } => {
-                    let mut pipe = pipe.clone();
+                Kind::PipeTx { .. } => return Ok(Err(Errno::Badf)),
+                Kind::PipeRx { rx } => {
+                    let mut rx = rx.clone();
+                    drop(guard);
 
+                    let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
+
+                    let res = __asyncify_light(
+                        env,
+                        if fd_flags.contains(Fdflags::NONBLOCK) {
+                            Some(Duration::ZERO)
+                        } else {
+                            None
+                        },
+                        async move {
+                            let mut total_read = 0usize;
+
+                            let iovs_arr =
+                                iovs.slice(&memory, iovs_len).map_err(mem_error_to_wasi)?;
+                            let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
+                            for iovs in iovs_arr.iter() {
+                                let mut buf = WasmPtr::<u8, M>::new(iovs.buf)
+                                    .slice(&memory, iovs.buf_len)
+                                    .map_err(mem_error_to_wasi)?
+                                    .access()
+                                    .map_err(mem_error_to_wasi)?;
+
+                                let local_read = match nonblocking {
+                                    true => match rx.try_read(buf.as_mut()) {
+                                        Some(amt) => amt,
+                                        None => {
+                                            return Err(Errno::Again);
+                                        }
+                                    },
+                                    false => {
+                                        virtual_fs::AsyncReadExt::read(&mut rx, buf.as_mut())
+                                            .await?
+                                    }
+                                };
+                                total_read += local_read;
+                                if local_read != buf.len() {
+                                    break;
+                                }
+                            }
+                            Ok(total_read)
+                        },
+                    );
+
+                    let bytes_read = wasi_try_ok_ok!(res?.map_err(|err| match err {
+                        Errno::Timedout => Errno::Again,
+                        a => a,
+                    }));
+
+                    (bytes_read, false)
+                }
+                Kind::DuplexPipe { pipe } => {
+                    let mut pipe = pipe.clone();
                     drop(guard);
 
                     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
@@ -395,7 +450,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
         if !is_stdio && should_update_cursor && can_update_cursor {
             // reborrow
             let mut fd_map = state.fs.fd_map.write().unwrap();
-            let fd_entry = wasi_try_ok_ok!(fd_map.get_mut(&fd).ok_or(Errno::Badf));
+            let fd_entry = wasi_try_ok_ok!(fd_map.get_mut(fd).ok_or(Errno::Badf));
             let old = fd_entry
                 .offset
                 .fetch_add(bytes_read as u64, Ordering::AcqRel);

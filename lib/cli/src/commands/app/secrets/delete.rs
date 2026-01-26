@@ -1,12 +1,12 @@
 use crate::{
-    commands::{app::util::AppIdentFlag, AsyncCliCommand},
+    commands::{AsyncCliCommand, app::util::AppIdentFlag},
     config::WasmerEnv,
 };
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 
 use super::utils::{self, get_secrets};
 
@@ -91,7 +91,8 @@ impl CmdAppSecretsDelete {
                 }
             }
 
-            let res = wasmer_api::query::delete_app_secret(client, secret.id.into_inner()).await?;
+            let res = wasmer_backend_api::query::delete_app_secret(client, secret.id.into_inner())
+                .await?;
 
             match res {
                 Some(res) if !res.success => {
@@ -149,7 +150,9 @@ impl AsyncCliCommand for CmdAppSecretsDelete {
             self.delete_from_file(&client, file, app_id).await
         } else if self.all {
             if self.non_interactive && !self.force {
-                anyhow::bail!("Refusing to delete all secrets in non-interactive mode without the `--force` flag.")
+                anyhow::bail!(
+                    "Refusing to delete all secrets in non-interactive mode without the `--force` flag."
+                )
             }
             let secrets = get_secrets(&client, &app_id).await?;
             for secret in secrets {

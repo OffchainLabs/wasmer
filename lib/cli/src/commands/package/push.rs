@@ -5,11 +5,11 @@ use crate::{
 };
 use anyhow::Context;
 use colored::Colorize;
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 use wasmer_config::package::{Manifest, PackageHash};
-use webc::wasmer_package::Package;
+use wasmer_package::package::Package;
 
 /// Push a package to the registry.
 ///
@@ -65,12 +65,11 @@ impl PackagePush {
             return Ok(owner.clone());
         }
 
-        if let Some(pkg) = &manifest.package {
-            if let Some(ns) = &pkg.name {
-                if let Some(first) = ns.split('/').next() {
-                    return Ok(first.to_string());
-                }
-            }
+        if let Some(pkg) = &manifest.package
+            && let Some(ns) = &pkg.name
+            && let Some(first) = ns.split('/').next()
+        {
+            return Ok(first.to_string());
         }
 
         if self.non_interactive {
@@ -78,7 +77,7 @@ impl PackagePush {
             anyhow::bail!("No package namespace specified: use --namespace XXX");
         }
 
-        let user = wasmer_api::query::current_user_with_namespaces(client, None).await?;
+        let user = wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
         let owner = crate::utils::prompts::prompt_for_namespace(
             "Choose a namespace to push the package to",
             None,
@@ -93,12 +92,11 @@ impl PackagePush {
             return Ok(Some(name.clone()));
         }
 
-        if let Some(pkg) = &manifest.package {
-            if let Some(ns) = &pkg.name {
-                if let Some(name) = ns.split('/').nth(1) {
-                    return Ok(Some(name.to_string()));
-                }
-            }
+        if let Some(pkg) = &manifest.package
+            && let Some(ns) = &pkg.name
+            && let Some(name) = ns.split('/').nth(1)
+        {
+            return Ok(Some(name.to_string()));
         }
 
         Ok(None)
@@ -112,7 +110,7 @@ impl PackagePush {
     }
 
     async fn should_push(&self, client: &WasmerClient, hash: &PackageHash) -> anyhow::Result<bool> {
-        let res = wasmer_api::query::get_package_release(client, &hash.to_string()).await;
+        let res = wasmer_backend_api::query::get_package_release(client, &hash.to_string()).await;
         tracing::info!("{:?}", res);
         res.map(|p| p.is_none())
     }
@@ -128,11 +126,19 @@ impl PackagePush {
     ) -> anyhow::Result<()> {
         let pb = make_spinner!(self.quiet, "Uploading the package..");
 
-        let signed_url = upload(client, package_hash, self.timeout, package, pb.clone()).await?;
+        let signed_url = upload(
+            client,
+            package_hash,
+            self.timeout,
+            package,
+            pb.clone(),
+            self.env.proxy()?,
+        )
+        .await?;
         spinner_ok!(pb, "Package correctly uploaded");
 
         let pb = make_spinner!(self.quiet, "Waiting for package to become available...");
-        match wasmer_api::query::push_package_release(
+        match wasmer_backend_api::query::push_package_release(
             client,
             name.as_deref(),
             namespace,
@@ -145,7 +151,9 @@ impl PackagePush {
                 if r.success {
                     r.package_webc.unwrap().id
                 } else {
-                    anyhow::bail!("An unidentified error occurred while publishing the package. (response had success: false)")
+                    anyhow::bail!(
+                        "An unidentified error occurred while publishing the package. (response had success: false)"
+                    )
                 }
             }
             None => anyhow::bail!("An unidentified error occurred while publishing the package."), // <- This is extremely bad..
@@ -176,7 +184,9 @@ impl PackagePush {
         let name = self.get_name(manifest).await?;
 
         let private = self.get_privacy(manifest);
-        tracing::info!("If published, package privacy is {private}, namespace is {namespace} and name is {name:?}");
+        tracing::info!(
+            "If published, package privacy is {private}, namespace is {namespace} and name is {name:?}"
+        );
 
         let pb = make_spinner!(
             self.quiet,

@@ -72,14 +72,13 @@ mod sys_terminal_size {
     }
 }
 
-#[allow(unused_mut)]
+#[allow(unused_mut, unused_imports)]
 #[cfg(all(unix, not(target_os = "ios")))]
 mod sys {
-    #![allow(unused_imports)]
     use {
         libc::{
-            c_int, tcsetattr, termios, ECHO, ECHOCTL, ECHOE, ECHOK, ECHONL, ICANON, ICRNL, IEXTEN,
-            IGNCR, ISIG, IXON, ONLCR, OPOST, TCSANOW,
+            ECHO, ECHOCTL, ECHOE, ECHOK, ECHONL, ICANON, ICRNL, IEXTEN, IGNCR, ISIG, IXON, ONLCR,
+            OPOST, TCSANOW, c_int, tcsetattr, termios,
         },
         std::mem,
         std::os::unix::io::AsRawFd,

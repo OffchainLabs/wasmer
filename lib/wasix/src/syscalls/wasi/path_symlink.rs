@@ -14,7 +14,7 @@ use crate::syscalls::*;
 ///     Array of UTF-8 bytes representing the target path
 /// - `u32 new_path_len`
 ///     The number of bytes to read from `new_path`
-#[instrument(level = "debug", skip_all, fields(%fd, old_path = field::Empty, new_path = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, old_path = field::Empty, new_path = field::Empty), ret)]
 pub fn path_symlink<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     old_path: WasmPtr<u8, M>,
@@ -23,14 +23,14 @@ pub fn path_symlink<M: MemorySize>(
     new_path: WasmPtr<u8, M>,
     new_path_len: M::Offset,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
-    let mut old_path_str = unsafe { get_input_str_ok!(&memory, old_path, old_path_len) };
+    let old_path_str = unsafe { get_input_str_ok!(&memory, old_path, old_path_len) };
     Span::current().record("old_path", old_path_str.as_str());
-    let mut new_path_str = unsafe { get_input_str_ok!(&memory, new_path, new_path_len) };
+    let new_path_str = unsafe { get_input_str_ok!(&memory, new_path, new_path_len) };
     Span::current().record("new_path", new_path_str.as_str());
-    old_path_str = ctx.data().state.fs.relative_path_to_absolute(old_path_str);
-    new_path_str = ctx.data().state.fs.relative_path_to_absolute(new_path_str);
 
     wasi_try_ok!(path_symlink_internal(
         &mut ctx,
@@ -45,7 +45,7 @@ pub fn path_symlink<M: MemorySize>(
         JournalEffector::save_path_symlink(&mut ctx, old_path_str, fd, new_path_str).map_err(
             |err| {
                 tracing::error!("failed to save path symbolic link event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             },
         )?;
     }
@@ -63,7 +63,7 @@ pub fn path_symlink_internal(
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
     let base_fd = state.fs.get_fd(fd)?;
-    if !base_fd.rights.contains(Rights::PATH_SYMLINK) {
+    if !base_fd.inner.rights.contains(Rights::PATH_SYMLINK) {
         return Err(Errno::Access);
     }
 
@@ -97,7 +97,9 @@ pub fn path_symlink_internal(
             }
             Kind::Root { .. } => return Err(Errno::Notcapable),
             Kind::Socket { .. }
-            | Kind::Pipe { .. }
+            | Kind::PipeRx { .. }
+            | Kind::PipeTx { .. }
+            | Kind::DuplexPipe { .. }
             | Kind::EventNotifications { .. }
             | Kind::Epoll { .. } => return Err(Errno::Inval),
             Kind::File { .. } | Kind::Symlink { .. } | Kind::Buffer { .. } => {
@@ -125,10 +127,7 @@ pub fn path_symlink_internal(
 
     {
         let mut guard = target_parent_inode.write();
-        if let Kind::Dir {
-            ref mut entries, ..
-        } = guard.deref_mut()
-        {
+        if let Kind::Dir { entries, .. } = guard.deref_mut() {
             entries.insert(entry_name, new_inode);
         }
     }

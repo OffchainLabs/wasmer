@@ -3,15 +3,16 @@ pub use env::*;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use url::Url;
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 
 pub static GLOBAL_CONFIG_FILE_NAME: &str = "wasmer.toml";
 pub static DEFAULT_PROD_REGISTRY: &str = "https://registry.wasmer.io/graphql";
 
-lazy_static::lazy_static! {
-    /// The default value for `$WASMER_DIR`.
-    pub static ref DEFAULT_WASMER_DIR: PathBuf = match WasmerConfig::get_wasmer_dir() {
+/// The default value for `$WASMER_DIR`.
+pub static DEFAULT_WASMER_DIR: LazyLock<PathBuf> =
+    LazyLock::new(|| match WasmerConfig::get_wasmer_dir() {
         Ok(path) => path,
         Err(e) => {
             if let Some(install_prefix) = option_env!("WASMER_INSTALL_PREFIX") {
@@ -20,13 +21,13 @@ lazy_static::lazy_static! {
 
             panic!("Unable to determine the wasmer dir: {e}");
         }
-    };
+    });
 
-    /// The default value for `$WASMER_DIR`.
-    pub static ref DEFAULT_WASMER_CACHE_DIR: PathBuf = DEFAULT_WASMER_DIR.join("cache");
-}
+/// The default value for `$WASMER_DIR`.
+pub static DEFAULT_WASMER_CACHE_DIR: LazyLock<PathBuf> =
+    LazyLock::new(|| DEFAULT_WASMER_DIR.join("cache"));
 
-#[derive(Deserialize, Default, Serialize, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub struct WasmerConfig {
     /// Whether or not telemetry is enabled.
     #[serde(default)]
@@ -42,6 +43,17 @@ pub struct WasmerConfig {
     /// The proxy to use when connecting to the Internet.
     #[serde(default)]
     pub proxy: Proxy,
+}
+
+impl Default for WasmerConfig {
+    fn default() -> Self {
+        Self {
+            telemetry_enabled: true,
+            update_notifications_enabled: true,
+            registry: Default::default(),
+            proxy: Default::default(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Default)]
@@ -69,6 +81,7 @@ impl Default for MultiRegistry {
     }
 }
 
+#[allow(unused)]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct Registry {
     pub url: String,
@@ -112,7 +125,9 @@ fn endpoint_from_domain_name(domain_name: &str) -> String {
 async fn test_if_registry_present(registry: &str) -> anyhow::Result<()> {
     let client = WasmerClient::new(url::Url::parse(registry)?, &DEFAULT_WASMER_CLI_USER_AGENT)?;
 
-    wasmer_api::query::current_user(&client).await.map(|_| ())
+    wasmer_backend_api::query::current_user(&client)
+        .await
+        .map(|_| ())
 }
 
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -167,8 +182,8 @@ impl MultiRegistry {
         let registry_formatted = format_graphql(registry);
         self.tokens
             .iter()
-            .filter(|login| login.registry == registry || login.registry == registry_formatted)
-            .last()
+            .rev()
+            .find(|login| login.registry == registry || login.registry == registry_formatted)
             .map(|login| login.token.clone())
     }
 

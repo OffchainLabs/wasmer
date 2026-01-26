@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{hash::Sha256Hash, package::PackageParseError};
 
 /// Hash for a package.
@@ -32,7 +34,7 @@ impl From<Sha256Hash> for PackageHash {
 impl std::fmt::Display for PackageHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Sha256(hash) => write!(f, "sha256:{}", hash),
+            Self::Sha256(hash) => write!(f, "sha256:{hash}"),
         }
     }
 }
@@ -75,12 +77,20 @@ impl<'de> serde::Deserialize<'de> for PackageHash {
 }
 
 impl schemars::JsonSchema for PackageHash {
-    fn schema_name() -> String {
-        "PackageHash".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PackageHash")
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        String::json_schema(gen)
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+
+    fn inline_schema() -> bool {
+        false
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        Self::schema_name()
     }
 }
 

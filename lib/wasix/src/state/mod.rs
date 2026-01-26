@@ -16,10 +16,11 @@
 #![allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 
 mod builder;
+pub mod context_switching;
 mod env;
 mod func_env;
 mod handles;
-mod run;
+mod linker;
 mod types;
 
 use std::{
@@ -30,25 +31,27 @@ use std::{
     time::Duration,
 };
 
-use run::*;
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 use virtual_fs::{FileOpener, FileSystem, FsError, OpenOptions, VirtualFile};
-use wasmer_wasix_types::wasi::{Errno, Fd as WasiFd, Rights, Snapshot0Clockid};
+use wasmer_wasix_types::wasi::{
+    Disposition, Errno, Fd as WasiFd, Rights, Signal, Snapshot0Clockid,
+};
 
 pub use self::{
     builder::*,
-    env::{WasiEnv, WasiEnvInit, WasiInstanceHandles},
+    env::{WasiEnv, WasiEnvInit, WasiModuleInstanceHandles, WasiModuleTreeHandles},
     func_env::WasiFunctionEnv,
     types::*,
 };
 pub use crate::fs::{InodeGuard, InodeWeakGuard};
 use crate::{
-    fs::{fs_error_into_wasi_err, WasiFs, WasiFsRoot, WasiInodes, WasiStateFileGuard},
+    fs::{WasiFs, WasiFsRoot, WasiInodes, WasiStateFileGuard, fs_error_into_wasi_err},
     syscalls::types::*,
     utils::WasiParkingLot,
 };
 pub(crate) use handles::*;
+pub(crate) use linker::*;
 
 /// all the rights enabled
 pub const ALL_RIGHTS: Rights = Rights::all();
@@ -122,8 +125,8 @@ pub(crate) struct WasiFutexState {
 /// interact.
 ///
 /// * The contents of files are not stored and may be modified by
-/// other, concurrently running programs.  Data such as the contents
-/// of directories are lazily loaded.
+///   other, concurrently running programs.  Data such as the contents
+///   of directories are lazily loaded.
 #[derive(Debug)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub(crate) struct WasiState {
@@ -133,8 +136,9 @@ pub(crate) struct WasiState {
     pub inodes: WasiInodes,
     pub futexs: Mutex<WasiFutexState>,
     pub clock_offset: Mutex<HashMap<Snapshot0Clockid, i64>>,
-    pub args: Vec<String>,
+    pub args: Mutex<Vec<String>>,
     pub envs: Mutex<Vec<Vec<u8>>>,
+    pub signals: Mutex<HashMap<Signal, Disposition>>,
 
     // TODO: should not be here, since this requires active work to resolve.
     // State should only hold active runtime state that can be reproducibly re-created.
@@ -202,7 +206,7 @@ impl WasiState {
             .map_err(fs_error_into_wasi_err)
     }
 
-    pub(crate) fn fs_new_open_options(&self) -> OpenOptions {
+    pub(crate) fn fs_new_open_options(&self) -> OpenOptions<'_> {
         self.fs.root_fs.new_open_options()
     }
 
@@ -255,8 +259,9 @@ impl WasiState {
             inodes: self.inodes.clone(),
             futexs: Default::default(),
             clock_offset: Mutex::new(self.clock_offset.lock().unwrap().clone()),
-            args: self.args.clone(),
+            args: Mutex::new(self.args.lock().unwrap().clone()),
             envs: Mutex::new(self.envs.lock().unwrap().clone()),
+            signals: Mutex::new(self.signals.lock().unwrap().clone()),
             preopen: self.preopen.clone(),
         }
     }

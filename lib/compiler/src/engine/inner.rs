@@ -1,33 +1,39 @@
 //! Universal compilation.
 
-use crate::engine::builder::EngineBuilder;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::Artifact;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::BaseTunables;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::CodeMemory;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::GlobalFrameInfoRegistration;
-#[cfg(feature = "compiler")]
-use crate::{Compiler, CompilerConfig};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{FunctionExtent, Tunables};
-#[cfg(not(target_arch = "wasm32"))]
-use shared_buffer::OwnedBuffer;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
-use wasmer_types::HashAlgorithm;
+
+use crate::engine::builder::EngineBuilder;
+#[cfg(feature = "compiler")]
+use crate::{Compiler, CompilerConfig};
+
+#[cfg(feature = "compiler")]
+use wasmer_types::Features;
+use wasmer_types::{CompilationProgressCallback, CompileError, target::Target};
+
+#[cfg(not(target_arch = "wasm32"))]
+use shared_buffer::OwnedBuffer;
+#[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+use wasmer_types::ModuleInfo;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer_types::{
-    entity::PrimaryMap, DeserializeError, FunctionBodyLike, FunctionIndex, FunctionType,
-    LocalFunctionIndex, SignatureIndex,
+    DeserializeError, FunctionIndex, FunctionType, LocalFunctionIndex, SignatureIndex,
+    entity::PrimaryMap,
 };
-use wasmer_types::{CompileError, Features, ModuleInfo, Target};
+
 #[cfg(not(target_arch = "wasm32"))]
-use wasmer_types::{CustomSectionLike, CustomSectionProtection, SectionIndex};
+use crate::{
+    Artifact, BaseTunables, CodeMemory, FunctionExtent, GlobalFrameInfoRegistration, Tunables,
+    types::{
+        function::FunctionBodyLike,
+        section::{CustomSectionLike, CustomSectionProtection, SectionIndex},
+    },
+};
+
 #[cfg(not(target_arch = "wasm32"))]
 use wasmer_vm::{
     FunctionBodyPtr, SectionBodyPtr, SignatureRegistry, VMFunctionBody, VMSharedSignatureIndex,
@@ -44,7 +50,6 @@ pub struct Engine {
     #[cfg(not(target_arch = "wasm32"))]
     tunables: Arc<dyn Tunables + Send + Sync>,
     name: String,
-    hash_algorithm: Option<HashAlgorithm>,
 }
 
 impl Engine {
@@ -73,17 +78,7 @@ impl Engine {
             #[cfg(not(target_arch = "wasm32"))]
             tunables: Arc::new(tunables),
             name,
-            hash_algorithm: None,
         }
-    }
-
-    #[cfg(not(feature = "compiler"))]
-    pub fn new(
-        compiler_config: Box<dyn CompilerConfig>,
-        target: Target,
-        features: Features,
-    ) -> Self {
-        panic!("The engine is not compiled with any compiler support")
     }
 
     /// Returns the name of this engine
@@ -91,23 +86,22 @@ impl Engine {
         self.name.as_str()
     }
 
-    /// Sets the hash algorithm
-    pub fn set_hash_algorithm(&mut self, hash_algorithm: Option<HashAlgorithm>) {
-        self.hash_algorithm = hash_algorithm;
-    }
-
-    /// Returns the hash algorithm
-    pub fn hash_algorithm(&self) -> Option<HashAlgorithm> {
-        self.hash_algorithm
-    }
-
     /// Returns the deterministic id of this engine
-    pub fn deterministic_id(&self) -> &str {
-        // TODO: add a `deterministic_id` to the Compiler, so two
-        // compilers can actually serialize into a different deterministic_id
-        // if their configuration is different (eg. LLVM with optimizations vs LLVM
-        // without optimizations)
-        self.name.as_str()
+    pub fn deterministic_id(&self) -> String {
+        #[cfg(feature = "compiler")]
+        {
+            let i = self.inner();
+            if let Some(ref c) = i.compiler {
+                return c.deterministic_id();
+            } else {
+                return self.name.clone();
+            }
+        }
+
+        #[allow(unreachable_code)]
+        {
+            self.name.to_string()
+        }
     }
 
     /// Create a headless `Engine`
@@ -143,7 +137,6 @@ impl Engine {
             #[cfg(not(target_arch = "wasm32"))]
             tunables: Arc::new(tunables),
             name: "engine-headless".to_string(),
-            hash_algorithm: None,
         }
     }
 
@@ -190,7 +183,22 @@ impl Engine {
             self,
             binary,
             self.tunables.as_ref(),
-            self.hash_algorithm,
+            None,
+        )?))
+    }
+
+    /// Compile a WebAssembly binary with a progress callback.
+    #[cfg(feature = "compiler")]
+    pub fn compile_with_progress(
+        &self,
+        binary: &[u8],
+        progress_callback: Option<CompilationProgressCallback>,
+    ) -> Result<Arc<Artifact>, CompileError> {
+        Ok(Arc::new(Artifact::new(
+            self,
+            binary,
+            self.tunables.as_ref(),
+            progress_callback,
         )?))
     }
 
@@ -209,7 +217,7 @@ impl Engine {
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Deserializes a WebAssembly module which was previously serialized with
-    /// [`Module::serialize`].
+    /// [`wasmer::Module::serialize`].
     ///
     /// # Safety
     ///
@@ -218,11 +226,11 @@ impl Engine {
         &self,
         bytes: OwnedBuffer,
     ) -> Result<Arc<Artifact>, DeserializeError> {
-        Ok(Arc::new(Artifact::deserialize_unchecked(self, bytes)?))
+        unsafe { Ok(Arc::new(Artifact::deserialize_unchecked(self, bytes)?)) }
     }
 
     /// Deserializes a WebAssembly module which was previously serialized with
-    /// [`Module::serialize`].
+    /// [`wasmer::Module::serialize`].
     ///
     /// # Safety
     ///
@@ -232,7 +240,7 @@ impl Engine {
         &self,
         bytes: OwnedBuffer,
     ) -> Result<Arc<Artifact>, DeserializeError> {
-        Ok(Arc::new(Artifact::deserialize(self, bytes)?))
+        unsafe { Ok(Arc::new(Artifact::deserialize(self, bytes)?)) }
     }
 
     /// Deserializes a WebAssembly module from a path.
@@ -244,10 +252,13 @@ impl Engine {
         &self,
         file_ref: &Path,
     ) -> Result<Arc<Artifact>, DeserializeError> {
-        let file = std::fs::File::open(file_ref)?;
-        self.deserialize(
-            OwnedBuffer::from_file(&file).map_err(|e| DeserializeError::Generic(e.to_string()))?,
-        )
+        unsafe {
+            let file = std::fs::File::open(file_ref)?;
+            self.deserialize(
+                OwnedBuffer::from_file(&file)
+                    .map_err(|e| DeserializeError::Generic(e.to_string()))?,
+            )
+        }
     }
 
     /// Deserialize from a file path.
@@ -260,10 +271,13 @@ impl Engine {
         &self,
         file_ref: &Path,
     ) -> Result<Arc<Artifact>, DeserializeError> {
-        let file = std::fs::File::open(file_ref)?;
-        self.deserialize_unchecked(
-            OwnedBuffer::from_file(&file).map_err(|e| DeserializeError::Generic(e.to_string()))?,
-        )
+        unsafe {
+            let file = std::fs::File::open(file_ref)?;
+            self.deserialize_unchecked(
+                OwnedBuffer::from_file(&file)
+                    .map_err(|e| DeserializeError::Generic(e.to_string()))?,
+            )
+        }
     }
 
     /// A unique identifier for this object.
@@ -291,15 +305,33 @@ impl Engine {
     pub fn tunables(&self) -> &dyn Tunables {
         self.tunables.as_ref()
     }
+
+    /// Add suggested optimizations to this engine.
+    ///
+    /// # Note
+    ///
+    /// Not every backend supports every optimization. This function may fail (i.e. not set the
+    /// suggested optimizations) silently if the underlying engine backend does not support one or
+    /// more optimizations.
+    pub fn with_opts(
+        &mut self,
+        _suggested_opts: &wasmer_types::target::UserCompilerOptimizations,
+    ) -> Result<(), CompileError> {
+        #[cfg(feature = "compiler")]
+        {
+            let mut i = self.inner_mut();
+            if let Some(ref mut c) = i.compiler {
+                c.with_opts(_suggested_opts)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Engine")
-            .field("target", &self.target)
-            .field("engine_id", &self.engine_id)
-            .field("name", &self.name)
-            .finish()
+        write!(f, "{}", self.deterministic_id())
     }
 }
 
@@ -319,6 +351,24 @@ pub struct EngineInner {
     /// performantly.
     #[cfg(not(target_arch = "wasm32"))]
     signatures: SignatureRegistry,
+}
+
+impl std::fmt::Debug for EngineInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut formatter = f.debug_struct("EngineInner");
+        #[cfg(feature = "compiler")]
+        {
+            formatter.field("compiler", &self.compiler);
+            formatter.field("features", &self.features);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            formatter.field("signatures", &self.signatures);
+        }
+
+        formatter.finish()
+    }
 }
 
 impl EngineInner {
@@ -351,7 +401,7 @@ impl EngineInner {
     #[allow(clippy::type_complexity)]
     pub(crate) fn allocate<'a, FunctionBody, CustomSection>(
         &'a mut self,
-        _module: &ModuleInfo,
+        _module: &wasmer_types::ModuleInfo,
         functions: impl ExactSizeIterator<Item = &'a FunctionBody> + 'a,
         function_call_trampolines: impl ExactSizeIterator<Item = &'a FunctionBody> + 'a,
         dynamic_function_trampolines: impl ExactSizeIterator<Item = &'a FunctionBody> + 'a,
@@ -378,7 +428,7 @@ impl EngineInner {
             .collect::<Vec<_>>();
         let (executable_sections, data_sections): (Vec<_>, _) = custom_sections
             .clone()
-            .partition(|section| *section.protection() == CustomSectionProtection::ReadExecute);
+            .partition(|section| section.protection() == CustomSectionProtection::ReadExecute);
         self.code_memory.push(CodeMemory::new());
 
         let (mut allocated_functions, allocated_executable_sections, allocated_data_sections) =
@@ -392,8 +442,7 @@ impl EngineInner {
                 )
                 .map_err(|message| {
                     CompileError::Resource(format!(
-                        "failed to allocate memory for functions: {}",
-                        message
+                        "failed to allocate memory for functions: {message}",
                     ))
                 })?;
 
@@ -426,7 +475,7 @@ impl EngineInner {
         let allocated_custom_sections = custom_sections
             .map(|section| {
                 SectionBodyPtr(
-                    if *section.protection() == CustomSectionProtection::ReadExecute {
+                    if section.protection() == CustomSectionProtection::ReadExecute {
                         exec_iter.next()
                     } else {
                         data_iter.next()
@@ -436,7 +485,6 @@ impl EngineInner {
                 )
             })
             .collect::<PrimaryMap<SectionIndex, _>>();
-
         Ok((
             allocated_functions_result,
             allocated_function_call_trampolines,
@@ -452,15 +500,33 @@ impl EngineInner {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     /// Register DWARF-type exception handling information associated with the code.
     pub(crate) fn publish_eh_frame(&mut self, eh_frame: Option<&[u8]>) -> Result<(), CompileError> {
         self.code_memory
             .last_mut()
             .unwrap()
             .unwind_registry_mut()
-            .publish(eh_frame)
+            .publish_eh_frame(eh_frame)
             .map_err(|e| {
-                CompileError::Resource(format!("Error while publishing the unwind code: {}", e))
+                CompileError::Resource(format!("Error while publishing the unwind code: {e}"))
+            })?;
+        Ok(())
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    /// Register macos-specific exception handling information associated with the code.
+    pub(crate) fn publish_compact_unwind(
+        &mut self,
+        compact_unwind: &[u8],
+        eh_personality_addr_in_got: Option<usize>,
+    ) -> Result<(), CompileError> {
+        self.code_memory
+            .last_mut()
+            .unwrap()
+            .unwind_registry_mut()
+            .publish_compact_unwind(compact_unwind, eh_personality_addr_in_got)
+            .map_err(|e| {
+                CompileError::Resource(format!("Error while publishing the unwind code: {e}"))
             })?;
         Ok(())
     }
@@ -478,6 +544,42 @@ impl EngineInner {
             .last_mut()
             .unwrap()
             .register_frame_info(frame_info);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+    pub(crate) fn register_perfmap(
+        &self,
+        finished_functions: &PrimaryMap<LocalFunctionIndex, FunctionExtent>,
+        module_info: &ModuleInfo,
+    ) -> Result<(), CompileError> {
+        if self
+            .compiler
+            .as_ref()
+            .is_some_and(|v| v.get_perfmap_enabled())
+        {
+            let filename = format!("/tmp/perf-{}.map", std::process::id());
+            let mut file = std::io::BufWriter::new(std::fs::File::create(filename).unwrap());
+
+            for (func_index, code) in finished_functions.iter() {
+                let func_index = module_info.func_index(func_index);
+                let name = if let Some(func_name) = module_info.function_names.get(&func_index) {
+                    func_name.clone()
+                } else {
+                    format!("{:p}", code.ptr.0)
+                };
+
+                let sanitized_name = name.replace(['\n', '\r'], "_");
+                let line = format!(
+                    "{:p} {:x} {}\n",
+                    code.ptr.0 as *const _, code.length, sanitized_name
+                );
+                write!(file, "{line}").map_err(|e| CompileError::Codegen(e.to_string()))?;
+                file.flush()
+                    .map_err(|e| CompileError::Codegen(e.to_string()))?;
+            }
+        }
+
+        Ok(())
     }
 }
 

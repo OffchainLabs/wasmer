@@ -46,7 +46,7 @@ impl JournalEffector {
     }
 
     pub fn apply_fd_write<M: MemorySize>(
-        ctx: &FunctionEnvMut<'_, WasiEnv>,
+        ctx: &mut FunctionEnvMut<'_, WasiEnv>,
         fd: Fd,
         offset: u64,
         data: Cow<'_, [u8]>,
@@ -61,11 +61,7 @@ impl JournalEffector {
         )?
         .map_err(|err| {
             anyhow::format_err!(
-                "journal restore error: failed to write to descriptor (fd={}, offset={}) - {}",
-                fd,
-                offset,
-                err
-            )
+                "journal restore error: failed to write to descriptor (fd={fd}, offset={offset}) - {err}")
         })?;
         Ok(())
     }

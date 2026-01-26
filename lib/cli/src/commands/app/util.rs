@@ -1,12 +1,12 @@
 use std::{path::Path, str::FromStr};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use colored::Colorize;
-use dialoguer::{theme::ColorfulTheme, Confirm};
-use wasmer_api::{
+use dialoguer::{Confirm, theme::ColorfulTheme};
+use wasmer_backend_api::{
+    WasmerClient,
     global_id::{GlobalId, NodeKind},
     types::DeployApp,
-    WasmerClient,
 };
 use wasmer_config::app::AppConfigV1;
 
@@ -32,33 +32,46 @@ impl AppIdent {
     /// Resolve an app identifier through the API.
     pub async fn resolve(&self, client: &WasmerClient) -> Result<DeployApp, anyhow::Error> {
         match self {
-            AppIdent::AppId(app_id) => wasmer_api::query::get_app_by_id(client, app_id.clone())
-                .await
-                .with_context(|| format!("Could not find app with id '{}'", app_id)),
+            AppIdent::AppId(app_id) => {
+                wasmer_backend_api::query::get_app_by_id(client, app_id.clone())
+                    .await
+                    .with_context(|| format!("Could not find app with id '{app_id}'"))
+            }
             AppIdent::AppVersionId(id) => {
                 let (app, _version) =
-                    wasmer_api::query::get_app_version_by_id_with_app(client, id.clone())
+                    wasmer_backend_api::query::get_app_version_by_id_with_app(client, id.clone())
                         .await
-                        .with_context(|| format!("Could not query for app version id '{}'", id))?;
+                        .with_context(|| format!("Could not query for app version id '{id}'"))?;
                 Ok(app)
             }
             AppIdent::Name(name) => {
                 // The API only allows to query by owner + name,
                 // so default to the current user as the owner.
                 // To to so the username must first be retrieved.
-                let user = wasmer_api::query::current_user(client)
+                let user = wasmer_backend_api::query::current_user(client)
                     .await?
                     .context("not logged in")?;
 
-                wasmer_api::query::get_app(client, user.username, name.clone())
+                wasmer_backend_api::query::get_app(client, user.username, name.clone())
                     .await?
                     .with_context(|| format!("Could not find app with name '{name}'"))
             }
             AppIdent::NamespacedName(owner, name) => {
-                wasmer_api::query::get_app(client, owner.clone(), name.clone())
+                wasmer_backend_api::query::get_app(client, owner.clone(), name.clone())
                     .await?
                     .with_context(|| format!("Could not find app '{owner}/{name}'"))
             }
+        }
+    }
+}
+
+impl std::fmt::Display for AppIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppIdent::AppId(id) => write!(f, "{id}"),
+            AppIdent::AppVersionId(id) => write!(f, "{id}"),
+            AppIdent::NamespacedName(namespace, name) => write!(f, "{namespace}/{name}"),
+            AppIdent::Name(name) => write!(f, "{name}"),
         }
     }
 }
@@ -121,6 +134,7 @@ pub struct AppIdentOpts {
 #[allow(clippy::large_enum_variant)]
 pub enum ResolvedAppIdent {
     Ident(AppIdent),
+    #[allow(dead_code)]
     Config {
         ident: AppIdent,
         config: AppConfigV1,
@@ -138,6 +152,34 @@ impl ResolvedAppIdent {
 }
 
 impl AppIdentOpts {
+    pub fn resolve_static_opt(&self) -> Result<Option<ResolvedAppIdent>, anyhow::Error> {
+        if let Some(id) = &self.app {
+            return Ok(Some(ResolvedAppIdent::Ident(id.clone())));
+        }
+
+        // Try to load from local.
+        let Some((config, path)) = get_app_config_from_current_dir_opt()? else {
+            return Ok(None);
+        };
+
+        let ident = if let Some(id) = &config.app_id {
+            AppIdent::AppId(id.clone())
+        } else if let Some(owner) = &config.owner {
+            AppIdent::NamespacedName(
+                owner.clone(),
+                config.name.clone().context("App name was not specified")?,
+            )
+        } else {
+            AppIdent::Name(config.name.clone().context("App name was not specified")?)
+        };
+
+        Ok(Some(ResolvedAppIdent::Config {
+            ident,
+            config,
+            path,
+        }))
+    }
+
     pub fn resolve_static(&self) -> Result<ResolvedAppIdent, anyhow::Error> {
         if let Some(id) = &self.app {
             return Ok(ResolvedAppIdent::Ident(id.clone()));
@@ -149,9 +191,12 @@ impl AppIdentOpts {
         let ident = if let Some(id) = &config.app_id {
             AppIdent::AppId(id.clone())
         } else if let Some(owner) = &config.owner {
-            AppIdent::NamespacedName(owner.clone(), config.name.clone())
+            AppIdent::NamespacedName(
+                owner.clone(),
+                config.name.clone().context("App name was not specified")?,
+            )
         } else {
-            AppIdent::Name(config.name.clone())
+            AppIdent::Name(config.name.clone().context("App name was not specified")?)
         };
 
         Ok(ResolvedAppIdent::Config {
@@ -170,6 +215,48 @@ impl AppIdentOpts {
         let app = id.ident().resolve(client).await?;
 
         Ok((id, app))
+    }
+
+    pub async fn load_app_opt(
+        &self,
+        client: &WasmerClient,
+    ) -> Result<Option<(ResolvedAppIdent, DeployApp)>, anyhow::Error> {
+        let id = match self.resolve_static_opt()? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let app = id.ident().resolve(client).await?;
+
+        Ok(Some((id, app)))
+    }
+}
+
+/// Options for identifying an app.
+///
+/// Same as [`AppIdentOpts`], but with the app being a --app flag instead of
+/// a positional argument.
+#[derive(clap::Parser, Debug, Clone)]
+pub struct AppIdentArgOpts {
+    /// Identifier of the application.
+    ///
+    /// NOTE: If not specified, the command will look for an app config file in
+    /// the current directory.
+    ///
+    /// Valid input:
+    /// - namespace/app-name
+    /// - app-alias
+    /// - App ID
+    #[clap(long, short)]
+    pub app: Option<AppIdent>,
+}
+
+impl AppIdentArgOpts {
+    /// Convert to `AppIdentOpts`.
+    /// Useful for accessing the methods on that type.
+    pub fn to_opts(&self) -> AppIdentOpts {
+        AppIdentOpts {
+            app: self.app.clone(),
+        }
     }
 }
 
@@ -253,7 +340,9 @@ pub(super) async fn login_user(
                 Some(n) => n,
                 None => String::from("wasmer"),
             };
-            eprintln!("You are not logged in. Use the `--token` flag or log in (use `{bin_name} login`) to {msg}.");
+            eprintln!(
+                "You are not logged in. Use the `--token` flag or log in (use `{bin_name} login`) to {msg}."
+            );
 
             anyhow::bail!("Stopping execution as the user is not logged in.")
         }
@@ -262,16 +351,13 @@ pub(super) async fn login_user(
     env.client()
 }
 
-pub fn get_app_config_from_dir(
+pub fn get_app_config_from_dir_opt(
     path: &Path,
-) -> Result<(AppConfigV1, std::path::PathBuf), anyhow::Error> {
+) -> Result<Option<(AppConfigV1, std::path::PathBuf)>, anyhow::Error> {
     let app_config_path = path.join(AppConfigV1::CANONICAL_FILE_NAME);
 
     if !app_config_path.exists() || !app_config_path.is_file() {
-        bail!(
-            "Could not find app.yaml at path: '{}'.\nPlease specify an app like 'wasmer app get <namespace>/<name>' or 'wasmer app get <name>`'",
-            app_config_path.display()
-        );
+        return Ok(None);
     }
     // read the app.yaml
     let raw_app_config = std::fs::read_to_string(&app_config_path)
@@ -281,7 +367,25 @@ pub fn get_app_config_from_dir(
     let config = AppConfigV1::parse_yaml(&raw_app_config)
         .map_err(|err| anyhow::anyhow!("Could not parse app.yaml: {err:?}"))?;
 
-    Ok((config, app_config_path))
+    Ok(Some((config, app_config_path)))
+}
+
+pub fn get_app_config_from_current_dir_opt()
+-> Result<Option<(AppConfigV1, std::path::PathBuf)>, anyhow::Error> {
+    let current_dir = std::env::current_dir()?;
+    get_app_config_from_dir_opt(&current_dir)
+}
+
+pub fn get_app_config_from_dir(
+    path: &Path,
+) -> Result<(AppConfigV1, std::path::PathBuf), anyhow::Error> {
+    get_app_config_from_dir_opt(path)?
+        .with_context(|| {
+            format!(
+                "Could not find app.yaml in directory: '{}'.\nPlease specify an app like 'wasmer app get <namespace>/<name>' or 'wasmer app get <name>`'",
+                path.display()
+            )
+        })
 }
 
 pub fn get_app_config_from_current_dir() -> Result<(AppConfigV1, std::path::PathBuf), anyhow::Error>

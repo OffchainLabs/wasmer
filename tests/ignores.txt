@@ -1,5 +1,10 @@
 # Compilers
 singlepass spec::simd # Singlepass doesn't support yet SIMD (no one asked for this feature)
+singlepass wasmer::simd_generated_ext_ops
+singlepass spec::exception_handling # Singlepass doesn't support EH yet (no one asked for this feature)
+singlepass wasmer::exception_handling
+windows spec::exception_handling # No EH support on Windows yet
+macos+cranelift spec::exception_handling
 
 # Traps
 ## Traps. Tracing doesn't work properly in Singlepass
@@ -9,10 +14,12 @@ singlepass+aarch64+macos traps::test_trap_trace
 cranelift+aarch64+macos    traps::test_trap_trace
 llvm+aarch64    traps::test_trap_trace
 llvm+riscv64    traps::test_trap_trace
+llvm+loongarch64    traps::test_trap_trace
 singlepass+aarch64+macos traps::test_trap_stack_overflow # Need to investigate
 singlepass+aarch64+macos traps::trap_display_pretty
 llvm       traps::trap_display_pretty
 windows    trap_display_pretty
+windows    traps::test_trap_trace
 cranelift+aarch64+macos    traps::trap_display_pretty
 singlepass+aarch64+macos traps::trap_display_multi_module
 llvm       traps::trap_display_multi_module
@@ -29,6 +36,9 @@ cranelift+aarch64+macos    traps::start_trap_pretty
 # https://github.com/wasmerio/wasmer/issues/2808
 llvm+aarch64      spec::skip_stack_guard_page
 llvm+riscv64      spec::skip_stack_guard_page
+llvm+loongarch64  spec::skip_stack_guard_page
+# Codegen("trampoline generation produced relocations")
+llvm+windows      issues::huge_number_of_arguments_fn
 
 # riscv support is still early, function call ABI needs some work
 llvm+riscv64      static_function::llvm::universal
@@ -46,15 +56,50 @@ llvm+riscv64      spec::simd::simd_align::llvm::universal
 llvm+riscv64      spec::simd::simd_f32x4_rounding::llvm::universal
 llvm+riscv64      spec::simd::simd_f64x2_rounding::llvm::universal
 llvm+riscv64      wasmer::nan_canonicalization::llvm::universal
-llvm+riscv64      wasmer::stack_overflow_sret::llvm::universal
+
+#6032
+llvm+riscv64      wasmer::stack_overflow_sret::llvm
+llvm+loongarch64      wasmer::stack_overflow_sret::llvm
+
 # riscv support on Cranelift is also very young
-cranelift+riscv64 spec::align::cranelift::universal
-cranelift+riscv64 spec::memory_copy::cranelift::universal
-cranelift+riscv64 spec::memory_trap::cranelift::universal
-cranelift+riscv64 spec::r#if::cranelift::universal
+cranelift+riscv64 spec::align::cranelift
+cranelift+riscv64 spec::memory_copy::cranelift
+cranelift+riscv64 spec::memory_trap::cranelift
+cranelift+riscv64 spec::r#if::cranelift
 
 # no SIMD on riscv, Cranelift will not handle them
 cranelift+riscv64 spec::simd
+# 6078
+cranelift+riscv64 wasmer::simd_generated_ext_ops
+
+# loongarch64 support is still early, function call ABI needs some work
+llvm+loongarch64  static_function::llvm::universal
+llvm+loongarch64  static_function_with_env::llvm::universal
+llvm+loongarch64  static_function_with_results::llvm::universal
+llvm+loongarch64  spec::f32::llvm::universal
+llvm+loongarch64  spec::f64::llvm::universal
+llvm+loongarch64  spec::float_misc::llvm::universal
+llvm+loongarch64  spec::memory_copy::llvm::universal
+llvm+loongarch64  spec::memory_init::llvm::universal
+llvm+loongarch64  spec::memory_trap::llvm::universal
+llvm+loongarch64  spec::multi_value::binary::llvm::universal
+llvm+loongarch64  spec::multi_value::block::llvm::universal
+llvm+loongarch64  spec::simd::simd_align::llvm::universal
+llvm+loongarch64  spec::simd::simd_f32x4_rounding::llvm::universal
+llvm+loongarch64  spec::simd::simd_f64x2_rounding::llvm::universal
+llvm+loongarch64  wasmer::nan_canonicalization::llvm::universal
+llvm+loongarch64  wasmer::stack_overflow_sret::llvm::universal
+
+# #6017 - a crash in the LLVM compiler
+llvm+loongarch64  spec::simd::simd_f32x4::llvm
+llvm+loongarch64  spec::simd::simd_f64x2::llvm
+llvm+loongarch64  spec::simd::simd_load::llvm
+llvm+loongarch64  spec::simd::simd_splat::llvm
+llvm+loongarch64  spec::simd_f32x4::llvm
+llvm+loongarch64  spec::simd_f64x2::llvm
+llvm+loongarch64  spec::simd_load::llvm
+llvm+loongarch64  spec::simd_splat::llvm
+
 
 # Windows doesn't overcommit and fails to allocate 4GB of memory
 windows wasmer::max_size_of_memory
@@ -62,6 +107,9 @@ windows wasmer::max_size_of_memory
 # Some AARCH64 CPU have issue with segfault writin 64bits on border page, where the 1 32bits might be written.
 aarch64+linux spec::align
 aarch64+linux spec::memory_trap
+
+# TODO: #5816
+cranelift+riscv64 spec::skip_stack_guard_page
 
 # Frontends
 
@@ -343,3 +391,11 @@ windows     wasitests::nightly_2022_10_18::host_fs::path_rename
 
 # FIXME - re-enable once the path resolution failures in WasiFs have been worked out
 path_rename
+
+# #5943 - multi-value tests
+singlepass        multi_value_imports
+cranelift         multi_value_imports
+llvm+windows      multi_value_imports
+llvm+loongarch64  multi_value_imports
+llvm+riscv64      multi_value_imports
+llvm+windows      static_function_with_results

@@ -13,38 +13,50 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-wasmer-types = { path = "../types", version = "=4.3.7", default-features = false }
-wasmer-object = { path = "../object", version = "=4.3.7", optional = true }
-wasmparser = { workspace = true, optional = true, default-features = false }
+wasmer-types = { path = "../types", version = "=7.0.0-rc.1", default-features = false }
+wasmparser = { workspace = true, default-features = false, optional = true }
 enumset.workspace = true
-hashbrown = { version = "0.11", optional = true }
-serde = { version = "1.0", features = ["derive"], optional = true }
-thiserror = "1.0"
-serde_bytes = { version = "0.11", optional = true }
-smallvec = "1.6"
-xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
+hashbrown = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+serde_bytes = { workspace = true, optional = true }
+smallvec.workspace = true
+loupe = { workspace = true, optional = true, features = [
+	"indexmap",
+	"enable-indexmap",
+] }
 
-backtrace = "0.3"
-memmap2 = "0.5"
-more-asserts = "0.2"
-lazy_static = "1.4"
+backtrace.workspace = true
+memmap2.workspace = true
+more-asserts.workspace = true
 
-cfg-if = "1.0"
-leb128 = "0.2"
-enum-iterator = "0.7.0"
+cfg-if.workspace = true
+leb128.workspace = true
+enum-iterator.workspace = true
 
-bytes = "1.0"
-self_cell = "1.0"
-rkyv = { workspace = true }
-shared-buffer = { workspace = true }
+bytes.workspace = true
+self_cell.workspace = true
+rkyv.workspace = true
+shared-buffer.workspace = true
 libc.workspace = true
+target-lexicon.workspace = true
+object = { workspace = true, features = ["write"] }
+itertools.workspace = true
+tempfile.workspace = true
+rangemap.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wasmer-vm = { path = "../vm", version = "=4.3.7" }
-region = { version = "3.0" }
+wasmer-vm = { path = "../vm", version = "=7.0.0-rc.1" }
+region.workspace = true
+which.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug"] }
+windows-sys = { workspace = true, features = [
+	"Win32_System_Diagnostics_Debug",
+] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+macho-unwind-info.workspace = true
 
 [features]
 default = ["std"]
@@ -56,19 +68,21 @@ compiler = ["translator"]
 wasmer-artifact-load = []
 wasmer-artifact-create = []
 static-artifact-load = []
-static-artifact-create = ["wasmer-object"]
+static-artifact-create = ["translator", "compiler"]
 std = ["wasmer-types/std"]
 core = ["hashbrown", "wasmer-types/core"]
 enable-serde = ["serde", "serde_bytes", "wasmer-types/enable-serde"]
+artifact-size = ["dep:loupe"]
 
 [badges]
 maintenance = { status = "experimental" }
 
 [package.metadata.docs.rs]
 features = [
-    "static-artifact-create",
-    "static-artifact-load",
-    "wasmer-artifact-create",
-    "wasmer-artifact-load",
+	"static-artifact-create",
+	"static-artifact-load",
+	"wasmer-artifact-create",
+	"wasmer-artifact-load",
 ]
 rustc-args = ["--cfg", "docsrs"]
+cargo-args = ["--no-deps"]
