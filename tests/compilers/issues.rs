@@ -540,6 +540,26 @@ fn issue_5309_reftype_panic(mut config: crate::Config) -> Result<()> {
     Ok(())
 }
 
+#[compiler_test(issues)]
+fn issue_memory_atomic_notify_stack_offset(mut config: crate::Config) -> Result<()> {
+    let store = config.store();
+    let wat = r#"
+    (module
+      (table 1 externref)
+      (memory 7)
+      (func
+        loop
+          table.size
+          table.size
+          memory.atomic.notify
+          unreachable
+        end))
+    "#;
+
+    let _module = Module::new(&store, wat)?;
+    Ok(())
+}
+
 fn gen_wat_sum_function(arguments: usize) -> String {
     assert!(arguments > 0);
     let arg_types = std::iter::repeat_n("i64", arguments).collect_vec();
@@ -746,4 +766,33 @@ fn issue_5719_shared_catch_clause_block(mut config: crate::Config) {
         .call(&mut store, &[])
         .unwrap();
     assert_eq!(&Value::I32(42), result.first().unwrap());
+}
+
+#[compiler_test(issues)]
+fn issue_4169_funcref_externref_import(mut config: crate::Config) -> Result<()> {
+    let wasm_bytes = wat2wasm(
+        r#"
+        (module
+            (type $t0 (func (param funcref externref)))
+            (import "" "" (func $hello (type $t0)))
+        )
+        "#
+        .as_bytes(),
+    )
+    .unwrap();
+
+    let mut store = config.store();
+    let module = Module::new(&store, wasm_bytes).unwrap();
+    let imports: Imports = imports! {
+        "" => {
+            "" => Function::new_typed(
+                &mut store,
+                |_fr: Option<Function>, _er: Option<ExternRef>| {},
+            ),
+        }
+    };
+
+    let _instance = Instance::new(&mut store, &module, &imports)?;
+
+    Ok(())
 }

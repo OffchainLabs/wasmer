@@ -1,4 +1,5 @@
 use super::*;
+use crate::VIRTUAL_ROOT_FD;
 use crate::syscalls::*;
 
 /// ### `path_open()`
@@ -126,14 +127,12 @@ pub(crate) fn path_open_internal(
 ) -> Result<Result<WasiFd, Errno>, WasiError> {
     let state = env.state.deref();
     let inodes = &state.inodes;
+    let follow_symlinks = dirflags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0;
 
     let path_arg = std::path::PathBuf::from(&path);
-    let maybe_inode = state.fs.get_inode_at_path(
-        inodes,
-        dirfd,
-        path,
-        dirflags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0,
-    );
+    let maybe_inode = state
+        .fs
+        .get_inode_at_path(inodes, dirfd, path, follow_symlinks);
 
     let working_dir = wasi_try_ok_ok!(state.fs.get_fd(dirfd));
     let working_dir_rights_inheriting = working_dir.inner.rights_inheriting;
@@ -290,9 +289,28 @@ pub(crate) fn path_open_internal(
                 path_to_symlink,
                 relative_path,
             } => {
-                // I think this should return an error (because symlinks should be resolved away by the path traversal)
-                // TODO: investigate this
-                unimplemented!("SYMLINKS IN PATH_OPEN");
+                // Resolve the symlink via the existing path traversal logic and restart
+                // path_open with lookup-follow semantics for this resolved path.
+                let (resolved_base_fd, resolved_path) = if relative_path.is_absolute() {
+                    (VIRTUAL_ROOT_FD, relative_path.clone())
+                } else {
+                    let mut resolved_path = path_to_symlink.clone();
+                    resolved_path.pop();
+                    resolved_path.push(relative_path);
+                    (*base_po_dir, resolved_path)
+                };
+                return path_open_internal(
+                    env,
+                    resolved_base_fd,
+                    __WASI_LOOKUP_SYMLINK_FOLLOW,
+                    &resolved_path.to_string_lossy(),
+                    o_flags,
+                    fs_rights_base,
+                    fs_rights_inheriting,
+                    fs_flags,
+                    fd_flags,
+                    with_fd,
+                );
             }
         }
         inode
@@ -310,13 +328,11 @@ pub(crate) fn path_open_internal(
 
             // strip end file name
 
-            let (parent_inode, new_entity_name) =
-                wasi_try_ok_ok!(state.fs.get_parent_inode_at_path(
-                    inodes,
-                    dirfd,
-                    &path_arg,
-                    dirflags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0
-                ));
+            let (parent_inode, new_entity_name) = wasi_try_ok_ok!(
+                state
+                    .fs
+                    .get_parent_inode_at_path(inodes, dirfd, &path_arg, follow_symlinks)
+            );
             let new_file_host_path = {
                 let guard = parent_inode.read();
                 match guard.deref() {
