@@ -172,7 +172,7 @@ impl<'a> FunctionBinaryReader<'a> for MiddlewareBinaryReader<'a> {
             MiddlewareInnerReader::Operator(..) => Err(WasmError::InvalidWebAssembly {
                 message: "locals must be read before the function body".to_string(),
                 offset: self.current_position(),
-            })
+            }),
         }?;
         self.state.local_decls = total;
         self.state.locals.reserve(total as usize);
