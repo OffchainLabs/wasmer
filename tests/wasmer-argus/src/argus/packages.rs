@@ -11,7 +11,7 @@ use tokio::{
 };
 use tracing::*;
 use url::Url;
-use wasmer_api::{
+use wasmer_backend_api::{
     query::get_package_versions_stream,
     types::{AllPackageVersionsVars, PackageVersionSortBy, PackageVersionWithPackage},
 };
@@ -101,7 +101,7 @@ impl Argus {
     ) -> anyhow::Result<()> {
         info!("downloading package from {} to file {:?}", url, path);
         static APP_USER_AGENT: &str =
-            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
         let mut dir_path = path.clone();
         dir_path.pop();

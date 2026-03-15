@@ -10,12 +10,14 @@ use crate::syscalls::*;
 /// ## Parameters
 ///
 /// * `how` - Which channels on the socket to shut down.
-#[instrument(level = "debug", skip_all, fields(%sock), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock), ret)]
 pub fn sock_shutdown(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     how: SdFlags,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let both = __WASI_SHUT_RD | __WASI_SHUT_WR;
     let shutdown = match how {
         __WASI_SHUT_RD => std::net::Shutdown::Read,
@@ -30,7 +32,7 @@ pub fn sock_shutdown(
     if ctx.data().enable_journal {
         JournalEffector::save_sock_shutdown(&mut ctx, sock, shutdown).map_err(|err| {
             tracing::error!("failed to save sock_shutdown event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 

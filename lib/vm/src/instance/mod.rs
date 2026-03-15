@@ -12,14 +12,15 @@ use crate::export::VMExtern;
 use crate::imports::Imports;
 use crate::store::{InternalStoreHandle, StoreObjects};
 use crate::table::TableElement;
-use crate::trap::{catch_traps, Trap, TrapCode};
+use crate::trap::{Trap, TrapCode};
 use crate::vmcontext::{
     memory32_atomic_check32, memory32_atomic_check64, memory_copy, memory_fill,
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionContext,
     VMFunctionImport, VMFunctionKind, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition,
-    VMMemoryImport, VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
+    VMMemoryImport, VMSharedSignatureIndex, VMSharedTagIndex, VMTableDefinition, VMTableImport,
+    VMTrampoline,
 };
-use crate::{FunctionBodyPtr, MaybeInstanceOwned, TrapHandlerFn, VMFunctionBody};
+use crate::{wasmer_call_trampoline, FunctionBodyPtr, MaybeInstanceOwned, TrapHandlerFn, VMTag};
 use crate::{LinearMemory, NotifyLocation};
 use crate::{VMConfig, VMFuncRef, VMFunction, VMGlobal, VMMemory, VMTable};
 pub use allocator::InstanceAllocator;
@@ -38,7 +39,8 @@ use wasmer_types::entity::{packed_option::ReservedValue, BoxedSlice, EntityRef, 
 use wasmer_types::{
     DataIndex, DataInitializer, ElemIndex, ExportIndex, FunctionIndex, GlobalIndex, GlobalInit,
     LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryError,
-    MemoryIndex, ModuleInfo, Pages, SignatureIndex, TableIndex, TableInitializer, VMOffsets,
+    MemoryIndex, ModuleInfo, Pages, SignatureIndex, TableIndex, TableInitializer, TagIndex,
+    VMOffsets,
 };
 
 /// A WebAssembly instance.
@@ -67,6 +69,9 @@ pub(crate) struct Instance {
 
     /// WebAssembly global data.
     globals: BoxedSlice<LocalGlobalIndex, InternalStoreHandle<VMGlobal>>,
+
+    /// WebAssembly tag data. Notably, this stores *all* tags, not just local ones.
+    tags: BoxedSlice<TagIndex, InternalStoreHandle<VMTag>>,
 
     /// Pointers to functions in executable memory.
     functions: BoxedSlice<LocalFunctionIndex, FunctionBodyPtr>,
@@ -181,6 +186,17 @@ impl Instance {
     /// Return a pointer to the `VMGlobalImport`s.
     fn imported_globals_ptr(&self) -> *mut VMGlobalImport {
         unsafe { self.vmctx_plus_offset(self.offsets.vmctx_imported_globals_begin()) }
+    }
+
+    /// Return the indexed `VMSharedTagIndex`.
+    pub(crate) fn shared_tag_ptr(&self, index: TagIndex) -> &VMSharedTagIndex {
+        let index = usize::try_from(index.as_u32()).unwrap();
+        unsafe { &*self.shared_tags_ptr().add(index) }
+    }
+
+    /// Return a pointer to the `VMSharedTagIndex`s.
+    pub(crate) fn shared_tags_ptr(&self) -> *mut VMSharedTagIndex {
+        unsafe { self.vmctx_plus_offset(self.offsets.vmctx_tag_ids_begin()) }
     }
 
     /// Return the indexed `VMTableDefinition`.
@@ -355,13 +371,22 @@ impl Instance {
             }
         };
 
-        // Make the call.
+        let sig = self.module.functions[start_index];
+        let trampoline = self.function_call_trampolines[sig];
+        let mut values_vec = vec![];
+
         unsafe {
-            catch_traps(trap_handler, config, || {
-                mem::transmute::<*const VMFunctionBody, unsafe extern "C" fn(VMFunctionContext)>(
-                    callee_address,
-                )(callee_vmctx)
-            })
+            // Even though we already know the type of the function we need to call, in certain
+            // specific cases trampoline prepare callee arguments for specific optimizations, such
+            // as passing g0 and m0_base_ptr as paramters.
+            wasmer_call_trampoline(
+                trap_handler,
+                config,
+                callee_vmctx,
+                trampoline,
+                callee_address,
+                values_vec.as_mut_ptr(),
+            )
         }
     }
 
@@ -1022,9 +1047,15 @@ impl VMInstance {
         finished_memories: BoxedSlice<LocalMemoryIndex, InternalStoreHandle<VMMemory>>,
         finished_tables: BoxedSlice<LocalTableIndex, InternalStoreHandle<VMTable>>,
         finished_globals: BoxedSlice<LocalGlobalIndex, InternalStoreHandle<VMGlobal>>,
+        tags: BoxedSlice<TagIndex, InternalStoreHandle<VMTag>>,
         imports: Imports,
         vmshared_signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
     ) -> Result<Self, Trap> {
+        let vmctx_tags = tags
+            .values()
+            .map(|m| VMSharedTagIndex::new(m.index() as u32))
+            .collect::<PrimaryMap<TagIndex, _>>()
+            .into_boxed_slice();
         let vmctx_globals = finished_globals
             .values()
             .map(|m| m.get(context).vmglobal())
@@ -1051,6 +1082,7 @@ impl VMInstance {
                 offsets,
                 memories: finished_memories,
                 tables: finished_tables,
+                tags,
                 globals: finished_globals,
                 functions: finished_functions,
                 function_call_trampolines: finished_function_call_trampolines,
@@ -1082,6 +1114,11 @@ impl VMInstance {
         };
         let instance = handle.instance();
 
+        ptr::copy(
+            vmctx_tags.values().as_slice().as_ptr(),
+            instance.shared_tags_ptr(),
+            vmctx_tags.len(),
+        );
         ptr::copy(
             vmshared_signatures.values().as_slice().as_ptr(),
             instance.signature_ids_ptr(),
@@ -1253,6 +1290,11 @@ impl VMInstance {
                 };
                 VMExtern::Global(handle)
             }
+
+            ExportIndex::Tag(index) => {
+                let handle = instance.tags[index];
+                VMExtern::Tag(handle)
+            }
         }
     }
 
@@ -1399,14 +1441,25 @@ fn initialize_tables(instance: &mut Instance) -> Result<(), Trap> {
             return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
 
-        for (i, func_idx) in init.elements.iter().enumerate() {
-            let anyfunc = instance.func_ref(*func_idx);
-            table
-                .set(
-                    u32::try_from(start + i).unwrap(),
-                    TableElement::FuncRef(anyfunc),
-                )
-                .unwrap();
+        if let wasmer_types::Type::FuncRef = table.ty().ty {
+            for (i, func_idx) in init.elements.iter().enumerate() {
+                let anyfunc = instance.func_ref(*func_idx);
+                table
+                    .set(
+                        u32::try_from(start + i).unwrap(),
+                        TableElement::FuncRef(anyfunc),
+                    )
+                    .unwrap();
+            }
+        } else {
+            for i in 0..init.elements.len() {
+                table
+                    .set(
+                        u32::try_from(start + i).unwrap(),
+                        TableElement::ExternRef(None),
+                    )
+                    .unwrap();
+            }
         }
     }
 

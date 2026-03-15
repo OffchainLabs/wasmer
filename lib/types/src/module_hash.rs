@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use rkyv::{Archive, CheckBytes, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -28,7 +28,7 @@ pub enum HashAlgorithm {
     RkyvDeserialize,
     Archive,
 )]
-#[archive_attr(derive(CheckBytes, Debug))]
+#[rkyv(derive(Debug))]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub enum ModuleHash {
     /// xxhash
@@ -36,6 +36,16 @@ pub enum ModuleHash {
 
     /// sha256
     Sha256([u8; 32]),
+}
+
+#[cfg(feature = "artifact-size")]
+impl loupe::MemoryUsage for ModuleHash {
+    fn size_of_val(&self, _tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        match self {
+            ModuleHash::XXHash(_) => 8 * 8,
+            ModuleHash::Sha256(_) => 8 * 32,
+        }
+    }
 }
 
 impl ModuleHash {
@@ -63,7 +73,7 @@ impl ModuleHash {
         Ok(Self::sha256_from_bytes(hash))
     }
 
-    /// Generate a new [`ModuleCache`] based on the XXHash hash of some bytes.
+    /// Generate a new [`ModuleHash`] based on the XXHash hash of some bytes.
     pub fn xxhash(wasm: impl AsRef<[u8]>) -> Self {
         let wasm = wasm.as_ref();
 
@@ -72,13 +82,20 @@ impl ModuleHash {
         Self::XXHash(hash.to_ne_bytes())
     }
 
-    /// Generate a new [`ModuleCache`] based on the Sha256 hash of some bytes.
+    /// Generate a new [`ModuleHash`] based on the Sha256 hash of some bytes.
     pub fn sha256(wasm: impl AsRef<[u8]>) -> Self {
         let wasm = wasm.as_ref();
 
         let hash: [u8; 32] = sha2::Sha256::digest(wasm).into();
 
         Self::Sha256(hash)
+    }
+
+    /// Generate a random [`ModuleHash`]. For when you don't care about caches.
+    pub fn random() -> Self {
+        let mut bytes = [0_u8; 8];
+        getrandom::getrandom(&mut bytes).unwrap();
+        Self::XXHash(bytes)
     }
 
     /// Get the raw hash.

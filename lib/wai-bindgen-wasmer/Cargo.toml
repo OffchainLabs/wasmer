@@ -1,7 +1,7 @@
 [package]
 name = "wai-bindgen-wasmer"
 description = "Generate WAI glue for a Rust Wasmer host"
-version = "0.27.0"
+version = "0.601.0"
 categories = ["wasm", "os"]
 keywords = ["wasm", "webassembly", "wasi", "sandbox", "ABI"]
 readme = "README.md"
@@ -13,14 +13,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow = "1.0"
-async-trait = { version = "0.1.50", optional = true }
+anyhow.workspace = true
+async-trait = { workspace = true, optional = true }
 bitflags = "1.2"
-once_cell = "1.13"
-thiserror = "1.0"
+once_cell.workspace = true
+thiserror.workspace = true
 tracing-lib = { version = "0.1.26", optional = true, package = "tracing" }
 wai-bindgen-wasmer-impl = { version = "0.2.2" }
-wasmer = { version = "=4.3.7", path = "../api", default-features = false }
+wasmer = { version = "=6.1.0", path = "../api", default-features = false }
 
 [features]
 # Enables generated code to emit events via the `tracing` crate whenever wasm is
@@ -34,7 +34,7 @@ async = ["async-trait", "wai-bindgen-wasmer-impl/async"]
 
 # Wasmer features
 js = ["wasmer/js-default"]
-sys = ["wasmer/sys"]
+sys = ["wasmer/sys-default"]
 
 # Wasmer compiler (with `sys` feature only)
 cranelift = ["wasmer/cranelift"]
@@ -42,5 +42,5 @@ singlepass = ["wasmer/singlepass"]
 llvm = ["wasmer/llvm"]
 
 [package.metadata.docs.rs]
-features = ["wasmer/sys"]
+features = ["wasmer/sys", "wasmer/compiler"]
 rustc-args = ["--cfg", "docsrs"]

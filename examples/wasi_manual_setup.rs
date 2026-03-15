@@ -10,7 +10,7 @@
 //! You can run the example directly by executing in Wasmer root:
 //!
 //! ```shell
-//! cargo run --example wasi-manual-setup --release --features "cranelift,wasi"
+//! cargo run --example wasi-manual-setup --release --features "cranelift,tokio,wasi"
 //! ```
 //!
 //! Ready?
@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wasi_env = WasiEnv::builder("hello")
         // .args(&["world"])
         // .env("KEY", "Value")
+        .engine(store.engine().clone())
         .finalize(&mut store)?;
 
     println!("Instantiating module with WASI imports...");

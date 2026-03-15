@@ -128,7 +128,7 @@ impl<'a: 'b, 'b> Extend<&'b Operator<'a>> for MiddlewareReaderState<'a> {
 impl<'a> MiddlewareBinaryReader<'a> {
     /// Constructs a `MiddlewareBinaryReader` with an explicit starting offset.
     pub fn new_with_offset(data: &'a [u8], original_offset: usize) -> Self {
-        let inner = BinaryReader::new_with_offset(data, original_offset);
+        let inner = BinaryReader::new(data, original_offset);
         Self {
             state: MiddlewareReaderState {
                 inner,

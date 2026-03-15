@@ -15,7 +15,6 @@ use crate::{VMBuiltinFunctionIndex, VMFunction};
 use std::convert::TryFrom;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::u32;
 use wasmer_types::RawValue;
 
 /// Union representing the first parameter passed when calling a function.
@@ -535,9 +534,28 @@ impl VMGlobalDefinition {
     }
 }
 
+/// A tag index, unique within the Store in which the instance was created.
+/// Usable for translating module-local tag indices to store-unique ones.
+#[repr(C)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+pub struct VMSharedTagIndex(u32);
+
+impl VMSharedTagIndex {
+    /// Create a new `VMSharedTagIndex`.
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Get the inner value.
+    pub fn index(&self) -> u32 {
+        self.0
+    }
+}
+
 /// An index into the shared signature registry, usable for checking signatures
 /// at indirect calls.
 #[repr(C)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Hash)]
 pub struct VMSharedSignatureIndex(u32);
 
@@ -710,6 +728,22 @@ impl VMBuiltinFunctionsArray {
             wasmer_vm_memory32_atomic_notify as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_memory_atomic_notify_index().index() as usize] =
             wasmer_vm_imported_memory32_atomic_notify as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_throw_index().index() as usize] =
+            wasmer_vm_throw as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_rethrow_index().index() as usize] =
+            wasmer_vm_rethrow as usize;
+
+        ptrs[VMBuiltinFunctionIndex::get_imported_alloc_exception_index().index() as usize] =
+            wasmer_vm_alloc_exception as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_delete_exception_index().index() as usize] =
+            wasmer_vm_delete_exception as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_read_exception_index().index() as usize] =
+            wasmer_vm_read_exception as usize;
+
+        ptrs[VMBuiltinFunctionIndex::get_imported_debug_usize_index().index() as usize] =
+            wasmer_vm_dbg_usize as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_debug_str_index().index() as usize] =
+            wasmer_vm_dbg_str as usize;
 
         debug_assert!(ptrs.iter().cloned().all(|p| p != 0));
 
@@ -748,7 +782,7 @@ impl VMContext {
     }
 }
 
-///
+/// The type for tramplines in the VM.
 pub type VMTrampoline = unsafe extern "C" fn(
     *mut VMContext,        // callee vmctx
     *const VMFunctionBody, // function we're actually calling

@@ -2,8 +2,8 @@
 // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Module for Windows x64 ABI unwind registry.
+use crate::types::unwind::CompiledFunctionUnwindInfoReference;
 use std::collections::HashMap;
-use wasmer_types::CompiledFunctionUnwindInfoReference;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     RtlAddFunctionTable, RtlDeleteFunctionTable, IMAGE_RUNTIME_FUNCTION_ENTRY,
 };
@@ -83,6 +83,18 @@ impl UnwindRegistry {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn register_compact_unwind(
+        &mut self,
+        compact_unwind: Option<&[u8]>,
+        _eh_personality_addr_in_got: Option<usize>,
+    ) -> Result<(), String> {
+        if compact_unwind.is_some() {
+            return Err("Cannot register compact_unwind frames on Windows platforms".to_string());
         }
 
         Ok(())

@@ -9,13 +9,13 @@ use std::convert::{TryFrom, TryInto};
 use std::ops::Range;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::FunctionType;
-use wasmer_types::WasmResult;
 use wasmer_types::{
     CustomSectionIndex, DataIndex, DataInitializer, DataInitializerLocation, ElemIndex,
     ExportIndex, FunctionIndex, GlobalIndex, GlobalInit, GlobalType, ImportIndex,
     LocalFunctionIndex, MemoryIndex, MemoryType, ModuleInfo, SignatureIndex, TableIndex,
     TableInitializer, TableType,
 };
+use wasmer_types::{TagIndex, WasmResult};
 
 /// Contains function data: bytecode and its offset in the module.
 #[derive(Hash)]
@@ -85,7 +85,7 @@ impl<'data> ModuleEnvironment<'data> {
 
     /// Translate a wasm module using this environment. This consumes the
     /// `ModuleEnvironment` and produces a `ModuleInfoTranslation`.
-    pub fn translate(mut self, data: &'data [u8]) -> WasmResult<ModuleEnvironment<'data>> {
+    pub fn translate(mut self, data: &'data [u8]) -> WasmResult<Self> {
         assert!(self.module_translation_state.is_none());
         let module_translation_state = translate_module(data, &mut self)?;
         self.module_translation_state = Some(module_translation_state);
@@ -149,6 +149,39 @@ impl<'data> ModuleEnvironment<'data> {
         )?;
         self.module.functions.push(sig_index);
         self.module.num_imported_functions += 1;
+        Ok(())
+    }
+
+    pub(crate) fn declare_tag_import(
+        &mut self,
+        t: wasmparser::TagType,
+        module_name: &str,
+        field_name: &str,
+    ) -> WasmResult<()> {
+        debug_assert_eq!(
+            self.module.tags.len(),
+            self.module.num_imported_tags,
+            "Imported tags must be declared first"
+        );
+
+        let tag = SignatureIndex::from_u32(t.func_type_idx);
+        debug_assert!(
+            self.module
+                .signatures
+                .get(SignatureIndex::from_u32(t.func_type_idx))
+                .is_some(),
+            "Imported tags must mach a declared signature!"
+        );
+
+        self.declare_import(
+            ImportIndex::Tag(TagIndex::from_u32(self.module.num_imported_tags as _)),
+            module_name,
+            field_name,
+        )?;
+
+        self.module.num_imported_tags += 1;
+        self.module.tags.push(tag);
+
         Ok(())
     }
 
@@ -259,6 +292,18 @@ impl<'data> ModuleEnvironment<'data> {
         Ok(())
     }
 
+    pub(crate) fn reserve_tags(&mut self, num: u32) -> WasmResult<()> {
+        self.module
+            .tags
+            .reserve_exact(usize::try_from(num).unwrap());
+        Ok(())
+    }
+
+    pub(crate) fn declare_tag(&mut self, tag: SignatureIndex) -> WasmResult<()> {
+        self.module.tags.push(tag);
+        Ok(())
+    }
+
     pub(crate) fn reserve_globals(&mut self, num: u32) -> WasmResult<()> {
         self.module
             .globals
@@ -303,6 +348,10 @@ impl<'data> ModuleEnvironment<'data> {
         name: &str,
     ) -> WasmResult<()> {
         self.declare_export(ExportIndex::Memory(memory_index), name)
+    }
+
+    pub(crate) fn declare_tag_export(&mut self, tag_index: TagIndex, name: &str) -> WasmResult<()> {
+        self.declare_export(ExportIndex::Tag(tag_index), name)
     }
 
     pub(crate) fn declare_global_export(

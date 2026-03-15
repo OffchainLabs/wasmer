@@ -8,9 +8,7 @@ use wasmer::*;
 fn module_get_name() -> Result<(), String> {
     let store = Store::default();
     let wat = r#"(module)"#;
-    let module = Module::new(&store, wat)
-        .map_err(|e| format!("{e:?}"))
-        .map_err(|e| format!("{e:?}"))?;
+    let module = Module::new(&store, wat).map_err(|e| format!("{e:?}"))?;
     assert_eq!(module.name(), None);
 
     Ok(())
@@ -35,7 +33,7 @@ fn imports() -> Result<(), String> {
     let wat = r#"(module
 (import "host" "func" (func))
 (import "host" "memory" (memory 1))
-(import "host" "table" (table 1 anyfunc))
+(import "host" "table" (table 1 funcref))
 (import "host" "global" (global i32))
 )"#;
     let module = Module::new(&store, wat).map_err(|e| format!("{e:?}"))?;
@@ -196,35 +194,35 @@ fn calling_host_functions_with_negative_values_works() -> Result<(), String> {
     let imports = imports! {
         "host" => {
             "host_func1" => Function::new_typed(&mut store, |p: u64| {
-                println!("host_func1: Found number {}", p);
+                println!("host_func1: Found number {p}");
                 assert_eq!(p, u64::max_value());
             }),
             "host_func2" => Function::new_typed(&mut store, |p: u32| {
-                println!("host_func2: Found number {}", p);
+                println!("host_func2: Found number {p}");
                 assert_eq!(p, u32::max_value());
             }),
             "host_func3" => Function::new_typed(&mut store, |p: i64| {
-                println!("host_func3: Found number {}", p);
+                println!("host_func3: Found number {p}");
                 assert_eq!(p, -1);
             }),
             "host_func4" => Function::new_typed(&mut store, |p: i32| {
-                println!("host_func4: Found number {}", p);
+                println!("host_func4: Found number {p}");
                 assert_eq!(p, -1);
             }),
             "host_func5" => Function::new_typed(&mut store, |p: i16| {
-                println!("host_func5: Found number {}", p);
+                println!("host_func5: Found number {p}");
                 assert_eq!(p, -1);
             }),
             "host_func6" => Function::new_typed(&mut store, |p: u16| {
-                println!("host_func6: Found number {}", p);
+                println!("host_func6: Found number {p}");
                 assert_eq!(p, u16::max_value());
             }),
             "host_func7" => Function::new_typed(&mut store, |p: i8| {
-                println!("host_func7: Found number {}", p);
+                println!("host_func7: Found number {p}");
                 assert_eq!(p, -1);
             }),
             "host_func8" => Function::new_typed(&mut store, |p: u8| {
-                println!("host_func8: Found number {}", p);
+                println!("host_func8: Found number {p}");
                 assert_eq!(p, u8::max_value());
             }),
         }
@@ -277,6 +275,9 @@ fn calling_host_functions_with_negative_values_works() -> Result<(), String> {
 }
 
 #[universal_test]
+#[cfg_attr(feature = "wamr", ignore = "wamr does not support custom sections")]
+#[cfg_attr(feature = "wasmi", ignore = "wasmi does not support custom sections")]
+#[cfg_attr(feature = "v8", ignore = "v8 does not support custom sections")]
 fn module_custom_sections() -> Result<(), String> {
     let store = Store::default();
     let custom_section_wasm_bytes = include_bytes!("simple-name-section.wasm");

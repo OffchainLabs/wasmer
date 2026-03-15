@@ -324,14 +324,20 @@ fn test_popcnt(mut config: crate::Config) -> Result<()> {
     let mut num = 1;
     for _ in 1..10000 {
         let result = popcnt_i32.call(&mut store, &[Value::I32(num)]).unwrap();
-        assert_eq!(&Value::I32(num.count_ones() as i32), result.get(0).unwrap());
+        assert_eq!(
+            &Value::I32(num.count_ones() as i32),
+            result.first().unwrap()
+        );
         num = get_next_number_i32(num);
     }
 
     let mut num = 1;
     for _ in 1..10000 {
         let result = popcnt_i64.call(&mut store, &[Value::I64(num)]).unwrap();
-        assert_eq!(&Value::I64(num.count_ones() as i64), result.get(0).unwrap());
+        assert_eq!(
+            &Value::I64(num.count_ones() as i64),
+            result.first().unwrap()
+        );
         num = get_next_number_i64(num);
     }
 
@@ -439,7 +445,7 @@ fn large_number_local(mut config: crate::Config) -> Result<()> {
         .get_function("large_local")?
         .call(&mut store, &[])
         .unwrap();
-    assert_eq!(&Value::I64(1_i64), result.get(0).unwrap());
+    assert_eq!(&Value::I64(1_i64), result.first().unwrap());
     Ok(())
 }
 
@@ -463,35 +469,66 @@ fn issue_4519(mut config: crate::Config) -> Result<()> {
 #[cfg(target_arch = "aarch64")]
 #[compiler_test(issues)]
 /// Singlepass panics on aarch64 for long relocations.
-/// This test specifically targets the emission of the sdiv64 binop.
+/// This test specifically targets the emission of sdiv64, srem64, urem64 binops.
 ///
 /// Note: this one is specific to Singlepass, but we want to test in all
 /// available compilers.
 ///
 /// https://github.com/wasmerio/wasmer/issues/4519
-fn issue_4519_sdiv64(mut config: crate::Config) -> Result<()> {
-    const REPEATS_TO_REPRODUCE: usize = 16_000;
+fn issue_4519_sdiv64_srem64_urem64(mut config: crate::Config) -> Result<()> {
+    const REPEATS_TO_REPRODUCE: usize = 30_000;
 
-    let sdiv64 = r#"
-        i64.const 3155225962131072202
-        i64.const -6717269760755396770
-        i64.div_s
-        drop
-    "#;
+    let ops = ["i64.div_s", "i64.rem_s", "i64.rem_u"];
 
-    let wat = format!(
-        r#"
-      (module
-        (func (;0;)
-            {}
+    for op in ops {
+        let sdiv64 = format!(
+            r#"
+            i64.const 3155225962131072202
+            i64.const -6717269760755396770
+            {op}
+            drop
+        "#
+        );
+
+        let wat = format!(
+            r#"
+        (module
+            (func (;0;)
+                {}
+            )
         )
+        "#,
+            sdiv64.repeat(REPEATS_TO_REPRODUCE)
+        );
+
+        let mut store = config.store();
+        let module = Module::new(&store, wat)?;
+    }
+
+    Ok(())
+}
+
+#[compiler_test(issues)]
+/// Singlepass panics when encountering ref types.
+///
+/// Note: this one is specific to Singlepass, but we want to test in all
+/// available compilers.
+///
+/// Note: for now, we don't want to implement reference types, we just don't want singlepass to
+/// panic.
+///
+/// https://github.com/wasmerio/wasmer/issues/5309
+fn issue_5309_reftype_panic(mut config: crate::Config) -> Result<()> {
+    let wat = r#"
+      (module
+        (type $x1 (func (param funcref)))
+        (import "env" "abort" (func $f (type $x1)))
       )
-    "#,
-        sdiv64.repeat(REPEATS_TO_REPRODUCE)
-    );
+    "#
+    .to_string();
 
     let mut store = config.store();
-    let module = Module::new(&store, wat)?;
+    let _ = Module::new(&store, wat);
 
     Ok(())
 }

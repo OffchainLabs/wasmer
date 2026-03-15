@@ -3,7 +3,7 @@ use indicatif::ProgressBar;
 use std::{fs::File, io::BufReader, path::Path, process::Command, sync::Arc};
 use tokio::time::{self, Instant};
 use tracing::*;
-use wasmer_api::types::PackageVersionWithPackage;
+use wasmer_backend_api::types::PackageVersionWithPackage;
 use webc::{v2::read::OwnedReader, v3::read::OwnedReader as OwnedReaderV3, Container, Version};
 
 use super::{TestReport, Tester};
@@ -55,33 +55,33 @@ impl<'a> CLIRunner<'a> {
             Backend::Cranelift => "--cranelift",
         };
 
-        Ok(
-            match std::panic::catch_unwind(move || {
-                let mut cmd = Command::new(cli_path);
+        let res = std::panic::catch_unwind(move || {
+            let mut cmd = Command::new(cli_path);
 
-                let cmd = cmd.args([
-                    "compile",
-                    atom_path.to_str().unwrap(),
-                    backend,
-                    "-o",
-                    output_path.to_str().unwrap(),
-                ]);
+            let cmd = cmd.args([
+                "compile",
+                atom_path.to_str().unwrap(),
+                backend,
+                "-o",
+                output_path.to_str().unwrap(),
+            ]);
 
-                info!("running cmd: {:?}", cmd);
+            info!("running cmd: {:?}", cmd);
 
-                let out = cmd.output();
+            let out = cmd.output();
 
-                info!("run cmd that gave result: {:#?}", out);
+            info!("run cmd that gave result: {:#?}", out);
 
-                out
-            }) {
-                Ok(r) => match r {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e.to_string()),
-                },
-                Err(_) => Err(String::from("thread panicked")),
+            out
+        });
+
+        Ok(match res {
+            Ok(r) => match r {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
             },
-        )
+            Err(_) => Err(String::from("thread panicked")),
+        })
     }
 
     fn ok(&self, version: String, start_time: Instant) -> anyhow::Result<TestReport> {
@@ -143,7 +143,7 @@ impl<'a> CLIRunner<'a> {
 }
 
 #[async_trait::async_trait]
-impl<'a> Tester for CLIRunner<'a> {
+impl Tester for CLIRunner<'_> {
     async fn run_test(&self) -> anyhow::Result<TestReport> {
         let start_time = time::Instant::now();
         let version = self.get_version().await?;
@@ -157,7 +157,7 @@ impl<'a> Tester for CLIRunner<'a> {
         let webc_v2_path = dir_path.join("package_v2.webc");
 
         self.p
-            .set_message(format!("unpacking webc at {:?}", webc_v2_path));
+            .set_message(format!("unpacking webc at {webc_v2_path:?}"));
 
         let v2_bytes = std::fs::read(&webc_v2_path)?;
 
@@ -182,7 +182,7 @@ impl<'a> Tester for CLIRunner<'a> {
         let webc_v3_path = dir_path.join("package_v3.webc");
 
         self.p
-            .set_message(format!("unpacking webc at {:?}", webc_v3_path));
+            .set_message(format!("unpacking webc at {webc_v3_path:?}"));
 
         let v3_bytes = std::fs::read(&webc_v3_path)?;
 

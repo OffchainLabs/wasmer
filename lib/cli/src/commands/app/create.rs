@@ -1,7 +1,6 @@
 //! Create a new Edge app.
 
 use std::{
-    collections::HashMap,
     env,
     io::Cursor,
     path::{Path, PathBuf},
@@ -13,8 +12,9 @@ use anyhow::Context;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Confirm, Select};
 use futures::stream::TryStreamExt;
+use indexmap::IndexMap;
 use is_terminal::IsTerminal;
-use wasmer_api::{
+use wasmer_backend_api::{
     types::{AppTemplate, TemplateLanguage},
     WasmerClient,
 };
@@ -28,7 +28,10 @@ use crate::{
     utils::{load_package_manifest, prompts::PackageCheckMode},
 };
 
-async fn write_app_config(app_config: &AppConfigV1, dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub(crate) async fn write_app_config(
+    app_config: &AppConfigV1,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let raw_app_config = app_config.clone().to_yaml()?;
 
     let app_dir = match dir {
@@ -47,6 +50,28 @@ async fn write_app_config(app_config: &AppConfigV1, dir: Option<PathBuf>) -> any
                 app_config_path.display()
             )
         })
+}
+
+pub(crate) fn minimal_app_config(owner: &str, name: &str) -> AppConfigV1 {
+    AppConfigV1 {
+        name: Some(String::from(name)),
+        owner: Some(String::from(owner)),
+        package: PackageSource::Path(String::from(".")),
+        app_id: None,
+        domains: None,
+        env: IndexMap::new(),
+        cli_args: None,
+        capabilities: None,
+        scheduled_tasks: None,
+        volumes: None,
+        health_checks: None,
+        debug: None,
+        scaling: None,
+        locality: None,
+        redirect: None,
+        extra: IndexMap::new(),
+        jobs: None,
+    }
 }
 
 /// Create a new Edge app.
@@ -132,12 +157,12 @@ impl CmdAppCreate {
     #[inline]
     fn get_app_config(&self, owner: &str, name: &str, package: &str) -> AppConfigV1 {
         AppConfigV1 {
-            name: String::from(name),
+            name: Some(String::from(name)),
             owner: Some(String::from(owner)),
             package: PackageSource::from_str(package).unwrap(),
             app_id: None,
             domains: None,
-            env: HashMap::new(),
+            env: IndexMap::new(),
             cli_args: None,
             capabilities: None,
             scheduled_tasks: None,
@@ -147,7 +172,8 @@ impl CmdAppCreate {
             scaling: None,
             locality: None,
             redirect: None,
-            extra: HashMap::new(),
+            extra: IndexMap::new(),
+            jobs: None,
         }
     }
 
@@ -173,7 +199,7 @@ impl CmdAppCreate {
             }),
         };
 
-        crate::utils::prompts::prompt_for_ident(
+        crate::utils::prompts::prompt_for_app_ident(
             "What should be the name of the app?",
             default_name.as_deref(),
         )
@@ -190,7 +216,7 @@ impl CmdAppCreate {
         }
 
         let user = if let Some(client) = client {
-            Some(wasmer_api::query::current_user_with_namespaces(client, None).await?)
+            Some(wasmer_backend_api::query::current_user_with_namespaces(client, None).await?)
         } else {
             None
         };
@@ -264,7 +290,7 @@ impl CmdAppCreate {
         if self.use_local_manifest || ask_confirmation()? {
             let app_config = self.get_app_config(owner, app_name, ".");
             write_app_config(&app_config, self.app_dir_path.clone()).await?;
-            self.try_deploy(owner, app_name, None).await?;
+            self.try_deploy(owner, app_name, None, false, false).await?;
             return Ok(true);
         }
 
@@ -286,7 +312,8 @@ impl CmdAppCreate {
         if let Some(pkg) = &self.package {
             let app_config = self.get_app_config(owner, app_name, pkg);
             write_app_config(&app_config, Some(output_path.clone())).await?;
-            self.try_deploy(owner, app_name, Some(&output_path)).await?;
+            self.try_deploy(owner, app_name, Some(&output_path), false, false)
+                .await?;
             return Ok(true);
         } else if !self.non_interactive {
             let (package_id, _) = crate::utils::prompts::prompt_for_package(
@@ -303,7 +330,8 @@ impl CmdAppCreate {
 
             let app_config = self.get_app_config(owner, app_name, &package_id.to_string());
             write_app_config(&app_config, Some(output_path.clone())).await?;
-            self.try_deploy(owner, app_name, Some(&output_path)).await?;
+            self.try_deploy(owner, app_name, Some(&output_path), false, false)
+                .await?;
             return Ok(true);
         } else {
             eprintln!(
@@ -359,10 +387,10 @@ impl CmdAppCreate {
         // Fetch the first page.
         // If first item matches, then no need to re-fetch.
         //
-        let stream = wasmer_api::query::fetch_all_app_templates_from_language(
+        let stream = wasmer_backend_api::query::fetch_all_app_templates_from_language(
             client,
             10,
-            Some(wasmer_api::types::AppTemplatesSortBy::Newest),
+            Some(wasmer_backend_api::types::AppTemplatesSortBy::Newest),
             language.to_string(),
         );
 
@@ -446,7 +474,7 @@ impl CmdAppCreate {
         // Either no cache present, or cache has exceeded max age.
         // Fetch the first page.
         // If first item matches, then no need to re-fetch.
-        let mut stream = Box::pin(wasmer_api::query::fetch_all_app_template_languages(
+        let mut stream = Box::pin(wasmer_backend_api::query::fetch_all_app_template_languages(
             client, None,
         ));
 
@@ -489,7 +517,8 @@ impl CmdAppCreate {
             if let Ok(url) = url::Url::parse(template) {
                 url
             } else if let Some(template) =
-                wasmer_api::query::fetch_app_template_from_slug(client, template.clone()).await?
+                wasmer_backend_api::query::fetch_app_template_from_slug(client, template.clone())
+                    .await?
             {
                 url::Url::parse(&template.repo_url)?
             } else {
@@ -685,6 +714,9 @@ impl CmdAppCreate {
             AppConfigV1::parse_yaml(&raw_app)?;
 
             tokio::fs::write(&app_yaml_path, raw_app).await?;
+        } else {
+            let app_config = minimal_app_config(owner, app_name);
+            write_app_config(&app_config, Some(output_path.clone())).await?;
         }
 
         let build_md_path = output_path.join("BUILD.md");
@@ -710,7 +742,8 @@ the app:\n"
                 format!("{bin_name} deploy").bold()
             )
         } else {
-            self.try_deploy(owner, app_name, Some(&output_path)).await?;
+            self.try_deploy(owner, app_name, Some(&output_path), false, false)
+                .await?;
         }
 
         Ok(true)
@@ -721,16 +754,23 @@ the app:\n"
         owner: &str,
         app_name: &str,
         path: Option<&Path>,
+        build_remote: bool,
+        skip_prompt: bool,
     ) -> anyhow::Result<()> {
         let interactive = !self.non_interactive;
         let theme = dialoguer::theme::ColorfulTheme::default();
 
-        if self.deploy_app
-            || (interactive
-                && Confirm::with_theme(&theme)
-                    .with_prompt("Do you want to deploy the app now?")
-                    .interact()?)
-        {
+        let mut should_deploy = self.deploy_app;
+
+        if skip_prompt {
+            should_deploy = true;
+        } else if !should_deploy && interactive {
+            should_deploy = Confirm::with_theme(&theme)
+                .with_prompt("Do you want to deploy the app now?")
+                .interact()?;
+        }
+
+        if should_deploy {
             let cmd_deploy = CmdAppDeploy {
                 quiet: false,
                 env: self.env.clone(),
@@ -739,7 +779,7 @@ the app:\n"
                 },
                 no_validate: false,
                 non_interactive: self.non_interactive,
-                publish_package: true,
+                publish_package: !build_remote,
                 dir: self.app_dir_path.clone(),
                 path: path.map(|v| v.to_path_buf()),
                 no_wait: self.no_wait,
@@ -748,9 +788,11 @@ the app:\n"
                 owner: Some(String::from(owner)),
                 app_name: Some(app_name.into()),
                 bump: false,
+                build_remote,
                 template: None,
                 package: None,
                 use_local_manifest: self.use_local_manifest,
+                ensure_app_config: true,
             };
             cmd_deploy.run_async().await?;
         }
@@ -797,21 +839,56 @@ impl AsyncCliCommand for CmdAppCreate {
                         .await?;
                 } else {
                     let theme = ColorfulTheme::default();
+                    let working_dir = if let Some(dir) = &self.app_dir_path {
+                        dir.clone()
+                    } else {
+                        std::env::current_dir()?
+                    };
+
+                    let remote_option_available = working_dir.is_dir()
+                        && std::fs::read_dir(&working_dir)?.next().is_some()
+                        && !working_dir.join(AppConfigV1::CANONICAL_FILE_NAME).exists()
+                        && load_package_manifest(&working_dir)?.is_none();
+
+                    let mut items = Vec::new();
+                    let mut remote_idx = None;
+                    if remote_option_available {
+                        remote_idx = Some(items.len());
+                        items.push(String::from(
+                            "Deploy the current directory with a remote build",
+                        ));
+                    }
+                    let template_idx = items.len();
+                    items.push(String::from("Start with a template"));
+                    let package_idx = items.len();
+                    items.push(String::from("Choose an existing package"));
+
                     let choice = Select::with_theme(&theme)
                         .with_prompt("What would you like to deploy?")
-                        .items(&["Start with a template", "Choose an existing package"])
+                        .items(&items)
                         .default(0)
                         .interact()?;
-                    match choice {
-                        0 => {
-                            self.create_from_template(client.as_ref(), &owner, &app_name)
-                                .await?
-                        }
-                        1 => {
-                            self.create_from_package(client.as_ref(), &owner, &app_name)
-                                .await?
-                        }
-                        x => panic!("unhandled selection {x}"),
+
+                    if remote_idx.is_some() && Some(choice) == remote_idx {
+                        let app_config = minimal_app_config(owner.as_str(), app_name.as_str());
+                        write_app_config(&app_config, Some(working_dir.clone())).await?;
+                        self.try_deploy(
+                            owner.as_str(),
+                            app_name.as_str(),
+                            Some(&working_dir),
+                            true,
+                            true,
+                        )
+                        .await?;
+                        return Ok(());
+                    } else if choice == template_idx {
+                        self.create_from_template(client.as_ref(), &owner, &app_name)
+                            .await?
+                    } else if choice == package_idx {
+                        self.create_from_package(client.as_ref(), &owner, &app_name)
+                            .await?
+                    } else {
+                        panic!("unhandled selection {choice}");
                     };
                 }
             } else {

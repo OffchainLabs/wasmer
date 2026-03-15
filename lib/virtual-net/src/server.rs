@@ -5,7 +5,6 @@ use crate::{
     VirtualNetworking, VirtualRawSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
 };
 use crate::{IpCidr, IpRoute, NetworkError, StreamSecurity, VirtualIcmpSocket};
-use derivative::Derivative;
 use futures_util::stream::FuturesOrdered;
 #[cfg(any(feature = "hyper", feature = "tokio-tungstenite"))]
 use futures_util::stream::{SplitSink, SplitStream};
@@ -17,6 +16,7 @@ use std::net::IpAddr;
 use std::task::Waker;
 use std::time::Duration;
 
+#[cfg(feature = "hyper")]
 use hyper_util::rt::tokio::TokioIo;
 use std::{
     collections::HashMap,
@@ -1222,6 +1222,7 @@ impl RemoteNetworkingServerDriver {
     }
 }
 
+#[derive(Debug)]
 enum RemoteAdapterSocket {
     TcpListener {
         socket: Box<dyn VirtualTcpListener + Sync + 'static>,
@@ -1455,7 +1456,7 @@ impl RemoteAdapterSocket {
                 Self::TcpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv(&mut chunk) {
+                    match this.try_recv(&mut chunk, false) {
                         Ok(0) => {}
                         Ok(amt) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1475,7 +1476,7 @@ impl RemoteAdapterSocket {
                 Self::UdpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv_from(&mut chunk) {
+                    match this.try_recv_from(&mut chunk, false) {
                         Ok((0, _)) => {}
                         Ok((amt, addr)) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1496,7 +1497,7 @@ impl RemoteAdapterSocket {
                 Self::IcmpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv_from(&mut chunk) {
+                    match this.try_recv_from(&mut chunk, false) {
                         Ok((0, _)) => {}
                         Ok((amt, addr)) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1517,7 +1518,7 @@ impl RemoteAdapterSocket {
                 Self::RawSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv(&mut chunk) {
+                    match this.try_recv(&mut chunk, false) {
                         Ok(0) => {}
                         Ok(amt) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1615,14 +1616,10 @@ impl InterestHandler for RemoteAdapterHandler {
 
 type SocketMap<T> = HashMap<SocketId, T>;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 struct RemoteAdapterCommon {
-    #[derivative(Debug = "ignore")]
     tx: RemoteTx<MessageResponse>,
-    #[derivative(Debug = "ignore")]
     rx: Mutex<RemoteRx<MessageRequest>>,
-    #[derivative(Debug = "ignore")]
     sockets: Mutex<SocketMap<RemoteAdapterSocket>>,
     socket_accept: Mutex<SocketMap<SocketId>>,
     handler: RemoteAdapterHandler,

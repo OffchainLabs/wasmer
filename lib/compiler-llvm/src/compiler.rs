@@ -9,19 +9,29 @@ use inkwell::targets::FileType;
 use inkwell::DLLStorageClass;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::ThreadPoolBuilder;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use wasmer_compiler::{Compiler, FunctionBodyData, ModuleMiddleware, ModuleTranslationState};
-use wasmer_types::entity::{EntityRef, PrimaryMap};
-use wasmer_types::{
-    Compilation, CompileError, CompileModuleInfo, CustomSection, CustomSectionProtection, Dwarf,
-    FunctionIndex, LocalFunctionIndex, RelocationTarget, SectionBody, SectionIndex, SignatureIndex,
-    Symbol, SymbolRegistry, Target,
+use wasmer_compiler::types::function::{Compilation, UnwindInfo};
+use wasmer_compiler::types::module::CompileModuleInfo;
+use wasmer_compiler::types::relocation::RelocationKind;
+use wasmer_compiler::{
+    types::{
+        relocation::RelocationTarget,
+        section::{CustomSection, CustomSectionProtection, SectionBody, SectionIndex},
+        symbols::{Symbol, SymbolRegistry},
+    },
+    Compiler, FunctionBodyData, ModuleMiddleware, ModuleTranslationState,
 };
-
-//use std::sync::Mutex;
+use wasmer_types::entity::{EntityRef, PrimaryMap};
+use wasmer_types::target::Target;
+use wasmer_types::{CompileError, FunctionIndex, LocalFunctionIndex, ModuleInfo, SignatureIndex};
+use wasmer_vm::LibCall;
 
 /// A compiler that compiles a WebAssembly module with LLVM, translating the Wasm to LLVM IR,
 /// optimizing it and then translating to assembly.
+#[derive(Debug)]
 pub struct LLVMCompiler {
     config: LLVM,
 }
@@ -75,7 +85,85 @@ impl SymbolRegistry for ShortNames {
     }
 }
 
+struct ModuleBasedSymbolRegistry {
+    wasm_module: Arc<ModuleInfo>,
+    local_func_names: HashMap<String, LocalFunctionIndex>,
+    short_names: ShortNames,
+}
+
+impl ModuleBasedSymbolRegistry {
+    const PROBLEMATIC_PREFIXES: &[&'static str] = &[
+        ".L",    // .L is used for local symbols
+        "llvm.", // llvm. is used for LLVM's own intrinsics
+    ];
+
+    fn new(wasm_module: Arc<ModuleInfo>) -> Self {
+        let local_func_names = HashMap::from_iter(
+            wasm_module
+                .function_names
+                .iter()
+                .map(|(f, v)| (wasm_module.local_func_index(*f), v))
+                .filter(|(f, _)| f.is_some())
+                .map(|(f, v)| (format!("{}_{}", v.clone(), f.unwrap().as_u32()), f.unwrap())),
+        );
+        Self {
+            wasm_module,
+            local_func_names,
+            short_names: ShortNames {},
+        }
+    }
+
+    // If the name starts with a problematic prefix, we prefix it with an underscore.
+    fn fixup_problematic_name(name: &str) -> Cow<str> {
+        for prefix in Self::PROBLEMATIC_PREFIXES {
+            if name.starts_with(prefix) {
+                return format!("_{name}").into();
+            }
+        }
+        name.into()
+    }
+
+    // If the name starts with an underscore and the rest starts with a problematic prefix,
+    // remove the underscore to get back the original name. This is necessary to be able
+    // to match the name back to the original name in the wasm module.
+    fn unfixup_problematic_name(name: &str) -> &str {
+        if let Some(stripped_name) = name.strip_prefix('_') {
+            for prefix in Self::PROBLEMATIC_PREFIXES {
+                if stripped_name.starts_with(prefix) {
+                    return stripped_name;
+                }
+            }
+        }
+
+        name
+    }
+}
+
+impl SymbolRegistry for ModuleBasedSymbolRegistry {
+    fn symbol_to_name(&self, symbol: Symbol) -> String {
+        match symbol {
+            Symbol::LocalFunction(index) => self
+                .wasm_module
+                .function_names
+                .get(&self.wasm_module.func_index(index))
+                .map(|name| format!("{}_{}", Self::fixup_problematic_name(name), index.as_u32()))
+                .unwrap_or(self.short_names.symbol_to_name(symbol)),
+            _ => self.short_names.symbol_to_name(symbol),
+        }
+    }
+
+    fn name_to_symbol(&self, name: &str) -> Option<Symbol> {
+        let name = Self::unfixup_problematic_name(name);
+        if let Some(idx) = self.local_func_names.get(name) {
+            Some(Symbol::LocalFunction(*idx))
+        } else {
+            self.short_names.name_to_symbol(name)
+        }
+    }
+}
+
 impl LLVMCompiler {
+    #[allow(clippy::too_many_arguments)]
     fn compile_native_object(
         &self,
         target: &Target,
@@ -84,6 +172,7 @@ impl LLVMCompiler {
         function_body_inputs: &PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
         symbol_registry: &dyn SymbolRegistry,
         wasmer_metadata: &[u8],
+        binary_format: target_lexicon::BinaryFormat,
     ) -> Result<Vec<u8>, CompileError> {
         let target_machine = self.config().target_machine(target);
         let ctx = Context::create();
@@ -93,7 +182,7 @@ impl LLVMCompiler {
         let merged_bitcode = function_body_inputs.into_iter().par_bridge().map_init(
             || {
                 let target_machine = self.config().target_machine(target);
-                FuncTranslator::new(target_machine)
+                FuncTranslator::new(target_machine, binary_format).unwrap()
             },
             |func_translator, (i, input)| {
                 let module = func_translator.translate_to_module(
@@ -106,6 +195,7 @@ impl LLVMCompiler {
                     &compile_info.table_styles,
                     symbol_registry,
                 )?;
+
                 Ok(module.write_bitcode_to_memory().as_slice().to_vec())
             },
         );
@@ -113,11 +203,16 @@ impl LLVMCompiler {
         let trampolines_bitcode = compile_info.module.signatures.iter().par_bridge().map_init(
             || {
                 let target_machine = self.config().target_machine(target);
-                FuncTrampoline::new(target_machine)
+                FuncTrampoline::new(target_machine, binary_format).unwrap()
             },
             |func_trampoline, (i, sig)| {
                 let name = symbol_registry.symbol_to_name(Symbol::FunctionCallTrampoline(i));
-                let module = func_trampoline.trampoline_to_module(sig, self.config(), &name)?;
+                let module = func_trampoline.trampoline_to_module(
+                    sig,
+                    self.config(),
+                    &name,
+                    compile_info,
+                )?;
                 Ok(module.write_bitcode_to_memory().as_slice().to_vec())
             },
         );
@@ -127,7 +222,7 @@ impl LLVMCompiler {
                 || {
                     let target_machine = self.config().target_machine(target);
                     (
-                        FuncTrampoline::new(target_machine),
+                        FuncTrampoline::new(target_machine, binary_format).unwrap(),
                         &compile_info.module.signatures,
                     )
                 },
@@ -172,7 +267,7 @@ impl LLVMCompiler {
         let metadata_gv = merged_module.add_global(
             metadata_init.get_type(),
             None,
-            &symbol_registry.symbol_to_name(wasmer_types::Symbol::Metadata),
+            &symbol_registry.symbol_to_name(wasmer_compiler::types::symbols::Symbol::Metadata),
         );
         metadata_gv.set_initializer(&metadata_init);
         metadata_gv.set_linkage(Linkage::DLLExport);
@@ -190,6 +285,7 @@ impl LLVMCompiler {
             callbacks.obj_memory_buffer(&CompiledKind::Module, &memory_buffer);
         }
 
+        tracing::trace!("Finished compling the module!");
         Ok(memory_buffer.as_slice().to_vec())
     }
 }
@@ -197,6 +293,28 @@ impl LLVMCompiler {
 impl Compiler for LLVMCompiler {
     fn name(&self) -> &str {
         "llvm"
+    }
+
+    fn get_perfmap_enabled(&self) -> bool {
+        self.config.enable_perfmap
+    }
+
+    fn deterministic_id(&self) -> String {
+        let mut ret = format!(
+            "llvm-{}",
+            match self.config.opt_level {
+                inkwell::OptimizationLevel::None => "opt0",
+                inkwell::OptimizationLevel::Less => "optl",
+                inkwell::OptimizationLevel::Default => "optd",
+                inkwell::OptimizationLevel::Aggressive => "opta",
+            }
+        );
+
+        if self.config.enable_g0m0_opt {
+            ret.push_str("-g0m0");
+        }
+
+        ret
     }
 
     /// Get the middlewares for this compiler
@@ -222,6 +340,7 @@ impl Compiler for LLVMCompiler {
             function_body_inputs,
             symbol_registry,
             wasmer_metadata,
+            self.config.target_binary_format(target),
         ))
     }
 
@@ -235,41 +354,94 @@ impl Compiler for LLVMCompiler {
         function_body_inputs: PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
     ) -> Result<Compilation, CompileError> {
         //let data = Arc::new(Mutex::new(0));
+
         let memory_styles = &compile_info.memory_styles;
         let table_styles = &compile_info.table_styles;
+        let binary_format = self.config.target_binary_format(target);
 
         let module = &compile_info.module;
 
         // TODO: merge constants in sections.
 
         let mut module_custom_sections = PrimaryMap::new();
-        let mut frame_section_bytes = vec![];
-        let mut frame_section_relocations = vec![];
-        let functions = function_body_inputs
-            .iter()
-            .collect::<Vec<(LocalFunctionIndex, &FunctionBodyData<'_>)>>()
-            .par_iter()
-            .map_init(
-                || {
-                    let target_machine = self.config().target_machine(target);
-                    FuncTranslator::new(target_machine)
-                },
-                |func_translator, (i, input)| {
+
+        let mut eh_frame_section_bytes = vec![];
+        let mut eh_frame_section_relocations = vec![];
+
+        let mut compact_unwind_section_bytes = vec![];
+        let mut compact_unwind_section_relocations = vec![];
+
+        let mut got_targets: HashSet<wasmer_compiler::types::relocation::RelocationTarget> = if matches!(
+            target.triple().binary_format,
+            target_lexicon::BinaryFormat::Macho
+        ) {
+            HashSet::from_iter(vec![RelocationTarget::LibCall(LibCall::EHPersonality)])
+        } else {
+            HashSet::default()
+        };
+
+        let symbol_registry = ModuleBasedSymbolRegistry::new(module.clone());
+
+        let functions = if self.config.num_threads.get() > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(self.config.num_threads.get())
+                .build()
+                .map_err(|e| CompileError::Resource(e.to_string()))?;
+            pool.install(|| {
+                function_body_inputs
+                    .iter()
+                    .collect::<Vec<(LocalFunctionIndex, &FunctionBodyData<'_>)>>()
+                    .par_iter()
+                    .map_init(
+                        || {
+                            let target_machine = self.config().target_machine(target);
+                            FuncTranslator::new(target_machine, binary_format).unwrap()
+                        },
+                        |func_translator, (i, input)| {
+                            // TODO: remove (to serialize)
+                            //let _data = data.lock().unwrap();
+
+                            func_translator.translate(
+                                module,
+                                module_translation,
+                                i,
+                                input,
+                                self.config(),
+                                memory_styles,
+                                table_styles,
+                                &symbol_registry,
+                            )
+                        },
+                    )
+                    .collect::<Result<Vec<_>, CompileError>>()
+            })?
+        } else {
+            let target_machine = self.config().target_machine(target);
+            let func_translator = FuncTranslator::new(target_machine, binary_format).unwrap();
+
+            function_body_inputs
+                .iter()
+                .collect::<Vec<(LocalFunctionIndex, &FunctionBodyData<'_>)>>()
+                .into_iter()
+                .map(|(i, input)| {
                     // TODO: remove (to serialize)
                     //let _data = data.lock().unwrap();
+
                     func_translator.translate(
                         module,
                         module_translation,
-                        i,
+                        &i,
                         input,
                         self.config(),
                         memory_styles,
                         table_styles,
-                        &ShortNames {},
+                        &symbol_registry,
                     )
-                },
-            )
-            .collect::<Result<Vec<_>, CompileError>>()?
+                })
+                .collect::<Result<Vec<_>, CompileError>>()?
+        };
+
+        let functions = functions
             .into_iter()
             .map(|mut compiled_function| {
                 let first_section = module_custom_sections.len() as u32;
@@ -282,20 +454,44 @@ impl Compiler for LLVMCompiler {
                                 SectionIndex::from_u32(first_section + index.as_u32()),
                             )
                         }
+
+                        if reloc.kind.needs_got() {
+                            got_targets.insert(reloc.reloc_target);
+                        }
                     }
+
                     if compiled_function
                         .eh_frame_section_indices
                         .contains(&section_index)
                     {
-                        let offset = frame_section_bytes.len() as u32;
+                        let offset = eh_frame_section_bytes.len() as u32;
                         for reloc in &mut custom_section.relocations {
                             reloc.offset += offset;
                         }
-                        frame_section_bytes.extend_from_slice(custom_section.bytes.as_slice());
-                        frame_section_relocations.extend(custom_section.relocations);
+                        eh_frame_section_bytes.extend_from_slice(custom_section.bytes.as_slice());
+                        eh_frame_section_relocations.extend(custom_section.relocations);
                         // TODO: we do this to keep the count right, remove it.
                         module_custom_sections.push(CustomSection {
                             protection: CustomSectionProtection::Read,
+                            alignment: None,
+                            bytes: SectionBody::new_with_vec(vec![]),
+                            relocations: vec![],
+                        });
+                    } else if compiled_function
+                        .compact_unwind_section_indices
+                        .contains(&section_index)
+                    {
+                        let offset = compact_unwind_section_bytes.len() as u32;
+                        for reloc in &mut custom_section.relocations {
+                            reloc.offset += offset;
+                        }
+                        compact_unwind_section_bytes
+                            .extend_from_slice(custom_section.bytes.as_slice());
+                        compact_unwind_section_relocations.extend(custom_section.relocations);
+                        // TODO: we do this to keep the count right, remove it.
+                        module_custom_sections.push(CustomSection {
+                            protection: CustomSectionProtection::Read,
+                            alignment: None,
                             bytes: SectionBody::new_with_vec(vec![]),
                             relocations: vec![],
                         });
@@ -309,67 +505,178 @@ impl Compiler for LLVMCompiler {
                             SectionIndex::from_u32(first_section + index.as_u32()),
                         )
                     }
+
+                    if reloc.kind.needs_got() {
+                        got_targets.insert(reloc.reloc_target);
+                    }
                 }
                 compiled_function.compiled_function
             })
             .collect::<PrimaryMap<LocalFunctionIndex, _>>();
 
-        let dwarf = if !frame_section_bytes.is_empty() {
-            let dwarf = Some(Dwarf::new(SectionIndex::from_u32(
-                module_custom_sections.len() as u32,
-            )));
-            // Do not terminate dwarf info with a zero-length CIE.
-            // Because more info will be added later
-            // in lib/object/src/module.rs emit_compilation
+        let mut unwind_info = UnwindInfo::default();
+
+        if !eh_frame_section_bytes.is_empty() {
+            let eh_frame_idx = SectionIndex::from_u32(module_custom_sections.len() as u32);
+            // Terminate the eh_frame info with a zero-length CIE.
+            //
+            // There may be more info added later in lib/object/src/module.rs emit_compilation
+            // but that's okay, because an eh_frame can have multiple CIEs.
+            eh_frame_section_bytes.extend_from_slice(&[0, 0, 0, 0]);
             module_custom_sections.push(CustomSection {
                 protection: CustomSectionProtection::Read,
-                bytes: SectionBody::new_with_vec(frame_section_bytes),
-                relocations: frame_section_relocations,
+                alignment: None,
+                bytes: SectionBody::new_with_vec(eh_frame_section_bytes),
+                relocations: eh_frame_section_relocations,
             });
-            dwarf
+            unwind_info.eh_frame = Some(eh_frame_idx);
+        }
+
+        if !compact_unwind_section_bytes.is_empty() {
+            let cu_index = SectionIndex::from_u32(module_custom_sections.len() as u32);
+            module_custom_sections.push(CustomSection {
+                protection: CustomSectionProtection::Read,
+                alignment: None,
+                bytes: SectionBody::new_with_vec(compact_unwind_section_bytes),
+                relocations: compact_unwind_section_relocations,
+            });
+            unwind_info.compact_unwind = Some(cu_index);
+        }
+
+        let function_call_trampolines = if self.config.num_threads.get() > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(self.config.num_threads.get())
+                .build()
+                .map_err(|e| CompileError::Resource(e.to_string()))?;
+            pool.install(|| {
+                module
+                    .signatures
+                    .values()
+                    .collect::<Vec<_>>()
+                    .par_iter()
+                    .map_init(
+                        || {
+                            let target_machine = self.config().target_machine(target);
+                            FuncTrampoline::new(target_machine, binary_format).unwrap()
+                        },
+                        |func_trampoline, sig| {
+                            func_trampoline.trampoline(sig, self.config(), "", compile_info)
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .collect::<Result<PrimaryMap<_, _>, CompileError>>()
+            })?
         } else {
-            None
+            let target_machine = self.config().target_machine(target);
+            let func_trampoline = FuncTrampoline::new(target_machine, binary_format).unwrap();
+            module
+                .signatures
+                .values()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|sig| func_trampoline.trampoline(sig, self.config(), "", compile_info))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<PrimaryMap<_, _>, CompileError>>()?
         };
 
-        let function_call_trampolines = module
-            .signatures
-            .values()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map_init(
-                || {
-                    let target_machine = self.config().target_machine(target);
-                    FuncTrampoline::new(target_machine)
-                },
-                |func_trampoline, sig| func_trampoline.trampoline(sig, self.config(), ""),
-            )
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect::<Result<PrimaryMap<_, _>, CompileError>>()?;
+        let dynamic_function_trampolines = if self.config.num_threads.get() > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(self.config.num_threads.get())
+                .build()
+                .map_err(|e| CompileError::Resource(e.to_string()))?;
+            pool.install(|| {
+                module
+                    .imported_function_types()
+                    .collect::<Vec<_>>()
+                    .par_iter()
+                    .map_init(
+                        || {
+                            let target_machine = self.config().target_machine(target);
+                            FuncTrampoline::new(target_machine, binary_format).unwrap()
+                        },
+                        |func_trampoline, func_type| {
+                            func_trampoline.dynamic_trampoline(func_type, self.config(), "")
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .collect::<Result<PrimaryMap<_, _>, CompileError>>()
+            })?
+        } else {
+            let target_machine = self.config().target_machine(target);
+            let func_trampoline = FuncTrampoline::new(target_machine, binary_format).unwrap();
+            module
+                .imported_function_types()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|func_type| func_trampoline.dynamic_trampoline(&func_type, self.config(), ""))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<PrimaryMap<_, _>, CompileError>>()?
+        };
 
-        let dynamic_function_trampolines = module
-            .imported_function_types()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map_init(
-                || {
-                    let target_machine = self.config().target_machine(target);
-                    FuncTrampoline::new(target_machine)
-                },
-                |func_trampoline, func_type| {
-                    func_trampoline.dynamic_trampoline(func_type, self.config(), "")
-                },
-            )
-            .collect::<Result<Vec<_>, CompileError>>()?
-            .into_iter()
-            .collect::<PrimaryMap<_, _>>();
+        let mut got = wasmer_compiler::types::function::GOT::empty();
 
+        if !got_targets.is_empty() {
+            let pointer_width = target
+                .triple()
+                .pointer_width()
+                .map_err(|_| CompileError::Codegen("Could not get pointer width".to_string()))?;
+
+            let got_entry_size = match pointer_width {
+                target_lexicon::PointerWidth::U64 => 8,
+                target_lexicon::PointerWidth::U32 => 4,
+                target_lexicon::PointerWidth::U16 => todo!(),
+            };
+
+            let got_entry_reloc_kind = match pointer_width {
+                target_lexicon::PointerWidth::U64 => RelocationKind::Abs8,
+                target_lexicon::PointerWidth::U32 => RelocationKind::Abs4,
+                target_lexicon::PointerWidth::U16 => todo!(),
+            };
+
+            let got_data: Vec<u8> = vec![0; got_targets.len() * got_entry_size];
+            let mut got_relocs = vec![];
+
+            for (i, target) in got_targets.into_iter().enumerate() {
+                got_relocs.push(wasmer_compiler::types::relocation::Relocation {
+                    kind: got_entry_reloc_kind,
+                    reloc_target: target,
+                    offset: (i * got_entry_size) as u32,
+                    addend: 0,
+                });
+            }
+
+            let got_idx = SectionIndex::from_u32(module_custom_sections.len() as u32);
+            module_custom_sections.push(CustomSection {
+                protection: CustomSectionProtection::Read,
+                alignment: None,
+                bytes: SectionBody::new_with_vec(got_data),
+                relocations: got_relocs,
+            });
+            got.index = Some(got_idx);
+        };
+
+        tracing::trace!("Finished compling the module!");
         Ok(Compilation {
             functions,
             custom_sections: module_custom_sections,
             function_call_trampolines,
             dynamic_function_trampolines,
-            debug: dwarf,
+            unwind_info,
+            got,
         })
+    }
+
+    fn with_opts(
+        &mut self,
+        suggested_compiler_opts: &wasmer_types::target::UserCompilerOptimizations,
+    ) -> Result<(), CompileError> {
+        if suggested_compiler_opts.pass_params.is_some_and(|v| v) {
+            self.config.enable_g0m0_opt = true;
+        }
+        Ok(())
     }
 }

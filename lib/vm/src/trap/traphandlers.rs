@@ -1,11 +1,13 @@
 // This file contains code from external sources.
 // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
+#![allow(static_mut_refs)]
+
 //! WebAssembly trap handling, which is built on top of the lower-level
 //! signalhandling mechanisms.
 
 use crate::vmcontext::{VMFunctionContext, VMTrampoline};
-use crate::{Trap, VMFunctionBody};
+use crate::{Trap, VMContext, VMFunctionBody};
 use backtrace::Backtrace;
 use core::ptr::{read, read_unaligned};
 use corosensei::stack::DefaultStack;
@@ -21,7 +23,7 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{compiler_fence, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 use wasmer_types::TrapCode;
 
 /// Configuration for the runtime VM
@@ -75,7 +77,7 @@ use libc::ucontext_t;
 
 /// Default stack size is 1MB.
 pub fn set_stack_size(size: usize) {
-    DEFAULT_STACK_SIZE.store(size.max(8 * 1024).min(100 * 1024 * 1024), Ordering::Relaxed);
+    DEFAULT_STACK_SIZE.store(size.clamp(8 * 1024, 100 * 1024 * 1024), Ordering::Relaxed);
 }
 
 cfg_if::cfg_if! {
@@ -234,7 +236,7 @@ cfg_if::cfg_if! {
                 libc::SIGBUS => &PREV_SIGBUS,
                 libc::SIGFPE => &PREV_SIGFPE,
                 libc::SIGILL => &PREV_SIGILL,
-                _ => panic!("unknown signal: {}", signum),
+                _ => panic!("unknown signal: {signum}"),
             };
             // We try to get the fault address associated to this signal
             let maybe_fault_address = match signum {
@@ -339,6 +341,9 @@ cfg_if::cfg_if! {
                 } else if #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))] {
                     pc = context.uc_mcontext.mc_gpregs.gp_elr as usize;
                     sp = context.uc_mcontext.mc_gpregs.gp_sp as usize;
+                } else if #[cfg(all(target_os = "linux", target_arch = "loongarch64"))] {
+                    pc = context.uc_mcontext.__gregs[1] as usize;
+                    sp = context.uc_mcontext.__gregs[3] as usize;
                 } else {
                     compile_error!("Unsupported platform");
                 }
@@ -459,6 +464,14 @@ cfg_if::cfg_if! {
                     context.uc_mcontext.mc_gpregs.gp_x[1] = x1 as libc::register_t;
                     context.uc_mcontext.mc_gpregs.gp_x[29] = x29 as libc::register_t;
                     context.uc_mcontext.mc_gpregs.gp_x[30] = lr as libc::register_t;
+                } else if #[cfg(all(target_os = "linux", target_arch = "loongarch64"))] {
+                    let TrapHandlerRegs { pc, sp, a0, a1, fp, ra } = regs;
+                    context.uc_mcontext.__pc = pc;
+                    context.uc_mcontext.__gregs[1] = ra;
+                    context.uc_mcontext.__gregs[3] = sp;
+                    context.uc_mcontext.__gregs[4] = a0;
+                    context.uc_mcontext.__gregs[5] = a1;
+                    context.uc_mcontext.__gregs[22] = fp;
                 } else {
                     compile_error!("Unsupported platform");
                 }
@@ -672,10 +685,15 @@ pub unsafe fn wasmer_call_trampoline(
     callee: *const VMFunctionBody,
     values_vec: *mut u8,
 ) -> Result<(), Trap> {
-    catch_traps(trap_handler, config, || {
-        mem::transmute::<_, extern "C" fn(VMFunctionContext, *const VMFunctionBody, *mut u8)>(
-            trampoline,
-        )(vmctx, callee, values_vec);
+    catch_traps(trap_handler, config, move || {
+        mem::transmute::<
+            unsafe extern "C" fn(
+                *mut VMContext,
+                *const VMFunctionBody,
+                *mut wasmer_types::RawValue,
+            ),
+            extern "C" fn(VMFunctionContext, *const VMFunctionBody, *mut u8),
+        >(trampoline)(vmctx, callee, values_vec);
     })
 }
 
@@ -685,13 +703,13 @@ pub unsafe fn wasmer_call_trampoline(
 /// # Safety
 ///
 /// Highly unsafe since `closure` won't have any dtors run.
-pub unsafe fn catch_traps<F, R>(
+pub unsafe fn catch_traps<F, R: 'static>(
     trap_handler: Option<*const TrapHandlerFn<'static>>,
     config: &VMConfig,
     closure: F,
 ) -> Result<R, Trap>
 where
-    F: FnOnce() -> R,
+    F: FnOnce() -> R + 'static,
 {
     // Ensure that per-thread initialization is done.
     lazy_per_thread_init()?;
@@ -710,8 +728,8 @@ where
 // We also do per-thread signal stack initialization on the first time
 // TRAP_HANDLER is accessed.
 thread_local! {
-    static YIELDER: Cell<Option<NonNull<Yielder<(), UnwindReason>>>> = Cell::new(None);
-    static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = AtomicPtr::new(ptr::null_mut());
+    static YIELDER: Cell<Option<NonNull<Yielder<(), UnwindReason>>>> = const { Cell::new(None) };
+    static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = const { AtomicPtr::new(ptr::null_mut()) };
 }
 
 /// Read-only information that is used by signal handlers to handle and recover
@@ -914,7 +932,7 @@ unsafe fn unwind_with(reason: UnwindReason) -> ! {
 /// Runs the given function on a separate stack so that its stack usage can be
 /// bounded. Stack overflows and other traps can be caught and execution
 /// returned to the root of the stack.
-fn on_wasm_stack<F: FnOnce() -> T, T>(
+fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     stack_size: usize,
     trap_handler: Option<*const TrapHandlerFn<'static>>,
     f: F,
@@ -923,16 +941,16 @@ fn on_wasm_stack<F: FnOnce() -> T, T>(
     // system calls. We therefore keep a cache of pre-allocated stacks which
     // allows them to be reused multiple times.
     // FIXME(Amanieu): We should refactor this to avoid the lock.
-    lazy_static::lazy_static! {
-        static ref STACK_POOL: crossbeam_queue::SegQueue<DefaultStack> = crossbeam_queue::SegQueue::new();
-    }
+    static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<DefaultStack>> =
+        LazyLock::new(crossbeam_queue::SegQueue::new);
+
     let stack = STACK_POOL
         .pop()
         .unwrap_or_else(|| DefaultStack::new(stack_size).unwrap());
     let mut stack = scopeguard::guard(stack, |stack| STACK_POOL.push(stack));
 
     // Create a coroutine with a new stack to run the function on.
-    let mut coro = ScopedCoroutine::with_stack(&mut *stack, move |yielder, ()| {
+    let coro = ScopedCoroutine::with_stack(&mut *stack, move |yielder, ()| {
         // Save the yielder to TLS so that it can be used later.
         YIELDER.with(|cell| cell.set(Some(yielder.into())));
 
@@ -944,20 +962,22 @@ fn on_wasm_stack<F: FnOnce() -> T, T>(
         YIELDER.with(|cell| cell.set(None));
     }
 
-    // Set up metadata for the trap handler for the duration of the coroutine
-    // execution. This is restored to its previous value afterwards.
-    TrapHandlerContext::install(trap_handler, coro.trap_handler(), || {
-        match coro.resume(()) {
-            CoroutineResult::Yield(trap) => {
-                // This came from unwind_with which requires that there be only
-                // Wasm code on the stack.
-                unsafe {
-                    coro.force_reset();
+    coro.scope(|mut coro_ref| {
+        // Set up metadata for the trap handler for the duration of the coroutine
+        // execution. This is restored to its previous value afterwards.
+        TrapHandlerContext::install(trap_handler, coro_ref.trap_handler(), || {
+            match coro_ref.resume(()) {
+                CoroutineResult::Yield(trap) => {
+                    // This came from unwind_with which requires that there be only
+                    // Wasm code on the stack.
+                    unsafe {
+                        coro_ref.force_reset();
+                    }
+                    Err(trap)
                 }
-                Err(trap)
+                CoroutineResult::Return(result) => result,
             }
-            CoroutineResult::Return(result) => result,
-        }
+        })
     })
 }
 

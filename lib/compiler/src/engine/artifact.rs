@@ -1,49 +1,55 @@
 //! Define `Artifact`, based on `ArtifactBuild`
 //! to allow compiling and instantiating to be done as separate steps.
 
-use crate::engine::link::link_module;
-use crate::lib::std::vec::IntoIter;
-use crate::ArtifactBuild;
-use crate::ArtifactBuildFromArchive;
-use crate::ArtifactCreate;
-use crate::Features;
-use crate::FrameInfosVariant;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering::SeqCst},
+    Arc,
+};
+
+#[cfg(feature = "compiler")]
 use crate::ModuleEnvironment;
 use crate::{
-    register_frame_info, resolve_imports, FunctionExtent, GlobalFrameInfoRegistration,
-    InstantiationError, Tunables,
+    engine::{link::link_module, resolver::resolve_tags},
+    lib::std::vec::IntoIter,
+    register_frame_info, resolve_imports,
+    serialize::{MetadataHeader, SerializableModule},
+    types::relocation::{RelocationLike, RelocationTarget},
+    ArtifactBuild, ArtifactBuildFromArchive, ArtifactCreate, Engine, EngineInner, Features,
+    FrameInfosVariant, FunctionExtent, GlobalFrameInfoRegistration, InstantiationError, Tunables,
 };
+#[cfg(any(feature = "static-artifact-create", feature = "static-artifact-load"))]
+use crate::{serialize::SerializableCompilation, types::symbols::ModuleMetadata};
 #[cfg(feature = "static-artifact-create")]
-use crate::{Compiler, FunctionBodyData, ModuleTranslationState};
-use crate::{Engine, EngineInner};
+use crate::{types::module::CompileModuleInfo, Compiler, FunctionBodyData, ModuleTranslationState};
+
 use enumset::EnumSet;
 use shared_buffer::OwnedBuffer;
+
 #[cfg(any(feature = "static-artifact-create", feature = "static-artifact-load"))]
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::Arc;
-#[cfg(feature = "static-artifact-create")]
-use wasmer_object::{emit_compilation, emit_data, get_object_for_target, Object};
-#[cfg(any(feature = "static-artifact-create", feature = "static-artifact-load"))]
-use wasmer_types::compilation::symbols::ModuleMetadata;
-use wasmer_types::entity::{BoxedSlice, PrimaryMap};
-use wasmer_types::ArchivedDataInitializerLocation;
-use wasmer_types::ArchivedOwnedDataInitializer;
-#[cfg(feature = "static-artifact-create")]
-use wasmer_types::CompileModuleInfo;
-use wasmer_types::DataInitializerLike;
-use wasmer_types::DataInitializerLocation;
-use wasmer_types::DataInitializerLocationLike;
-use wasmer_types::MetadataHeader;
-use wasmer_types::{
-    CompileError, CpuFeature, DataInitializer, DeserializeError, FunctionIndex, HashAlgorithm,
-    LocalFunctionIndex, MemoryIndex, ModuleInfo, OwnedDataInitializer, SignatureIndex, TableIndex,
-    Target,
-};
-use wasmer_types::{SerializableModule, SerializeError};
-use wasmer_vm::{FunctionBodyPtr, MemoryStyle, TableStyle, VMSharedSignatureIndex, VMTrampoline};
-use wasmer_vm::{InstanceAllocator, StoreObjects, TrapHandlerFn, VMConfig, VMExtern, VMInstance};
 
+#[cfg(feature = "static-artifact-create")]
+use crate::object::{
+    emit_compilation, emit_data, get_object_for_target, Object, ObjectMetadataBuilder,
+};
+
+#[cfg(feature = "compiler")]
+use wasmer_types::HashAlgorithm;
+use wasmer_types::{
+    entity::{BoxedSlice, PrimaryMap},
+    target::{CpuFeature, Target},
+    ArchivedDataInitializerLocation, ArchivedOwnedDataInitializer, CompileError, DataInitializer,
+    DataInitializerLike, DataInitializerLocation, DataInitializerLocationLike, DeserializeError,
+    FunctionIndex, LocalFunctionIndex, MemoryIndex, ModuleInfo, OwnedDataInitializer,
+    SerializeError, SignatureIndex, TableIndex,
+};
+
+use wasmer_vm::{
+    FunctionBodyPtr, InstanceAllocator, MemoryStyle, StoreObjects, TableStyle, TrapHandlerFn,
+    VMConfig, VMExtern, VMInstance, VMSharedSignatureIndex, VMTrampoline,
+};
+
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct AllocatedArtifact {
     // This shows if the frame info has been regestered already or not.
     // Because the 'GlobalFrameInfoRegistration' ownership can be transfered to EngineInner
@@ -55,6 +61,8 @@ pub struct AllocatedArtifact {
     // so the GloabelFrameInfo and MMap stays in sync and get dropped at the same time
     frame_info_registration: Option<GlobalFrameInfoRegistration>,
     finished_functions: BoxedSlice<LocalFunctionIndex, FunctionBodyPtr>,
+
+    #[cfg_attr(feature = "artifact-size", loupe(skip))]
     finished_function_call_trampolines: BoxedSlice<SignatureIndex, VMTrampoline>,
     finished_dynamic_function_trampolines: BoxedSlice<FunctionIndex, FunctionBodyPtr>,
     signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
@@ -62,6 +70,7 @@ pub struct AllocatedArtifact {
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[repr(transparent)]
 /// A unique identifier for an Artifact.
 pub struct ArtifactId {
@@ -91,6 +100,7 @@ impl Default for ArtifactId {
 }
 
 /// A compiled wasm module, ready to be instantiated.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct Artifact {
     id: ArtifactId,
     artifact: ArtifactBuildVariant,
@@ -102,6 +112,8 @@ pub struct Artifact {
 /// Artifacts may be created as the result of the compilation of a wasm
 /// module, corresponding to `ArtifactBuildVariant::Plain`, or loaded
 /// from an archive, corresponding to `ArtifactBuildVariant::Archived`.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[allow(clippy::large_enum_variant)]
 pub enum ArtifactBuildVariant {
     Plain(ArtifactBuild),
     Archived(ArtifactBuildFromArchive),
@@ -202,10 +214,10 @@ impl Artifact {
                 Ok(v) => {
                     return Ok(v);
                 }
-                Err(_) => {
-                    return Err(DeserializeError::Incompatible(
-                        "The provided bytes are not wasmer-universal".to_string(),
-                    ));
+                Err(e) => {
+                    return Err(DeserializeError::Incompatible(format!(
+                        "The provided bytes are not wasmer-universal: {e}"
+                    )));
                 }
             }
         }
@@ -247,10 +259,10 @@ impl Artifact {
                 Ok(v) => {
                     return Ok(v);
                 }
-                Err(_) => {
-                    return Err(DeserializeError::Incompatible(
-                        "The provided bytes are not wasmer-universal".to_string(),
-                    ));
+                Err(e) => {
+                    return Err(DeserializeError::Incompatible(format!(
+                        "The provided bytes are not wasmer-universal: {e}"
+                    )));
                 }
             }
         }
@@ -319,6 +331,44 @@ impl Artifact {
             )?,
         };
 
+        let get_got_address: Box<dyn Fn(RelocationTarget) -> Option<usize>> = match &artifact {
+            ArtifactBuildVariant::Plain(ref p) => {
+                if let Some(got) = p.get_got_ref().index {
+                    let relocs: Vec<_> = p.get_custom_section_relocations_ref()[got]
+                        .iter()
+                        .map(|v| (v.reloc_target, v.offset))
+                        .collect();
+                    let got_base = custom_sections[got].0 as usize;
+                    Box::new(move |t: RelocationTarget| {
+                        relocs
+                            .iter()
+                            .find(|(v, _)| v == &t)
+                            .map(|(_, o)| got_base + (*o as usize))
+                    })
+                } else {
+                    Box::new(|_: RelocationTarget| None)
+                }
+            }
+
+            ArtifactBuildVariant::Archived(ref p) => {
+                if let Some(got) = p.get_got_ref().index {
+                    let relocs: Vec<_> = p.get_custom_section_relocations_ref()[got]
+                        .iter()
+                        .map(|v| (v.reloc_target(), v.offset))
+                        .collect();
+                    let got_base = custom_sections[got].0 as usize;
+                    Box::new(move |t: RelocationTarget| {
+                        relocs
+                            .iter()
+                            .find(|(v, _)| v == &t)
+                            .map(|(_, o)| got_base + (o.to_native() as usize))
+                    })
+                } else {
+                    Box::new(|_: RelocationTarget| None)
+                }
+            }
+        };
+
         match &artifact {
             ArtifactBuildVariant::Plain(p) => link_module(
                 module_info,
@@ -332,6 +382,7 @@ impl Artifact {
                     .map(|(k, v)| (k, v.iter())),
                 p.get_libcall_trampolines(),
                 p.get_libcall_trampoline_len(),
+                &get_got_address,
             ),
             ArtifactBuildVariant::Archived(a) => link_module(
                 module_info,
@@ -345,6 +396,7 @@ impl Artifact {
                     .map(|(k, v)| (k, v.iter())),
                 a.get_libcall_trampolines(),
                 a.get_libcall_trampoline_len(),
+                &get_got_address,
             ),
         };
 
@@ -358,32 +410,55 @@ impl Artifact {
                 .collect::<PrimaryMap<_, _>>()
         };
 
-        let debug_ref = match &artifact {
-            ArtifactBuildVariant::Plain(p) => p.get_debug_ref(),
-            ArtifactBuildVariant::Archived(a) => a.get_debug_ref(),
+        let eh_frame = match &artifact {
+            ArtifactBuildVariant::Plain(p) => p.get_unwind_info().eh_frame.map(|v| unsafe {
+                std::slice::from_raw_parts(
+                    *custom_sections[v],
+                    p.get_custom_sections_ref()[v].bytes.len(),
+                )
+            }),
+            ArtifactBuildVariant::Archived(a) => a.get_unwind_info().eh_frame.map(|v| unsafe {
+                std::slice::from_raw_parts(
+                    *custom_sections[v],
+                    a.get_custom_sections_ref()[v].bytes.len(),
+                )
+            }),
         };
-        let eh_frame = match debug_ref {
-            Some(debug) => {
-                let eh_frame_section_size = match &artifact {
-                    ArtifactBuildVariant::Plain(p) => {
-                        p.get_custom_sections_ref()[debug.eh_frame].bytes.len()
-                    }
-                    ArtifactBuildVariant::Archived(a) => {
-                        a.get_custom_sections_ref()[debug.eh_frame].bytes.len()
-                    }
-                };
-                let eh_frame_section_pointer = custom_sections[debug.eh_frame];
-                Some(unsafe {
-                    std::slice::from_raw_parts(*eh_frame_section_pointer, eh_frame_section_size)
+
+        let compact_unwind = match &artifact {
+            ArtifactBuildVariant::Plain(p) => p.get_unwind_info().compact_unwind.map(|v| unsafe {
+                std::slice::from_raw_parts(
+                    *custom_sections[v],
+                    p.get_custom_sections_ref()[v].bytes.len(),
+                )
+            }),
+            ArtifactBuildVariant::Archived(a) => {
+                a.get_unwind_info().compact_unwind.map(|v| unsafe {
+                    std::slice::from_raw_parts(
+                        *custom_sections[v],
+                        a.get_custom_sections_ref()[v].bytes.len(),
+                    )
                 })
             }
-            None => None,
         };
+
+        // This needs to be called before publishing the `eh_frame`.
+        engine_inner.register_compact_unwind(
+            compact_unwind,
+            get_got_address(RelocationTarget::LibCall(wasmer_vm::LibCall::EHPersonality)),
+        )?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            engine_inner.register_perfmap(&finished_functions, module_info)?;
+        }
 
         // Make all code compiled thus far executable.
         engine_inner.publish_compiled_code();
 
         engine_inner.publish_eh_frame(eh_frame)?;
+
+        drop(get_got_address);
 
         let finished_function_lengths = finished_functions
             .values()
@@ -417,7 +492,7 @@ impl Artifact {
 
         artifact
             .internal_register_frame_info()
-            .map_err(|e| DeserializeError::CorruptedBinary(format!("{:?}", e)))?;
+            .map_err(|e| DeserializeError::CorruptedBinary(format!("{e:?}")))?;
         if let Some(frame_info) = artifact.internal_take_frame_info_registration() {
             engine_inner.register_frame_info(frame_info);
         }
@@ -597,7 +672,7 @@ pub enum DataInitializerLocationVariant<'a> {
     Archived(&'a ArchivedDataInitializerLocation),
 }
 
-impl<'a> DataInitializerLocationVariant<'a> {
+impl DataInitializerLocationVariant<'_> {
     pub fn clone_to_plain(&self) -> DataInitializerLocation {
         match self {
             Self::Plain(p) => (*p).clone(),
@@ -610,7 +685,7 @@ impl<'a> DataInitializerLocationVariant<'a> {
     }
 }
 
-impl<'a> DataInitializerLocationLike for DataInitializerLocationVariant<'a> {
+impl DataInitializerLocationLike for DataInitializerLocationVariant<'_> {
     fn memory_index(&self) -> MemoryIndex {
         match self {
             Self::Plain(plain) => plain.memory_index(),
@@ -634,17 +709,6 @@ impl<'a> DataInitializerLocationLike for DataInitializerLocationVariant<'a> {
 }
 
 impl Artifact {
-    /// Register thie `Artifact` stack frame information into the global scope.
-    ///
-    /// This is not required anymore as it's done automaticaly when creating by 'Artifact::from_parts'
-    #[deprecated(
-        since = "4.0.0",
-        note = "done automaticaly by Artifact::from_parts, use 'take_frame_info_registration' if you use this method"
-    )]
-    pub fn register_frame_info(&mut self) -> Result<(), DeserializeError> {
-        self.internal_register_frame_info()
-    }
-
     fn internal_register_frame_info(&mut self) -> Result<(), DeserializeError> {
         if self
             .allocated
@@ -697,13 +761,6 @@ impl Artifact {
             .frame_info_registered = true;
 
         Ok(())
-    }
-
-    /// The GlobalFrameInfoRegistration needs to be transfered to EngineInner if
-    /// register_frame_info has been used.
-    #[deprecated(since = "4.0.0", note = "done automaticaly by Artifact::from_parts.")]
-    pub fn take_frame_info_registration(&mut self) -> Option<GlobalFrameInfoRegistration> {
-        self.internal_take_frame_info_registration()
     }
 
     fn internal_take_frame_info_registration(&mut self) -> Option<GlobalFrameInfoRegistration> {
@@ -788,6 +845,9 @@ impl Artifact {
         self.preinstantiate()?;
 
         let module = self.create_module_info();
+
+        let tags = resolve_tags(&module, imports, context).map_err(InstantiationError::Link)?;
+
         let imports = resolve_imports(
             &module,
             imports,
@@ -835,6 +895,7 @@ impl Artifact {
             finished_memories,
             finished_tables,
             finished_globals,
+            tags,
             imports,
             self.signatures().clone(),
         )
@@ -986,14 +1047,14 @@ impl Artifact {
             ModuleInfo,
             Object<'data>,
             usize,
-            Box<dyn wasmer_types::SymbolRegistry>,
+            Box<dyn crate::types::symbols::SymbolRegistry>,
         ),
         CompileError,
     > {
-        use wasmer_types::{compilation::symbols::ModuleMetadataSymbolRegistry, SymbolRegistry};
+        use crate::types::symbols::{ModuleMetadataSymbolRegistry, SymbolRegistry};
 
         fn to_compile_error(err: impl std::error::Error) -> CompileError {
-            CompileError::Codegen(format!("{}", err))
+            CompileError::Codegen(format!("{err}"))
         }
 
         let target_triple = target.triple();
@@ -1018,36 +1079,59 @@ impl Artifact {
         - SignatureIndex -> VMSharedSignatureindextureIndex // signatures
          */
 
-        let serialized_data = metadata.serialize().map_err(to_compile_error)?;
-        let mut metadata_binary = vec![];
-        metadata_binary.extend(MetadataHeader::new(serialized_data.len()).into_bytes());
-        metadata_binary.extend(serialized_data);
+        let mut metadata_builder =
+            ObjectMetadataBuilder::new(&metadata, target_triple).map_err(to_compile_error)?;
 
         let (_compile_info, symbol_registry) = metadata.split();
 
-        let compilation: wasmer_types::compilation::function::Compilation = compiler
-            .compile_module(
-                target,
-                &metadata.compile_info,
-                module_translation.as_ref().unwrap(),
-                function_body_inputs,
-            )?;
+        let compilation: crate::types::function::Compilation = compiler.compile_module(
+            target,
+            &metadata.compile_info,
+            module_translation.as_ref().unwrap(),
+            function_body_inputs,
+        )?;
         let mut obj = get_object_for_target(target_triple).map_err(to_compile_error)?;
 
         let object_name = ModuleMetadataSymbolRegistry {
             prefix: metadata_prefix.unwrap_or_default().to_string(),
         }
-        .symbol_to_name(wasmer_types::Symbol::Metadata);
+        .symbol_to_name(crate::types::symbols::Symbol::Metadata);
 
-        emit_data(&mut obj, object_name.as_bytes(), &metadata_binary, 1)
-            .map_err(to_compile_error)?;
+        let default_align = match target_triple.architecture {
+            target_lexicon::Architecture::Aarch64(_) => {
+                if matches!(
+                    target_triple.operating_system,
+                    target_lexicon::OperatingSystem::Darwin
+                ) {
+                    8
+                } else {
+                    4
+                }
+            }
+            _ => 1,
+        };
 
-        emit_compilation(&mut obj, compilation, &symbol_registry, target_triple)
-            .map_err(to_compile_error)?;
+        let offset = emit_data(
+            &mut obj,
+            object_name.as_bytes(),
+            metadata_builder.placeholder_data(),
+            default_align,
+        )
+        .map_err(to_compile_error)?;
+        metadata_builder.set_section_offset(offset);
+
+        emit_compilation(
+            &mut obj,
+            compilation,
+            &symbol_registry,
+            target_triple,
+            &metadata_builder,
+        )
+        .map_err(to_compile_error)?;
         Ok((
             Arc::try_unwrap(metadata.compile_info.module).unwrap(),
             obj,
-            metadata_binary.len(),
+            metadata_builder.placeholder_data().len(),
             Box::new(symbol_registry),
         ))
     }
@@ -1088,8 +1172,6 @@ impl Artifact {
         engine: &Engine,
         bytes: OwnedBuffer,
     ) -> Result<Self, DeserializeError> {
-        use wasmer_types::SerializableCompilation;
-
         let bytes = bytes.as_slice();
         let metadata_len = MetadataHeader::parse(bytes)?;
         let metadata_slice = Self::get_byte_slice(bytes, MetadataHeader::LEN, bytes.len())?;

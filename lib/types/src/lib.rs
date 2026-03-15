@@ -37,7 +37,7 @@ pub mod lib {
     #[cfg(feature = "core")]
     pub mod std {
         pub use alloc::{borrow, boxed, format, iter, rc, slice, string, vec};
-        pub use core::{any, cell, cmp, convert, fmt, hash, marker, mem, ops, ptr, sync, u32};
+        pub use core::{any, cell, cmp, convert, fmt, hash, marker, mem, ops, ptr, sync};
     }
 
     /// Custom `std` module.
@@ -45,12 +45,11 @@ pub mod lib {
     pub mod std {
         pub use std::{
             any, borrow, boxed, cell, cmp, convert, fmt, format, hash, iter, marker, mem, ops, ptr,
-            rc, slice, string, sync, u32, vec,
+            rc, slice, string, sync, vec,
         };
     }
 }
 
-pub mod compilation;
 pub mod error;
 mod features;
 mod indexes;
@@ -63,6 +62,7 @@ mod serialize;
 mod stack;
 mod store_id;
 mod table;
+pub mod target;
 mod trapcode;
 mod types;
 mod units;
@@ -70,14 +70,6 @@ mod utils;
 mod value;
 mod vmoffsets;
 
-pub use crate::compilation::target::{
-    Aarch64Architecture, Architecture, BinaryFormat, CallingConvention, CpuFeature, Endianness,
-    Environment, OperatingSystem, PointerWidth, Target, Triple, Vendor,
-};
-pub use crate::serialize::{
-    ArchivedSerializableCompilation, ArchivedSerializableModule, MetadataHeader,
-    SerializableCompilation, SerializableModule,
-};
 pub use error::{
     CompileError, DeserializeError, ImportError, MemoryError, MiddlewareError,
     ParseCpuFeatureError, PreInstantiationError, SerializeError, WasmError, WasmResult,
@@ -88,8 +80,8 @@ pub mod entity;
 pub use crate::features::Features;
 pub use crate::indexes::{
     CustomSectionIndex, DataIndex, ElemIndex, ExportIndex, FunctionIndex, GlobalIndex, ImportIndex,
-    LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex,
-    SignatureIndex, TableIndex,
+    LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, LocalTagIndex,
+    MemoryIndex, SignatureIndex, TableIndex, Tag, TagIndex,
 };
 pub use crate::initializers::{
     ArchivedDataInitializerLocation, ArchivedOwnedDataInitializer, DataInitializer,
@@ -99,46 +91,25 @@ pub use crate::initializers::{
 pub use crate::memory::{Memory32, Memory64, MemorySize};
 pub use crate::module::{ExportsIterator, ImportKey, ImportsIterator, ModuleInfo};
 pub use crate::module_hash::{HashAlgorithm, ModuleHash};
+pub use crate::types::{
+    ExportType, ExternType, FunctionType, GlobalInit, GlobalType, ImportType, MemoryType,
+    Mutability, TableType, TagKind, TagType, Type, V128,
+};
 pub use crate::units::{
     Bytes, PageCountOutOfRange, Pages, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE,
-};
-pub use types::{
-    ExportType, ExternType, FunctionType, GlobalInit, GlobalType, ImportType, MemoryType,
-    Mutability, TableType, Type, V128,
 };
 pub use value::{RawValue, ValueType};
 
 pub use crate::libcalls::LibCall;
 pub use crate::memory::MemoryStyle;
 pub use crate::table::TableStyle;
+pub use serialize::MetadataHeader;
 // TODO: OnCalledAction is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
-pub use crate::trapcode::{OnCalledAction, TrapCode};
-pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMBuiltinFunctionIndex, VMOffsets};
-
-pub use crate::utils::is_wasm;
-
-pub use crate::compilation::relocation::{
-    ArchivedRelocation, Relocation, RelocationKind, RelocationLike, RelocationTarget, Relocations,
-};
-pub use crate::compilation::section::{
-    ArchivedCustomSection, CustomSection, CustomSectionLike, CustomSectionProtection, SectionBody,
-    SectionIndex,
-};
-
-pub use crate::compilation::address_map::{FunctionAddressMap, InstructionAddressMap};
-pub use crate::compilation::function::{
-    ArchivedFunctionBody, Compilation, CompiledFunction, CompiledFunctionFrameInfo, CustomSections,
-    Dwarf, FunctionBody, FunctionBodyLike, Functions,
-};
-pub use crate::compilation::module::CompileModuleInfo;
-pub use crate::compilation::symbols::{Symbol, SymbolRegistry};
-pub use crate::compilation::unwind::{
-    ArchivedCompiledFunctionUnwindInfo, CompiledFunctionUnwindInfo, CompiledFunctionUnwindInfoLike,
-    CompiledFunctionUnwindInfoReference,
-};
-
 pub use crate::stack::{FrameInfo, SourceLoc, TrapInformation};
 pub use crate::store_id::StoreId;
+pub use crate::trapcode::{OnCalledAction, TrapCode};
+pub use crate::utils::is_wasm;
+pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMBuiltinFunctionIndex, VMOffsets};
 
 /// Offset in bytes from the beginning of the function.
 pub type CodeOffset = u32;

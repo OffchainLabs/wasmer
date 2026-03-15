@@ -6,8 +6,588 @@
 
 Looking for changes that affect our C API? See the [C API Changelog](lib/c-api/CHANGELOG.md).
 
-
 ## **Unreleased**
+
+## 6.1.0 - 08/10/2025
+
+This release adds:
+
+* The dynamic linker which, paired with [wasixcc](https://github.com/wasix-org/wasixcc),
+  can load DL modules at runtime
+* New WASIX syscalls for reflection, dynamic function invocation and closure creation;
+  this makes WASIX compatible with libffi
+* Better support for the Exception Handling proposal in the LLVM backend
+* The `--build-remote` flag for `wasmer deploy`, which lets you build packages in the
+  cloud rather than locally
+* And many more stability fixes and improvements.
+
+## Added
+
+  - [#5763](https://github.com/wasmerio/wasmer/pull/5763) chore(lib/vm): update `corosensei` to `0.3.0` to support AddressSanitizer
+  - [#5783](https://github.com/wasmerio/wasmer/pull/5783) chore(cli): package unpack command: add shortform -u
+  - [#5773](https://github.com/wasmerio/wasmer/pull/5773) feat(cli): Add loading spinner when compiling modules in TTY
+  - [#5775](https://github.com/wasmerio/wasmer/pull/5775) Add `/dev/shm` to the root filesystem
+
+## Changed
+
+  - [#5784](https://github.com/wasmerio/wasmer/pull/5784) Use wasmerignore for bundling and gitignore for remote builds
+  - [#5774](https://github.com/wasmerio/wasmer/pull/5774) SDK cleanup
+  - [#5770](https://github.com/wasmerio/wasmer/pull/5770) Make table methods don’t fail in the browser
+  - [#5776](https://github.com/wasmerio/wasmer/pull/5776) chore(cli): Provide fallback login instructions in login command
+  - [#5769](https://github.com/wasmerio/wasmer/pull/5769) Promote async-trait to a workspace dependency
+  - [#5743](https://github.com/wasmerio/wasmer/pull/5743) CLI: wasmer deploy --build-remote
+  - [#5526](https://github.com/wasmerio/wasmer/pull/5526) feat(wasix): Improve module loading performance and API correctness
+
+## Fixed
+
+  - [#5789](https://github.com/wasmerio/wasmer/pull/5789) fix(cli): Improve behaviour for deployments without wasmer.toml
+  - [#5761](https://github.com/wasmerio/wasmer/pull/5761) Fix deadlocks in Selector
+  - [#5780](https://github.com/wasmerio/wasmer/pull/5780) Fix/eh nested catch ref
+  - [#5779](https://github.com/wasmerio/wasmer/pull/5779) Linker: fix dlsym'ing functions from the main modules when there are …
+  - [#5757](https://github.com/wasmerio/wasmer/pull/5757) Fix order of arguments when spawning processes from WASI
+  - [#5756](https://github.com/wasmerio/wasmer/pull/5756) Fix stalling issue when using shared libraries
+  - [#5745](https://github.com/wasmerio/wasmer/pull/5745) fix(wasix): Linker must re-use the same Engine
+  - [#5752](https://github.com/wasmerio/wasmer/pull/5752) LLVM: Fix compilation breaking for modules with function names that have sp…
+
+## 6.1.0-rc.5 - 16/09/2025
+This release includes better support for the Exception Handling proposal in LLVM,
+as well as fixes to the linker and other stability fixes.
+
+## Added
+
+## Changed
+
+  - [#5724](https://github.com/wasmerio/wasmer/pull/5724) Singlepass: simplify dynamic regs usage
+  - [#5715](https://github.com/wasmerio/wasmer/pull/5715) feat(cli): App-specific SSH sessions
+  - [#5707](https://github.com/wasmerio/wasmer/pull/5707) compiler: Ensure unique function symbols by appending function index
+  - [#5703](https://github.com/wasmerio/wasmer/pull/5703) Simplify unwind
+  - [#5741](https://github.com/wasmerio/wasmer/pull/5741) Replace serde_yml with serde_yaml
+
+## Fixed
+
+  - [#5726](https://github.com/wasmerio/wasmer/pull/5726) Multiple fixes to EH codegen
+  - [#5736](https://github.com/wasmerio/wasmer/pull/5736) LLVM codegen: truncate stack to correct size when leaving a WASM block
+  - [#5701](https://github.com/wasmerio/wasmer/pull/5701) fix(config): Add missing skip_serializing_if for ssh capability
+  - [#5716](https://github.com/wasmerio/wasmer/pull/5716) Fix impossible relocation error in emit srem64, urem64 for singlepass compiler/Aarch64
+  - [#5700](https://github.com/wasmerio/wasmer/pull/5700) fix(DynamicFunction): allocate space for trap on host stack
+  - [#5706](https://github.com/wasmerio/wasmer/pull/5706) Fix caching dlsym results in the linker
+  - [#5699](https://github.com/wasmerio/wasmer/pull/5699) Fix synchronizing load of multiple modules with internal table space and GOT.func entries
+
+
+
+## 6.1.0-rc.3 - 20/08/2025
+This release introduces a new reflection syscall for WASIX, RUNTIME_PATH support for
+dynamically-loaded modules, as well as many fixes and improvements across the board.
+
+## Added
+
+  - [#5695](https://github.com/wasmerio/wasmer/pull/5695) Implement RUNTIME_PATH support in the linker
+  - [#5653](https://github.com/wasmerio/wasmer/pull/5653) Implement a reflection API in WASIX
+  - [#5697](https://github.com/wasmerio/wasmer/pull/5697) Add WASIX DL tests
+  - [#5689](https://github.com/wasmerio/wasmer/pull/5689) feat(config): Add CapabilitySshServerV1 to app config
+  - [#5618](https://github.com/wasmerio/wasmer/pull/5618) Add ModuleCache::contains() + make compilation opts hashable
+
+## Changed
+
+  - [#5634](https://github.com/wasmerio/wasmer/pull/5634) Improve thread error handling
+  - [#5679](https://github.com/wasmerio/wasmer/pull/5679) Call __wasm_apply_tls_relocs during first load of each module
+  - [#5693](https://github.com/wasmerio/wasmer/pull/5693) chore(ci): upgrade checkout to v5
+  - [#5673](https://github.com/wasmerio/wasmer/pull/5673) Enable the "all" feature for socket2.
+  - [#5515](https://github.com/wasmerio/wasmer/pull/5515) docs: remove consecutive duplicate words
+  - [#5629](https://github.com/wasmerio/wasmer/pull/5629) Make bundling webcs fail if there are major errors
+
+## Fixed
+
+  - [#5677](https://github.com/wasmerio/wasmer/pull/5677) Fix deadlock when loading shared libraries
+  - [#5670](https://github.com/wasmerio/wasmer/pull/5670) Fix segfault on unterminated eh_frame by validating the frame before passing it to `__register_function`.
+  - [#5690](https://github.com/wasmerio/wasmer/pull/5690) fix(lib/vm): vendor `compiler-builtins` to fix undefined symbol `__rust_probestack`
+  - [#5669](https://github.com/wasmerio/wasmer/pull/5669) Fix WASIX networking w.r.t. aiohttp
+  - [#5655](https://github.com/wasmerio/wasmer/pull/5655) Shamelessly fix multiple things in one PR
+  - [#5652](https://github.com/wasmerio/wasmer/pull/5652) fix(lib/api): make `Memory::new_from_existing(...)` compatible with wasmer 5.0
+  - [#5646](https://github.com/wasmerio/wasmer/pull/5646) fix: fix wat gating
+  - [#5635](https://github.com/wasmerio/wasmer/pull/5635) fix(wasix): make wasmer/wat & wasmer/js-serializable-module optional features
+
+
+
+## 6.1.0-rc.2 - 16/07/2025
+This is the first release of the linker, adding support for dynamic linking in WASIX.
+The linker, paired with [wasixcc](https://github.com/wasix-org/wasixcc), can load DL modules
+at runtime.
+
+This release also includes other updates to WASIX, as well as stability and performance
+improvements across the board.
+
+## Added
+
+  - [#5598](https://github.com/wasmerio/wasmer/pull/5598) Add syscalls required to support libffi
+  - [#5581](https://github.com/wasmerio/wasmer/pull/5581) Dynamic linking with support for threads
+  - [#5578](https://github.com/wasmerio/wasmer/pull/5578) feat(cranelift): Add num_threads setting for Cranelift
+  - [#5500](https://github.com/wasmerio/wasmer/pull/5500) docs: added a new tag badge
+  - [#5561](https://github.com/wasmerio/wasmer/pull/5561) Add support for proper time in virtual-fs when targeting js
+  - [#5617](https://github.com/wasmerio/wasmer/pull/5617) Implement Memory::size function
+  - [#5600](https://github.com/wasmerio/wasmer/pull/5600) Implement MSG_PEEK and MSG_DONTWAIT functionality for send*/recv* syscalls
+  - [#5586](https://github.com/wasmerio/wasmer/pull/5586) V8 full exceptions support
+
+## Changed
+
+  - [#5636](https://github.com/wasmerio/wasmer/pull/5636) Implement strict mode switch in call_dynamic
+  - [#5628](https://github.com/wasmerio/wasmer/pull/5628) Improve help messages for auth commands
+  - [#5621](https://github.com/wasmerio/wasmer/pull/5621) feat: support sys-minimal feature
+  - [#5615](https://github.com/wasmerio/wasmer/pull/5615) The cli binary should use correct target triple when compiling a wasm module
+  - [#5570](https://github.com/wasmerio/wasmer/pull/5570) Return 1 second past epoch even when an explicit zero timestamp exist…
+  - [#5607](https://github.com/wasmerio/wasmer/pull/5607) Make error messages for missing shared libraries more helpful
+  - [#5590](https://github.com/wasmerio/wasmer/pull/5590) chore(deps): Upgrade some dependencies
+  - [#5589](https://github.com/wasmerio/wasmer/pull/5589) Change intrinsics::transmute to mem::transmute
+  - [#5583](https://github.com/wasmerio/wasmer/pull/5583) feat(wasix): Extend BuiltinPackageLoader with cache scanning and purging
+  - [#5572](https://github.com/wasmerio/wasmer/pull/5572) Update C API examples link in README to current documentation
+  - [#5564](https://github.com/wasmerio/wasmer/pull/5564) build: Make `ureq` optional (build) dependency
+  - [#5566](https://github.com/wasmerio/wasmer/pull/5566) Always preserve preopened FDs when doing proc_spawn2 + warn when dup2…
+
+## Fixed
+
+  - [#5620](https://github.com/wasmerio/wasmer/pull/5620) Fix missing dependency in `wasmer-package` for `wasm` targets
+  - [#5616](https://github.com/wasmerio/wasmer/pull/5616) Fix threads breaking when dlsym is called before thread spawn
+  - [#5569](https://github.com/wasmerio/wasmer/pull/5569) Fix a couple of webc FS issues
+  - [#5585](https://github.com/wasmerio/wasmer/pull/5585) fix(lib/vm): update `corosensei` to `0.2.2` to fix UB on Windows
+  - [#5568](https://github.com/wasmerio/wasmer/pull/5568) Fix the WASIX FS failing to union with a WEBC's volumes when running …
+
+
+
+## 6.0.1 - 09/05/2025
+This patch release fixes an error in cached memory operations in LLVM, adds CLI
+commands to list databases tied to an app, and provides miscellaneous QoL
+improvements to LLVM and updates. It also fixes the build of Wasmer for
+linux-aarch64.
+
+## Added
+
+  - [#5546](https://github.com/wasmerio/wasmer/pull/5546) feat(llvm): Add `asm_memory_buffer` to `LLVMCallbacks`
+  - [#5548](https://github.com/wasmerio/wasmer/pull/5548) feat(llvm): Add the `debug_str` intrinsic function
+  - [#5538](https://github.com/wasmerio/wasmer/pull/5538) feat(cli): Add "app database list" command
+
+## Changed
+
+  - [#5553](https://github.com/wasmerio/wasmer/pull/5553) feat(singlepass): Update dynasm to 3.2.0
+
+## Fixed
+
+  - [#5556](https://github.com/wasmerio/wasmer/pull/5556) ci: fix build of Wasmer on linux-aarch64
+  - [#5555](https://github.com/wasmerio/wasmer/pull/5555) Fix docs build
+  - [#5554](https://github.com/wasmerio/wasmer/pull/5554) fix(api): Misc fixes to compile with v8 when targeting aarch64-linux-android
+  - [#5549](https://github.com/wasmerio/wasmer/pull/5549) fix(llvm): Correctly cache pointers to intrinsic memory operations
+
+
+
+## 6.0.0 - 24/04/2025
+
+This stable release adds support for the exception handling proposal on Linux
+and Darwin platforms when using LLVM, adds a new LLVM-specific optimization
+(`--enable-pass-params-opt`), allows for multiple heterogeneous backends to be
+embedded in the same Wasmer build (`--llvm`, `--cranelift`, `--singlepass`,
+`--v8`, `--wamr`, `--wasmi`), adds support for process spawning without
+asyncify via full support for posix_spawn in wasix-libc with the new
+proc_spawn2 syscall, a number of QoL improvements to CLI commands and WASIX and
+much more. 
+
+## Added
+
+  - [#5524](https://github.com/wasmerio/wasmer/pull/5524) feat(llvm): Add ability to select how many threads LLVM should use during compilation.
+  - [#5531](https://github.com/wasmerio/wasmer/pull/5531) feat: Add Features::extend()
+  - [#5504](https://github.com/wasmerio/wasmer/pull/5504) feat: Add support for `perfmap`-based profiler data generation
+  - [#5518](https://github.com/wasmerio/wasmer/pull/5518) feat: Add `SuggestedCompilerOptimization` type(s) to automatically infer when to enable g0m0 optimization
+  - [#5514](https://github.com/wasmerio/wasmer/pull/5514) Added support for tags in JS
+  - [#5485](https://github.com/wasmerio/wasmer/pull/5485) docs: added a shield and a link to twitter
+
+## Changed
+
+  - [#5532](https://github.com/wasmerio/wasmer/pull/5532) chore(compiler): Print only the `deterministic_id()` of the engine in `Debug` impl
+  - [#5528](https://github.com/wasmerio/wasmer/pull/5528) Update pre-release crate versions automatically
+  - [#5498](https://github.com/wasmerio/wasmer/pull/5498) Simplify object initialization path with relocations
+  - [#5503](https://github.com/wasmerio/wasmer/pull/5503) feat(llvm): Pass global #0 and memory #0 as parameters between guest functions
+  - [#5517](https://github.com/wasmerio/wasmer/pull/5517) Updated singlepass and llvm compilers to use newer license
+  - [#5513](https://github.com/wasmerio/wasmer/pull/5513) chore: Bump `crossbeam-channel`
+  - [#5501](https://github.com/wasmerio/wasmer/pull/5501) Report one v2 and one v3 package when mixed packages are encountered …
+  - [#5497](https://github.com/wasmerio/wasmer/pull/5497) Reject mixed webc v2 and v3 in the same dependency tree
+  - [#5488](https://github.com/wasmerio/wasmer/pull/5488) Make sure api crate builds without compiler's translator & compiler features
+  - [#5484](https://github.com/wasmerio/wasmer/pull/5484) Make snapshot triggers strongly typed in the app schema
+  - [#5482](https://github.com/wasmerio/wasmer/pull/5482) deps: Update to zip 2.4.x
+  - [#5483](https://github.com/wasmerio/wasmer/pull/5483) Let cronjobs be triggered on a timer
+  - [#5443](https://github.com/wasmerio/wasmer/pull/5443) Enable multiple backends supported by the api crate to be used in the c-api as well
+  - [#5469](https://github.com/wasmerio/wasmer/pull/5469) Use engine-specific default features
+
+## Fixed
+
+  - [#5523](https://github.com/wasmerio/wasmer/pull/5523) fix(types): Bump `CURRENT_VERSION`
+  - [#5525](https://github.com/wasmerio/wasmer/pull/5525) fix(wamr): Wamr zip folder not found
+  - [#5522](https://github.com/wasmerio/wasmer/pull/5522) fix(jsc): Export engine as `JSC`
+  - [#5512](https://github.com/wasmerio/wasmer/pull/5512) fix(create-exe): Misc fixes to make `create-exe` work on aarch64 targeting Mach-O object files
+  - [#5519](https://github.com/wasmerio/wasmer/pull/5519) fix: Allow `BUSL-1.1` license in `deny.toml`
+  - [#5506](https://github.com/wasmerio/wasmer/pull/5506) fix(compiler): Preserve original alignment of custom sections
+  - [#5505](https://github.com/wasmerio/wasmer/pull/5505) Wasmer-JS fixes
+  - [#5507](https://github.com/wasmerio/wasmer/pull/5507) Fix experimental attribute and support keyword in tests, update example comment
+  - [#5502](https://github.com/wasmerio/wasmer/pull/5502) fix(compiler-test-derive): Don't use "Universal" as engine name/feature
+  - [#5491](https://github.com/wasmerio/wasmer/pull/5491) fix(cli): Respect active backend in "wasmer ssh" command
+  - [#5489](https://github.com/wasmerio/wasmer/pull/5489) fix: Metadata symbol size calculation in create-exe command
+  - [#5487](https://github.com/wasmerio/wasmer/pull/5487) docs: fixed broken link
+  - [#5449](https://github.com/wasmerio/wasmer/pull/5449) fix(api): Check if `WasmSliceAccess` ptr is aligned before reading
+  - [#5468](https://github.com/wasmerio/wasmer/pull/5468) Journal fixes to enable PHP+proc_snapshot
+  - [#5470](https://github.com/wasmerio/wasmer/pull/5470) fix(swift): Don't use default features in `wasix`, use the `sys` feature only
+  - [#5471](https://github.com/wasmerio/wasmer/pull/5471) fix: Explicitly allow "paste - no longer maintained" advisory in `cargo-deny`
+  - [#5467](https://github.com/wasmerio/wasmer/pull/5467) fix(journal): Use `sys-default` feature from `wasmer`
+  - [#5466](https://github.com/wasmerio/wasmer/pull/5466) Fix feature flags to build packages when publishing crates
+
+
+
+## 6.0.0-beta.1 - 07/03/2025
+
+This first beta release fixes a bug in `virtual-fs` together with other fixes
+to WASIX, adds various functions to check the features of a WebAssembly module
+given its bytes, adds a mechanism to the CLI to automatically switch to a
+suitable engine when needed, such as running a module with exception handling
+without specifying `--llvm` and, finally, also adds QoL improvements to the
+`package unpack` command in the CLI.
+
+## Added
+
+  - [#5448](https://github.com/wasmerio/wasmer/pull/5448) Add tests for exec*p and posix_spawnp
+  - [#5439](https://github.com/wasmerio/wasmer/pull/5439) feat: Add `check-api-features` Makefile target
+  - [#5433](https://github.com/wasmerio/wasmer/pull/5433) fix(api): Add missing loupe::MemoryUsage impls
+
+## Changed
+
+  - [#5451](https://github.com/wasmerio/wasmer/pull/5451) Select engine based on WASM module feature requirements
+  - [#5458](https://github.com/wasmerio/wasmer/pull/5458) Select engine based on WASM module feature requirements (v2)
+  - [#5455](https://github.com/wasmerio/wasmer/pull/5455) Engine selection improved
+  - [#5454](https://github.com/wasmerio/wasmer/pull/5454) CLI: package unpack command improvements
+  - [#5415](https://github.com/wasmerio/wasmer/pull/5415) chore(wasix): Avoid redundant hashing when spawning commands
+  - [#5440](https://github.com/wasmerio/wasmer/pull/5440) Remove `unwrap` in code that instantiates a WASI module
+
+## Fixed
+
+  - [#5461](https://github.com/wasmerio/wasmer/pull/5461) fix: Bump `ring` to `0.17.12`
+  - [#5460](https://github.com/wasmerio/wasmer/pull/5460) fix(c-api): Adjust `wasix` features in the import in `wasmer-c-api`
+  - [#5452](https://github.com/wasmerio/wasmer/pull/5452) Fix CI
+  - [#5436](https://github.com/wasmerio/wasmer/pull/5436) Fix interacting with socket pairs through `send` and `recv`
+  - [#5438](https://github.com/wasmerio/wasmer/pull/5438) chore(wasix): Fix compilation warning when host-fs not enabled
+  - [#5446](https://github.com/wasmerio/wasmer/pull/5446) fix(virtual-fs): OverlayFs: don't copy files that are never written
+  - [#5435](https://github.com/wasmerio/wasmer/pull/5435) Fix polling duplex pipes
+
+
+
+## 6.0.0-alpha.2 - 25/02/2025
+
+This second alpha release notably fixes an out-of-bound memory access when
+using LLVM on aarch64. Furthermore, it adds proper support for the
+`posix_spawn` function without a need for asyncify.
+
+## Added
+
+  - [#5426](https://github.com/wasmerio/wasmer/pull/5426) Add proper posix_spawn support without needing asyncify
+
+## Changed
+
+  - [#5425](https://github.com/wasmerio/wasmer/pull/5425) chore: Update build docs
+  - [#5418](https://github.com/wasmerio/wasmer/pull/5418) chore: Bump `webc` version to `8.0.0`
+  - [#5408](https://github.com/wasmerio/wasmer/pull/5408) Updated registry token on integration test workflow
+  - [#5414](https://github.com/wasmerio/wasmer/pull/5414) LLVM: Use `Default` and `Static` code model and reloc mode when targeting Mach-O
+  - [#5409](https://github.com/wasmerio/wasmer/pull/5409) Properly close vfork FDs if exec is not called, report subprocess traps
+
+## Fixed
+
+  - [#5420](https://github.com/wasmerio/wasmer/pull/5420) Fix manually inserting an FD at the first free index in FdList
+  - [#5419](https://github.com/wasmerio/wasmer/pull/5419) fix(singlepass): Don't panic on `funcref` types
+  - [#5410](https://github.com/wasmerio/wasmer/pull/5410) fix(ci): bump cache@v2 to cache@v3, temporarily disable test.yaml
+
+
+
+## 6.0.0-alpha.1 - 18/02/2025
+
+This alpha release adds support for multiple heterogeneous backends to be
+enabled at the same time. For example, the `llvm`,  `v8` and `wamr` backends
+can be enabled in a single binary release. Furthermore, this release adds
+initial support for the exception handling proposal on linux-x64, linux-aarch64
+and macOS through LLVM. This release also contains improvements to process
+spawning in WASIX.
+
+## Added
+
+  - [#5396](https://github.com/wasmerio/wasmer/pull/5396) CI: Disable V8 for linux-aarch64, bump ubuntu version for linux-x64 and add search paths for linux-musl
+  - [#5347](https://github.com/wasmerio/wasmer/pull/5347) Add support for exceptions in LLVM
+  - [#5374](https://github.com/wasmerio/wasmer/pull/5374) Add VirtualFile::copy_from_owned_buffer, fixes running mounted comman…
+  - [#5312](https://github.com/wasmerio/wasmer/pull/5312) Forward reuse_port and reuse_addr when it's possible to
+  - [#5370](https://github.com/wasmerio/wasmer/pull/5370) utils: prompts: add prompt_for_app_ident
+  - [#5369](https://github.com/wasmerio/wasmer/pull/5369) fix(ci): Add `RUSTDOCFLAGS` env var to add brew's libs
+  - [#5365](https://github.com/wasmerio/wasmer/pull/5365) Add .wasmerignore
+
+## Changed
+
+  - [#5402](https://github.com/wasmerio/wasmer/pull/5402) Update integration tests
+  - [#5395](https://github.com/wasmerio/wasmer/pull/5395) examples: funcref: memory_grow: resolve warnings
+  - [#5391](https://github.com/wasmerio/wasmer/pull/5391) chore: Prepare build scripts for release
+  - [#5386](https://github.com/wasmerio/wasmer/pull/5386) Rework WASIX pipes to be simplex, implement proper closing semantics, implement SIGPIPE
+  - [#5383](https://github.com/wasmerio/wasmer/pull/5383) Merge wasmer-5.1.0
+  - [#5384](https://github.com/wasmerio/wasmer/pull/5384) Implement CLOEXEC and related syscalls
+  - [#5379](https://github.com/wasmerio/wasmer/pull/5379) Allow memory growing to exactly 65536 pages, as per the specification
+  - [#5367](https://github.com/wasmerio/wasmer/pull/5367) Also put commands from webc dependencies in /usr/bin
+  - [#5368](https://github.com/wasmerio/wasmer/pull/5368) make: cli-compiler: resolve build-doc errors
+  - [#5366](https://github.com/wasmerio/wasmer/pull/5366) Reduce memory usage when loading webc packages by ensuring binaries m…
+  - [#5364](https://github.com/wasmerio/wasmer/pull/5364) Follow up to #5363
+  - [#5360](https://github.com/wasmerio/wasmer/pull/5360) chore: inline format args to improve readability
+  - [#5362](https://github.com/wasmerio/wasmer/pull/5362) chore: inline format args to improve readability (3)
+  - [#5361](https://github.com/wasmerio/wasmer/pull/5361) chore: inline format args to improve readability (2)
+  - [#5355](https://github.com/wasmerio/wasmer/pull/5355) chore: remove lazy_static dependency, use std instead
+  - [#5352](https://github.com/wasmerio/wasmer/pull/5352) Rework cron expression parsing to use saffron
+  - [#5350](https://github.com/wasmerio/wasmer/pull/5350) Rework the action field in the Job yaml schema
+  - [#5284](https://github.com/wasmerio/wasmer/pull/5284) Take into account requirements for "isolate" or single-threaded runtimes
+  - [#5348](https://github.com/wasmerio/wasmer/pull/5348) Merge main into 5.1.0
+  - [#5346](https://github.com/wasmerio/wasmer/pull/5346) Implement the WASIX proc_snapshot syscall
+  - [#5334](https://github.com/wasmerio/wasmer/pull/5334) Implement app.yaml job schema
+  - [#5323](https://github.com/wasmerio/wasmer/pull/5323) Close host files when the last FD referencing them is closed
+  - [#5333](https://github.com/wasmerio/wasmer/pull/5333) build: Make build dependency on `zip` and `xz` optional
+  - [#5331](https://github.com/wasmerio/wasmer/pull/5331) Make memory access functions in WasiEnv public
+  - [#5327](https://github.com/wasmerio/wasmer/pull/5327) Make try_memory public
+
+## Fixed
+
+  - [#5406](https://github.com/wasmerio/wasmer/pull/5406) fix: Use the "Keep a changelog" spec for the changelog
+  - [#5401](https://github.com/wasmerio/wasmer/pull/5401) Fix returning from a failed exec + fix vfork
+  - [#5397](https://github.com/wasmerio/wasmer/pull/5397) fix: have wasmer-wasix (lib/wasix) compile with `cargo build`
+  - [#5400](https://github.com/wasmerio/wasmer/pull/5400) Fix build script
+  - [#5399](https://github.com/wasmerio/wasmer/pull/5399) fix(ci): use custom llvm build on linux-aarch64
+  - [#5398](https://github.com/wasmerio/wasmer/pull/5398) fix(ci): Use official ubuntu-arm64 runners and install libxml2 on musl-x64
+  - [#5393](https://github.com/wasmerio/wasmer/pull/5393) fix(make): Check whether `ENABLE_x` variables are `1` or `true`
+  - [#5392](https://github.com/wasmerio/wasmer/pull/5392) fix(ci): Use `${{}}` notation for env variables passed from matrix
+  - [#5390](https://github.com/wasmerio/wasmer/pull/5390) chore: Fix doc comments in the api crate
+  - [#5389](https://github.com/wasmerio/wasmer/pull/5389) fix(c_api): Feature gate compiler-related types and functions behind …
+  - [#5385](https://github.com/wasmerio/wasmer/pull/5385) Fix documentation comments in examples
+  - [#5363](https://github.com/wasmerio/wasmer/pull/5363) chore: fix all warnings
+  - [#5354](https://github.com/wasmerio/wasmer/pull/5354) Fix non-consistent hashing of webc's
+
+
+
+## 5.0.5-rc1 - 03/01/2025
+Fixed an error in `wasmer create-exe` that prevented the correct execution and various improvements to the FS in WASIX. 
+
+## Added
+
+  - [#5315](https://github.com/wasmerio/wasmer/pull/5315) Implement cross-FS file rename
+
+## Changed
+
+  - [#5321](https://github.com/wasmerio/wasmer/pull/5321) Flush before closing files to avoid missed writes
+
+## Fixed
+
+  - [#5320](https://github.com/wasmerio/wasmer/pull/5320) Fix "error: GitHub API: more that one release selected" in `create-exe`
+
+
+
+## 5.0.4 - 17/12/2024
+
+This release fixes minor bugs and adds spurious improvements. 
+
+## Added
+
+
+## Changed
+
+  - [#5305](https://github.com/wasmerio/wasmer/pull/5305) make `AppConfig.name` optional in wasmer-config
+  - [#5292](https://github.com/wasmerio/wasmer/pull/5292) Pass readme content instead of readme file name
+  - [#5300](https://github.com/wasmerio/wasmer/pull/5300) Refactor path_create_directory and path_remove_directory to…
+  - [#5277](https://github.com/wasmerio/wasmer/pull/5277) Rephrase the description for `--no-persist-id`
+  - [#5291](https://github.com/wasmerio/wasmer/pull/5291) chore(wasix): make Capabilities hashable
+  - [#5293](https://github.com/wasmerio/wasmer/pull/5293) LoongArch: Switch to the medium code model
+
+## Fixed
+
+  - [#5306](https://github.com/wasmerio/wasmer/pull/5306) Fix build for 32bit targets (usize == u32)
+  - [#5307](https://github.com/wasmerio/wasmer/pull/5307) A few WASIX FS-related fixes
+  - [#5285](https://github.com/wasmerio/wasmer/pull/5285) Fix handling of the root path in WasiFS resulting in a bad inode structure
+  - [#5294](https://github.com/wasmerio/wasmer/pull/5294) Fix typo in readme file
+
+
+
+## 5.0.3 - 07/12/2024
+
+This release adds support for a more fine-grained and flexible control over the network sandbox. Also, some bug fixes
+and improvements are included.
+
+## Added
+
+  - [#5274](https://github.com/wasmerio/wasmer/pull/5274) feat(config): Add (Named)PackageIdent::matches_id helpers
+
+## Changed
+
+  - [#5288](https://github.com/wasmerio/wasmer/pull/5288) Bump up macos runner versions
+  - [#5283](https://github.com/wasmerio/wasmer/pull/5283) Better network sandbox
+  - [#5243](https://github.com/wasmerio/wasmer/pull/5243) Support multiple heterogeneous backends at the same time
+  - [#5275](https://github.com/wasmerio/wasmer/pull/5275) Protect preopened inodes from being closed
+  - [#5264](https://github.com/wasmerio/wasmer/pull/5264) update running wasmer-integration-tests in CI
+
+## Fixed
+
+
+
+
+## 5.0.2 - 22/11/2024
+
+This release mostly consists of bug fixes and clean ups.
+
+## Added
+
+  - [#5259](https://github.com/wasmerio/wasmer/pull/5259) Fix alignment and padding of the WASIX snapshot type to align with wasix-libc
+  - [#5236](https://github.com/wasmerio/wasmer/pull/5236) feat(benches): Add compilation benches, use remote artifacts
+  - [#5230](https://github.com/wasmerio/wasmer/pull/5230) fix(llvm): Fix `ADD_ABS_LO12_NC` relocation
+  - [#5226](https://github.com/wasmerio/wasmer/pull/5226) Add make target for building `wasmer-api` with `js` feature as `cdylib`
+
+## Changed
+
+  - [#4997](https://github.com/wasmerio/wasmer/pull/4997) Rework WasiFs to use a "holey" FdList instead of hashmap + seed + fre…
+  - [#5257](https://github.com/wasmerio/wasmer/pull/5257) ci: update `CONTRIBUTING.md` reference
+  - [#5250](https://github.com/wasmerio/wasmer/pull/5250) deps: Remove usage of unmaintained derivative crate
+  - [#5256](https://github.com/wasmerio/wasmer/pull/5256) deps: Upgrade wcgi crates to 0.3.0
+  - [#5253](https://github.com/wasmerio/wasmer/pull/5253) chore(wasix): Downgrade debug logs to trace
+  - [#5245](https://github.com/wasmerio/wasmer/pull/5245) Relax `wat` version requirement
+  - [#5244](https://github.com/wasmerio/wasmer/pull/5244) Alias `.` to cwd in wasi env
+  - [#5225](https://github.com/wasmerio/wasmer/pull/5225) Move compilation types inside of wasmer compiler
+
+## Fixed
+
+  - [#5268](https://github.com/wasmerio/wasmer/pull/5268) Fix musl builds
+  - [#5231](https://github.com/wasmerio/wasmer/pull/5231) Fix LLVM detection
+  - [#5235](https://github.com/wasmerio/wasmer/pull/5235) c-api/README.md: Fix double include in usage section
+  - [#5238](https://github.com/wasmerio/wasmer/pull/5238) Revert "Fix handling of the root dir in `path_create_directory` and `get_inode_at_path_inner`"
+  - [#5237](https://github.com/wasmerio/wasmer/pull/5237) Fix handling of the root dir in `path_create_directory` and `get_inode_at_path_inner`
+
+
+
+## 5.0.1 - 06/11/2024
+
+This release adds LLVM support to MacOS ARM64 binaries and contains minor fixes and improvements.
+
+## Added
+
+  - [#5220](https://github.com/wasmerio/wasmer/pull/5220) fix(ci): Move addition of `brew` libs to other step
+  - [#5218](https://github.com/wasmerio/wasmer/pull/5218) fix(ci): Add `brew` libs to `RUSTFLAGS` in aarch64
+  - [#5129](https://github.com/wasmerio/wasmer/pull/5129) Experimental: Add support for WASMI
+  - [#5205](https://github.com/wasmerio/wasmer/pull/5205) Add LLVM to docs CI
+
+## Changed
+
+  - [#5216](https://github.com/wasmerio/wasmer/pull/5216) Bump up webc version
+  - [#5215](https://github.com/wasmerio/wasmer/pull/5215) Re-enable RISC-V
+  - [#5194](https://github.com/wasmerio/wasmer/pull/5194) build: Update nix flake devshell for LLVM 18
+  - [#5202](https://github.com/wasmerio/wasmer/pull/5202) chore: Remove `isle-in-source-tree` feature from `cranelift-codegen`
+
+## Fixed
+
+  - [#5210](https://github.com/wasmerio/wasmer/pull/5210) Fix(LLVM): Implement the missing relocations on aarch64, fix SIMD operations
+  - [#5209](https://github.com/wasmerio/wasmer/pull/5209) Revert "Fix(LLVM): Implement the missing relocations on aarch64, fix SIMD operations"
+  - [#5207](https://github.com/wasmerio/wasmer/pull/5207) Fix(LLVM): Implement the missing relocations on aarch64, fix SIMD operations
+  - [#5203](https://github.com/wasmerio/wasmer/pull/5203) Fix the wasmer-swift crate build
+
+
+
+## 5.0.0 - 29/10/2024
+
+The main star of this release is the experimental support for three new backends: v8, wamr and wasmi. Also, many dependencies, namely LLVM, Cranelift, and rkyv are updated
+which bring significant enhancements.
+
+## Added
+
+  - [#5185](https://github.com/wasmerio/wasmer/pull/5185) Add execution benchmarks
+  - [#5174](https://github.com/wasmerio/wasmer/pull/5174) chore(wasix): Additional logging in wasix HTTP client
+  - [#5152](https://github.com/wasmerio/wasmer/pull/5152) Experimental: add support for loongarch64 on LLVM
+
+## Changed
+
+  - [#5188](https://github.com/wasmerio/wasmer/pull/5188) feat: Rename `wasmer-api` to `wasmer-backend-api`
+  - [#5186](https://github.com/wasmerio/wasmer/pull/5186) Remove support for emscripten
+  - [#5181](https://github.com/wasmerio/wasmer/pull/5181) Sunset `wasmer-registry`, `wasmer-interface` and update misc dependencies
+  - [#5165](https://github.com/wasmerio/wasmer/pull/5165) 5.0.0-rc.1 post release
+  - [#5151](https://github.com/wasmerio/wasmer/pull/5151) Remove negative variant of exit code
+  - [#5153](https://github.com/wasmerio/wasmer/pull/5153) Terminate entire wasix process when a worker thread fails or calls exit
+  - [#5172](https://github.com/wasmerio/wasmer/pull/5172) chore(backend-api): Update GraphQL schema
+  - [#5176](https://github.com/wasmerio/wasmer/pull/5176) Remove unused edge-util dependency
+  - [#5171](https://github.com/wasmerio/wasmer/pull/5171) Refactor webc usage
+  - [#5144](https://github.com/wasmerio/wasmer/pull/5144) Implement app-deployment related CLI commands
+  - [#5163](https://github.com/wasmerio/wasmer/pull/5163) Correct the example of the README in the WASIX crate
+
+## Fixed
+
+  - [#5184](https://github.com/wasmerio/wasmer/pull/5184) fix(api/wamr): Build `wamr` on `iOS`
+  - [#5179](https://github.com/wasmerio/wasmer/pull/5179) Fix build CI
+  - [#5178](https://github.com/wasmerio/wasmer/pull/5178) Fix usage of exit code
+  - [#5162](https://github.com/wasmerio/wasmer/pull/5162) Fix append-ness of new fd affecting old fds
+  - [#5160](https://github.com/wasmerio/wasmer/pull/5160) Fix fd with append flag can't seek correctly
+
+
+
+## 5.0.0-rc.1 - 21/10/2024
+
+This is a release candidate as we are preparing for the final release of 5.0
+
+## Added
+
+  - [#5154](https://github.com/wasmerio/wasmer/pull/5154) Add build steps for interpreter backends
+  - [#5138](https://github.com/wasmerio/wasmer/pull/5138) Experimental: Add support for v8
+  - [#5129](https://github.com/wasmerio/wasmer/pull/5129) Experimental: Add support for WASMI
+  - [#4515](https://github.com/wasmerio/wasmer/pull/4515) Experimental: Add interpreter support for Wasmer
+
+## Changed
+
+  - [#5158](https://github.com/wasmerio/wasmer/pull/5158) path_create_directory shouldn't behave recursively
+  - [#5156](https://github.com/wasmerio/wasmer/pull/5156) Resolve double-free error in c-api
+  - [#5149](https://github.com/wasmerio/wasmer/pull/5149) Merge 5.0 release candidate into main
+  - [#5148](https://github.com/wasmerio/wasmer/pull/5148) Remove deprecated methods and types
+  - [#5147](https://github.com/wasmerio/wasmer/pull/5147) Feat(compiler/llvm): Replace runtime assertions (in debug mode) with errors
+  - [#5146](https://github.com/wasmerio/wasmer/pull/5146) feat(api/build/v8): Use blob to build v8
+  - [#5142](https://github.com/wasmerio/wasmer/pull/5142) Upgrade `rkyv`
+  - [#5098](https://github.com/wasmerio/wasmer/pull/5098) `js::module`: leave warning comment on the `Send` impl
+  - [#5139](https://github.com/wasmerio/wasmer/pull/5139) deps: Update corosensei
+  - [#5136](https://github.com/wasmerio/wasmer/pull/5136) Replace v3 usage of download-artifact
+  - [#5135](https://github.com/wasmerio/wasmer/pull/5135) Use upload/download artifact v4
+
+## Fixed
+
+  - [#4834](https://github.com/wasmerio/wasmer/pull/4834) Fix `path_open` trailing slash edge case
+  - [#4821](https://github.com/wasmerio/wasmer/pull/4821) Fix `path_open` sometimes ignoring trailing slash
+  - [#5137](https://github.com/wasmerio/wasmer/pull/5137) Trying to fix js build
+
+
+
+## 4.4.0 - 04/10/2024
+
+This release adds support for object size estimation, adds better proxy support, improves executable spawning, and contains various bug fixes.
+
+## Added
+
+  - [#5079](https://github.com/wasmerio/wasmer/pull/5079) Add feature for objects' sizes estimation
+  - [#5125](https://github.com/wasmerio/wasmer/pull/5125) oss-fuzz: add cifuzz
+  - [#5110](https://github.com/wasmerio/wasmer/pull/5110) Add new --invoke arg for choosing entry function for single WASM modules + fix --invoke not working for WASI(X) modules
+  - [#5090](https://github.com/wasmerio/wasmer/pull/5090) Add the right to fetch stats on pipes
+  - [#5088](https://github.com/wasmerio/wasmer/pull/5088) Various cleanup chores + add a new test
+
+## Changed
+
+  - [#5127](https://github.com/wasmerio/wasmer/pull/5127) Implement proper executable spawn
+  - [#5098](https://github.com/wasmerio/wasmer/pull/5098) `js::module`: leave warning comment on the `Send` impl
+  - [#5120](https://github.com/wasmerio/wasmer/pull/5120) Improve QueryError
+  - [#5118](https://github.com/wasmerio/wasmer/pull/5118) InMemory/MultiSource Improvements
+  - [#5104](https://github.com/wasmerio/wasmer/pull/5104) Transfer the file size when renamed
+  - [#5102](https://github.com/wasmerio/wasmer/pull/5102) chore(wasix): Reduce syscall instrumentation levels
+  - [#5096](https://github.com/wasmerio/wasmer/pull/5096) Update cargo-deny config
+  - [#4983](https://github.com/wasmerio/wasmer/pull/4983) deps: Upgrade some dependencies + lift to workspace root
+  - [#5092](https://github.com/wasmerio/wasmer/pull/5092) Replace `WASM_ANYREF` with `WASM_EXTERNREF`
+  - [#5091](https://github.com/wasmerio/wasmer/pull/5091) Apply the proxy setting in wasmer config
+  - [#5089](https://github.com/wasmerio/wasmer/pull/5089) feat(cli): Restore packages from webcs
+
+## Fixed
+
+  - [#5124](https://github.com/wasmerio/wasmer/pull/5124) Various fixes to get wasmer-js compiling
+  - [#5108](https://github.com/wasmerio/wasmer/pull/5108) Fix error in metering middleware
+
+
 
 ## 4.3.7 - 06/09/2024
 
@@ -1130,7 +1710,7 @@ Lots of new things in the release!
   - [#3665](https://github.com/wasmerio/wasmer/pull/3665) Fix doc, threads are enabled by default now
   - [#3662](https://github.com/wasmerio/wasmer/pull/3662) Why is it so difficult to type LLVM_SYS_140_PREFIX
   - [#3661](https://github.com/wasmerio/wasmer/pull/3661) [CI] New attempt at fixing the Windows build on the CI
-  - [#3659](https://github.com/wasmerio/wasmer/pull/3659) Fixed building with with just the sys feature
+  - [#3659](https://github.com/wasmerio/wasmer/pull/3659) Fixed building with just the sys feature
   - [#3648](https://github.com/wasmerio/wasmer/pull/3648) Fix CI and llvm detection
   - [#3643](https://github.com/wasmerio/wasmer/pull/3643) fix(wasi): Memory leak due to cyclical WasiControlPlane references
   - [#3639](https://github.com/wasmerio/wasmer/pull/3639) wasi: Thread Lifecycle Fix

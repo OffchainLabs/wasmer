@@ -30,24 +30,25 @@ pub fn fd_write<M: MemorySize>(
     iovs_len: M::Offset,
     nwritten: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
+    let enable_journal = env.enable_journal;
     let offset = {
         let state = env.state.clone();
         let inodes = state.inodes.clone();
 
         let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-        fd_entry.offset.load(Ordering::Acquire) as usize
+        fd_entry.inner.offset.load(Ordering::Acquire) as usize
     };
 
     let bytes_written = wasi_try_ok!(fd_write_internal::<M>(
-        &ctx,
+        &mut ctx,
         fd,
         FdWriteSource::Iovs { iovs, iovs_len },
         offset as u64,
         true,
-        env.enable_journal,
+        enable_journal,
     )?);
 
     Span::current().record("nwritten", bytes_written);
@@ -85,12 +86,12 @@ pub fn fd_pwrite<M: MemorySize>(
     offset: Filesize,
     nwritten: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let enable_snapshot_capture = ctx.data().enable_journal;
 
     let bytes_written = wasi_try_ok!(fd_write_internal::<M>(
-        &ctx,
+        &mut ctx,
         fd,
         FdWriteSource::Iovs { iovs, iovs_len },
         offset,
@@ -120,13 +121,14 @@ pub(crate) enum FdWriteSource<'a, M: MemorySize> {
 
 #[allow(clippy::await_holding_lock)]
 pub(crate) fn fd_write_internal<M: MemorySize>(
-    ctx: &FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
     data: FdWriteSource<'_, M>,
     offset: u64,
     should_update_cursor: bool,
     should_snapshot: bool,
 ) -> Result<Result<usize, Errno>, WasiError> {
+    let mut offset = offset;
     let mut env = ctx.data();
     let state = env.state.clone();
 
@@ -134,11 +136,11 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
     let is_stdio = fd_entry.is_stdio;
 
     let bytes_written = {
-        if !is_stdio && !fd_entry.rights.contains(Rights::FD_WRITE) {
+        if !is_stdio && !fd_entry.inner.rights.contains(Rights::FD_WRITE) {
             return Ok(Err(Errno::Access));
         }
 
-        let fd_flags = fd_entry.flags;
+        let fd_flags = fd_entry.inner.flags;
         let mut memory = unsafe { env.memory_view(&ctx) };
 
         let (bytes_written, is_file, can_snapshot) = {
@@ -152,7 +154,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                         let res = __asyncify_light(
                             env,
-                            if fd_entry.flags.contains(Fdflags::NONBLOCK) {
+                            if fd_entry.inner.flags.contains(Fdflags::NONBLOCK) {
                                 Some(Duration::ZERO)
                             } else {
                                 None
@@ -160,6 +162,12 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             async {
                                 let mut handle = handle.write().unwrap();
                                 if !is_stdio {
+                                    if fd_entry.inner.flags.contains(Fdflags::APPEND) {
+                                        // `fdflags::append` means we need to seek to the end before writing.
+                                        offset = fd_entry.inode.stat.read().unwrap().st_size;
+                                        fd_entry.inner.offset.store(offset, Ordering::Release);
+                                    }
+
                                     handle
                                         .seek(std::io::SeekFrom::Start(offset))
                                         .await
@@ -267,11 +275,15 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                     let written = wasi_try_ok_ok!(res?);
                     (written, false, false)
                 }
-                Kind::Pipe { pipe } => {
+                Kind::PipeRx { .. } => {
+                    return Ok(Err(Errno::Badf));
+                }
+                Kind::PipeTx { tx } => {
                     let mut written = 0usize;
 
                     match &data {
                         FdWriteSource::Iovs { iovs, iovs_len } => {
+                            let mut raise_sigpipe = false;
                             let iovs_arr = wasi_try_ok_ok!(iovs
                                 .slice(&memory, *iovs_len)
                                 .map_err(mem_error_to_wasi));
@@ -282,20 +294,98 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                     .slice(&memory, iovs.buf_len)
                                     .map_err(mem_error_to_wasi));
                                 let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
-                                let local_written =
-                                    wasi_try_ok_ok!(std::io::Write::write(pipe, buf.as_ref())
-                                        .map_err(map_io_err));
+                                let write_result = std::io::Write::write(tx, buf.as_ref());
+                                let local_written = match write_result {
+                                    Ok(w) => w,
+                                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                        // Need to do this to avoid double borrow on ctx with iovs_arr
+                                        raise_sigpipe = true;
+                                        break;
+                                    }
+                                    Err(e) => return Ok(Err(map_io_err(e))),
+                                };
 
                                 written += local_written;
                                 if local_written != buf.len() {
                                     break;
                                 }
                             }
+
+                            drop(iovs_arr);
+
+                            if raise_sigpipe {
+                                env.process.signal_process(Signal::Sigpipe);
+                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                return Ok(Err(Errno::Pipe));
+                            }
                         }
                         FdWriteSource::Buffer(data) => {
-                            wasi_try_ok_ok!(
-                                std::io::Write::write_all(pipe, data).map_err(map_io_err)
-                            );
+                            match std::io::Write::write_all(tx, data) {
+                                Ok(()) => (),
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                    env.process.signal_process(Signal::Sigpipe);
+                                    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                    return Ok(Err(Errno::Pipe));
+                                }
+                                Err(e) => return Ok(Err(map_io_err(e))),
+                            };
+                            written += data.len();
+                        }
+                    }
+
+                    (written, false, true)
+                }
+                Kind::DuplexPipe { pipe } => {
+                    let mut written = 0usize;
+
+                    match &data {
+                        FdWriteSource::Iovs { iovs, iovs_len } => {
+                            let mut raise_sigpipe = false;
+                            let iovs_arr = wasi_try_ok_ok!(iovs
+                                .slice(&memory, *iovs_len)
+                                .map_err(mem_error_to_wasi));
+                            let iovs_arr =
+                                wasi_try_ok_ok!(iovs_arr.access().map_err(mem_error_to_wasi));
+                            for iovs in iovs_arr.iter() {
+                                let buf = wasi_try_ok_ok!(WasmPtr::<u8, M>::new(iovs.buf)
+                                    .slice(&memory, iovs.buf_len)
+                                    .map_err(mem_error_to_wasi));
+                                let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                let write_result = std::io::Write::write(pipe, buf.as_ref());
+                                let local_written = match write_result {
+                                    Ok(w) => w,
+                                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                        // Need to do this to avoid double borrow on ctx with iovs_arr
+                                        raise_sigpipe = true;
+                                        break;
+                                    }
+                                    Err(e) => return Ok(Err(map_io_err(e))),
+                                };
+
+                                written += local_written;
+                                if local_written != buf.len() {
+                                    break;
+                                }
+                            }
+
+                            drop(iovs_arr);
+
+                            if raise_sigpipe {
+                                env.process.signal_process(Signal::Sigpipe);
+                                wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                return Ok(Err(Errno::Pipe));
+                            }
+                        }
+                        FdWriteSource::Buffer(data) => {
+                            match std::io::Write::write_all(pipe, data) {
+                                Ok(()) => (),
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                    env.process.signal_process(Signal::Sigpipe);
+                                    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
+                                    return Ok(Err(Errno::Pipe));
+                                }
+                                Err(e) => return Ok(Err(map_io_err(e))),
+                            };
                             written += data.len();
                         }
                     }
@@ -404,7 +494,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 JournalEffector::save_fd_write(ctx, fd, offset, bytes_written, iovs, iovs_len)
                     .map_err(|err| {
                         tracing::error!("failed to save terminal data - {}", err);
-                        WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                        WasiError::Exit(ExitCode::from(Errno::Fault))
                     })?;
             }
         }
@@ -417,14 +507,14 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
             let curr_offset = if is_file && should_update_cursor {
                 let bytes_written = bytes_written as u64;
                 let mut fd_map = state.fs.fd_map.write().unwrap();
-                let fd_entry = wasi_try_ok_ok!(fd_map.get_mut(&fd).ok_or(Errno::Badf));
+                let fd_entry = wasi_try_ok_ok!(fd_map.get_mut(fd).ok_or(Errno::Badf));
                 fd_entry
                     .offset
                     .fetch_add(bytes_written, Ordering::AcqRel)
                     // fetch_add returns the previous value, we have to add bytes_written again here
                     + bytes_written
             } else {
-                fd_entry.offset.load(Ordering::Acquire)
+                fd_entry.inner.offset.load(Ordering::Acquire)
             };
 
             // we set the size but we don't return any errors if it fails as

@@ -1,11 +1,12 @@
 use crate::engine::error::LinkError;
 use std::ptr::NonNull;
-use wasmer_types::entity::{EntityRef, PrimaryMap};
 use wasmer_types::{
-    GlobalType, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex, MemoryType,
-    ModuleInfo, Pages, PointerWidth, TableIndex, TableType, Target,
+    entity::{EntityRef, PrimaryMap},
+    target::{PointerWidth, Target},
+    FunctionType, GlobalType, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex,
+    MemoryType, ModuleInfo, Pages, TableIndex, TableType, TagKind,
 };
-use wasmer_vm::{InternalStoreHandle, MemoryError, StoreObjects};
+use wasmer_vm::{InternalStoreHandle, MemoryError, StoreObjects, VMTag};
 use wasmer_vm::{MemoryStyle, TableStyle};
 use wasmer_vm::{VMConfig, VMGlobal, VMMemory, VMTable};
 use wasmer_vm::{VMMemoryDefinition, VMTableDefinition};
@@ -56,6 +57,11 @@ pub trait Tunables {
         Ok(VMGlobal::new(ty))
     }
 
+    /// Create a new tag.
+    fn create_tag(&self, kind: TagKind, ty: FunctionType) -> Result<VMTag, String> {
+        Ok(VMTag::new(kind, ty))
+    }
+
     /// Allocate memory for just the memories of the current module.
     ///
     /// # Safety
@@ -83,7 +89,7 @@ pub trait Tunables {
             memories.push(InternalStoreHandle::new(
                 context,
                 self.create_vm_memory(ty, style, *mdl)
-                    .map_err(|e| LinkError::Resource(format!("Failed to create memory: {}", e)))?,
+                    .map_err(|e| LinkError::Resource(format!("Failed to create memory: {e}")))?,
             ));
         }
         Ok(memories)

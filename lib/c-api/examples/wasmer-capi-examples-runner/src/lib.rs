@@ -172,7 +172,7 @@ pub const TESTS: &[&str] = &[
 fn test_run() {
     let _drop = RemoveTestsOnDrop::default();
     let config = Config::get();
-    println!("config: {:#?}", config);
+    println!("config: {config:#?}");
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let host = target_lexicon::HOST.to_string();
@@ -190,7 +190,7 @@ fn test_run() {
     for test in TESTS.iter() {
         let manifest_dir_parent = std::path::Path::new(&manifest_dir);
         let manifest_dir_parent = manifest_dir_parent.parent().unwrap();
-        let c_file_path = manifest_dir_parent.join(&format!("{test}.c"));
+        let c_file_path = manifest_dir_parent.join(format!("{test}.c"));
 
         if target.contains("msvc") {
             let mut build = cc::Build::new();
@@ -208,10 +208,10 @@ fn test_run() {
             let compiler = build.try_get_compiler().unwrap();
             let mut command = compiler.to_command();
 
-            command.arg(&format!("{}", c_file_path.display()));
+            command.arg(format!("{}", c_file_path.display()));
             if !config.wasmer_dir.is_empty() {
                 command.arg("/I");
-                command.arg(&format!("{}/include/", config.wasmer_dir));
+                command.arg(format!("{}/include/", config.wasmer_dir));
                 let mut log = String::new();
                 fixup_symlinks(
                     &[
@@ -225,17 +225,17 @@ fn test_run() {
                 println!("{log}");
             }
 
-            let exe_outpath = manifest_dir_parent.join(&format!("{test}.exe"));
+            let exe_outpath = manifest_dir_parent.join(format!("{test}.exe"));
             let exe_outpath = format!("{}", exe_outpath.display());
             println!("compiling exe to {exe_outpath}");
 
-            command.arg(&format!("/Fo:{}/", manifest_dir_parent.display()));
+            command.arg(format!("/Fo:{}/", manifest_dir_parent.display()));
             command.arg("/link");
             if !config.wasmer_dir.is_empty() {
-                command.arg(&format!("/LIBPATH:{}/lib", config.wasmer_dir));
-                command.arg(&format!("{}/lib/wasmer.dll.lib", config.wasmer_dir));
+                command.arg(format!("/LIBPATH:{}/lib", config.wasmer_dir));
+                command.arg(format!("{}/lib/wasmer.dll.lib", config.wasmer_dir));
             }
-            command.arg(&format!("/OUT:{exe_outpath}"));
+            command.arg(format!("/OUT:{exe_outpath}"));
 
             // read vcvars into file, append command, then execute the bat
 
@@ -309,7 +309,7 @@ fn test_run() {
 
             if !config.wasmer_dir.is_empty() {
                 command.arg("-I");
-                command.arg(&format!("{}/include", config.wasmer_dir));
+                command.arg(format!("{}/include", config.wasmer_dir));
                 let mut log = String::new();
                 fixup_symlinks(
                     &[
@@ -324,12 +324,12 @@ fn test_run() {
             command.arg(&c_file_path);
             if !config.wasmer_dir.is_empty() {
                 command.arg("-L");
-                command.arg(&format!("{}/lib/", config.wasmer_dir));
+                command.arg(format!("{}/lib/", config.wasmer_dir));
                 command.arg("-lwasmer");
-                command.arg(&format!("-Wl,-rpath,{}/lib/", config.wasmer_dir));
+                command.arg(format!("-Wl,-rpath,{}/lib/", config.wasmer_dir));
             }
             command.arg("-o");
-            command.arg(&format!("{manifest_dir}/../{test}"));
+            command.arg(format!("{manifest_dir}/../{test}"));
 
             // cc -g -IC:/Users/felix/Development/wasmer/lib/c-api/examples/../tests
             //       -IC:/Users/felix/Development/wasmer/package/include
@@ -358,7 +358,7 @@ fn test_run() {
             }
 
             // execute
-            let mut command = std::process::Command::new(&format!("{manifest_dir}/../{test}"));
+            let mut command = std::process::Command::new(format!("{manifest_dir}/../{test}"));
             command.env("LD_PRELOAD", &libwasmer_so_path);
             command.current_dir(&exe_dir);
             println!("execute: {command:#?}");
@@ -453,7 +453,7 @@ fn fixup_symlinks_inner(include_paths: &[String], log: &mut String) -> Result<()
             _ => continue,
         };
         let lines_3 = file.lines().take(3).collect::<Vec<_>>();
-        log.push_str(&format!("first 3 lines of {path:?}: {:#?}\n", lines_3));
+        log.push_str(&format!("first 3 lines of {path:?}: {lines_3:#?}\n"));
 
         let parent = std::path::Path::new(&path).parent().unwrap();
         if let Ok(symlink) = std::fs::read_to_string(parent.join(&file)) {
@@ -466,7 +466,7 @@ fn fixup_symlinks_inner(include_paths: &[String], log: &mut String) -> Result<()
             .captures_iter(&file)
             .map(|c| c[1].to_string())
             .collect::<Vec<_>>();
-        log.push_str(&format!("regex captures: ({path:?}): {:#?}\n", filepaths));
+        log.push_str(&format!("regex captures: ({path:?}): {filepaths:#?}\n"));
         let joined_filepaths = filepaths
             .iter()
             .map(|s| {

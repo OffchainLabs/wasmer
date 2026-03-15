@@ -4,33 +4,43 @@ use crate::types::wasi::Snapshot0Filestat;
 
 /// ### `fd_filestat_get()`
 /// Get the metadata of an open file
+///
 /// Input:
 /// - `Fd fd`
 ///     The open file descriptor whose metadata will be read
+///
 /// Output:
 /// - `Filestat *buf`
 ///     Where the metadata from `fd` will be written
-#[instrument(level = "debug", skip_all, fields(%fd), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, size = field::Empty, mtime = field::Empty), ret)]
 pub fn fd_filestat_get<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
     buf: WasmPtr<Filestat, M>,
-) -> Errno {
-    let stat = wasi_try!(fd_filestat_get_internal(&mut ctx, fd));
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    let stat = wasi_try_ok!(fd_filestat_get_internal(&mut ctx, fd));
+
+    // These two values have proved to be helpful in multiple investigations
+    Span::current().record("size", stat.st_size);
+    Span::current().record("mtime", stat.st_mtim);
 
     let env = ctx.data();
     let (memory, _) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
     let buf = buf.deref(&memory);
-    wasi_try_mem!(buf.write(stat));
+    wasi_try_mem_ok!(buf.write(stat));
 
-    Errno::Success
+    Ok(Errno::Success)
 }
 
 /// ### `fd_filestat_get()`
 /// Get the metadata of an open file
+///
 /// Input:
 /// - `__wasi_fd_t fd`
 ///     The open file descriptor whose metadata will be read
+///
 /// Output:
 /// - `__wasi_filestat_t *buf`
 ///     Where the metadata from `fd` will be written
@@ -41,7 +51,7 @@ pub(crate) fn fd_filestat_get_internal(
     let env = ctx.data();
     let (_, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
     let fd_entry = state.fs.get_fd(fd)?;
-    if !fd_entry.rights.contains(Rights::FD_FILESTAT_GET) {
+    if !fd_entry.inner.rights.contains(Rights::FD_FILESTAT_GET) {
         return Err(Errno::Access);
     }
 
@@ -50,13 +60,15 @@ pub(crate) fn fd_filestat_get_internal(
 
 /// ### `fd_filestat_get_old()`
 /// Get the metadata of an open file
+///
 /// Input:
 /// - `Fd fd`
 ///     The open file descriptor whose metadata will be read
+///
 /// Output:
 /// - `Snapshot0Filestat *buf`
 ///     Where the metadata from `fd` will be written
-#[instrument(level = "debug", skip_all, fields(%fd), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd), ret)]
 pub fn fd_filestat_get_old<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,

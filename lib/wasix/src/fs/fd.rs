@@ -2,38 +2,45 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     path::PathBuf,
-    pin::Pin,
     sync::{atomic::AtomicU64, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
-    task::Context,
 };
 
-use futures::Future;
 use serde_derive::{Deserialize, Serialize};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{watch, Mutex as AsyncMutex};
-use virtual_fs::{Pipe, VirtualFile};
-use wasmer_wasix_types::wasi::{EpollType, Fd as WasiFd, Fdflags, Filestat, Rights};
+use virtual_fs::{Pipe, PipeRx, PipeTx, VirtualFile};
+use wasmer_wasix_types::wasi::{EpollType, Fd as WasiFd, Fdflags, Fdflagsext, Filestat, Rights};
 
-use crate::{net::socket::InodeSocket, syscalls::EpollJoinWaker};
+use crate::net::socket::InodeSocket;
 
 use super::{
-    InodeGuard, InodeValFilePollGuard, InodeValFilePollGuardJoin, InodeValFilePollGuardMode,
-    InodeWeakGuard, NotificationInner,
+    InodeGuard, InodeValFilePollGuard, InodeValFilePollGuardMode, InodeWeakGuard, NotificationInner,
 };
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct Fd {
-    pub rights: Rights,
-    pub rights_inheriting: Rights,
-    pub flags: Fdflags,
-    pub offset: Arc<AtomicU64>,
+    #[cfg_attr(feature = "enable-serde", serde(flatten))]
+    pub inner: FdInner,
+
     /// Flags that determine how the [`Fd`] can be used.
     ///
     /// Used when reopening a [`VirtualFile`] during deserialization.
     pub open_flags: u16,
     pub inode: InodeGuard,
     pub is_stdio: bool,
+}
+
+// This struct contains the bits of Fd that are safe to mutate, so that
+// FdList::get_mut can safely return mutable references.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct FdInner {
+    pub rights: Rights,
+    pub rights_inheriting: Rights,
+    pub flags: Fdflags,         // This is file table related flags, not fd flags
+    pub offset: Arc<AtomicU64>, // This also belongs in the file table
+    pub fd_flags: Fdflagsext,   // This is the actual FD flags that belongs here
 }
 
 impl Fd {
@@ -62,7 +69,7 @@ impl Fd {
 pub struct InodeVal {
     pub stat: RwLock<Filestat>,
     pub is_preopened: bool,
-    pub name: Cow<'static, str>,
+    pub name: RwLock<Cow<'static, str>>,
     pub kind: RwLock<Kind>,
 }
 
@@ -100,48 +107,32 @@ pub struct EpollInterest {
 
 /// Guard the cleans up the selector registrations
 #[derive(Debug)]
-pub enum EpollJoinGuard {
-    Join {
-        join_guard: InodeValFilePollGuardJoin,
-        epoll_waker: Arc<EpollJoinWaker>,
-    },
-    Handler {
-        fd_guard: InodeValFilePollGuard,
-    },
+pub struct EpollJoinGuard {
+    pub(crate) fd_guard: InodeValFilePollGuard,
 }
 impl Drop for EpollJoinGuard {
     fn drop(&mut self) {
-        if let Self::Handler { fd_guard, .. } = self {
-            if let InodeValFilePollGuardMode::Socket { inner } = &mut fd_guard.mode {
+        match &self.fd_guard.mode {
+            InodeValFilePollGuardMode::File(_) => {
+                // Intentionally ignored, epoll doesn't work with files
+            }
+            InodeValFilePollGuardMode::Socket { inner } => {
                 let mut inner = inner.protected.write().unwrap();
                 inner.remove_handler();
             }
-        }
-    }
-}
-impl EpollJoinGuard {
-    pub fn is_spent(&self) -> bool {
-        match self {
-            Self::Join { join_guard, .. } => join_guard.is_spent(),
-            Self::Handler { .. } => false,
-        }
-    }
-    pub fn renew(&mut self) {
-        if let Self::Join {
-            join_guard,
-            epoll_waker,
-        } = self
-        {
-            let fd = join_guard.fd();
-            join_guard.reset();
-
-            let waker = epoll_waker.as_waker();
-            let mut cx = Context::from_waker(&waker);
-            if Pin::new(join_guard).poll(&mut cx).is_ready() {
-                tracing::trace!(fd, "join renew already woken");
-                waker.wake();
-            } else {
-                tracing::trace!(fd, "join waker reinstalled");
+            InodeValFilePollGuardMode::EventNotifications(inner) => {
+                inner.remove_interest_handler();
+            }
+            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
+                let inner = pipe.write().unwrap();
+                inner.remove_interest_handler();
+            }
+            InodeValFilePollGuardMode::PipeRx { rx } => {
+                let inner = rx.write().unwrap();
+                inner.remove_interest_handler();
+            }
+            InodeValFilePollGuardMode::PipeTx { .. } => {
+                // Intentionally ignored, the sending end of a pipe can't have an interest handler
             }
         }
     }
@@ -173,8 +164,15 @@ pub enum Kind {
         socket: InodeSocket,
     },
     #[cfg_attr(feature = "enable-serde", serde(skip))]
-    Pipe {
-        /// Reference to the pipe
+    PipeTx {
+        tx: PipeTx,
+    },
+    #[cfg_attr(feature = "enable-serde", serde(skip))]
+    PipeRx {
+        rx: PipeRx,
+    },
+    #[cfg_attr(feature = "enable-serde", serde(skip))]
+    DuplexPipe {
         pipe: Pipe,
     },
     Epoll {

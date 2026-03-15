@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::*;
 use url::Url;
-use wasmer_api::{types::PackageVersionWithPackage, WasmerClient};
+use wasmer_backend_api::{types::PackageVersionWithPackage, WasmerClient};
 
 #[derive(Debug, Clone)]
 pub struct Argus {
@@ -156,12 +156,11 @@ impl Argus {
             }
         };
 
-        p.set_message(format!("[{test_id}] testing package {package_name}",));
+        p.set_message(format!("[{test_id}] testing package {package_name}"));
 
         let path = Argus::get_path(config.clone(), package).await;
         p.set_message(format!(
-            "testing package {package_name} -- path to download to is: {:?}",
-            path
+            "testing package {package_name} -- path to download to is: {path:?}",
         ));
 
         #[cfg(not(feature = "wasmer_lib"))]

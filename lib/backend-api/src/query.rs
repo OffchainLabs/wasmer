@@ -2,13 +2,14 @@ use std::{collections::HashSet, time::Duration};
 
 use anyhow::{bail, Context};
 use cynic::{MutationBuilder, QueryBuilder};
-use edge_schema::schema::NetworkTokenV1;
 use futures::StreamExt;
 use merge_streams::MergeStreams;
 use time::OffsetDateTime;
 use tracing::Instrument;
 use url::Url;
 use wasmer_config::package::PackageIdent;
+use wasmer_package::utils::from_bytes;
+use webc::Container;
 
 use crate::{
     types::{self, *},
@@ -54,6 +55,42 @@ pub async fn redeploy_app_by_id(
         ))
         .await
         .map(|v| v.redeploy_active_version.map(|v| v.app))
+}
+
+/// List all bindings associated with a particular package.
+///
+/// If a version number isn't provided, this will default to the most recently
+/// published version.
+pub async fn list_bindings(
+    client: &WasmerClient,
+    name: &str,
+    version: Option<&str>,
+) -> Result<Vec<Bindings>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::GetBindingsQuery::build(GetBindingsQueryVariables {
+            name,
+            version,
+        }))
+        .await
+        .and_then(|b| {
+            b.package_version
+                .ok_or(anyhow::anyhow!("No bindings found!"))
+        })
+        .map(|v| {
+            let mut bindings_packages = Vec::new();
+
+            for b in v.bindings.into_iter().flatten() {
+                let pkg = Bindings {
+                    id: b.id.into_inner(),
+                    url: b.url,
+                    language: b.language,
+                    generator: b.generator,
+                };
+                bindings_packages.push(pkg);
+            }
+
+            bindings_packages
+        })
 }
 
 /// Revoke an existing token
@@ -215,12 +252,40 @@ pub async fn get_app_volumes(
         .get_deploy_app
         .context("app not found")?
         .active_version
-        .volumes
+        .and_then(|v| v.volumes)
         .unwrap_or_default()
         .into_iter()
         .flatten()
         .collect();
     Ok(volumes)
+}
+
+/// Retrieve volumes for an app.
+pub async fn get_app_databases(
+    client: &WasmerClient,
+    owner: impl Into<String>,
+    name: impl Into<String>,
+) -> Result<Vec<types::AppDatabase>, anyhow::Error> {
+    let vars = types::GetAppDatabasesVars {
+        owner: owner.into(),
+        name: name.into(),
+        after: None,
+    };
+    let res = client
+        .run_graphql_strict(types::GetAppDatabases::build(vars))
+        .await?;
+
+    let app = res.get_deploy_app.context("app not found")?;
+    let dbs = app.databases;
+    let _ = dbs.page_info;
+
+    let dbs = dbs
+        .edges
+        .into_iter()
+        .flatten()
+        .flat_map(|edge| edge.node)
+        .collect::<Vec<_>>();
+    Ok(dbs)
 }
 
 /// Load the S3 credentials.
@@ -375,7 +440,7 @@ pub async fn fetch_webc_package(
     client: &WasmerClient,
     ident: &PackageIdent,
     default_registry: &Url,
-) -> Result<webc::compat::Container, anyhow::Error> {
+) -> Result<Container, anyhow::Error> {
     let url = match ident {
         PackageIdent::Named(n) => Url::parse(&format!(
             "{default_registry}/{}:{}",
@@ -399,7 +464,7 @@ pub async fn fetch_webc_package(
         .bytes()
         .await?;
 
-    webc::compat::Container::from_bytes(data).context("failed to parse webc package")
+    from_bytes(data).context("failed to parse webc package")
 }
 
 /// Fetch app templates.
@@ -796,6 +861,56 @@ pub async fn get_signed_url_for_package_upload(
         .await
         .map(|r| r.get_signed_url_for_package_upload)
 }
+
+/// Request a signed URL for uploading an app archive via the autobuild flow.
+pub async fn generate_upload_url(
+    client: &WasmerClient,
+    filename: &str,
+    name: Option<&str>,
+    version: Option<&str>,
+    expires_after_seconds: Option<i32>,
+) -> Result<SignedUrl, anyhow::Error> {
+    let payload = client
+        .run_graphql_strict(types::GenerateUploadUrl::build(
+            GenerateUploadUrlVariables {
+                expires_after_seconds,
+                filename,
+                name,
+                version,
+            },
+        ))
+        .await
+        .and_then(|res| {
+            res.generate_upload_url
+                .context("generateUploadUrl mutation did not return data")
+        })?;
+
+    Ok(payload.signed_url)
+}
+
+/// Retrieve autobuild metadata derived from a previously uploaded archive.
+pub async fn autobuild_config_for_zip_upload(
+    client: &WasmerClient,
+    upload_url: &str,
+) -> Result<Option<types::AutobuildConfigForZipUploadPayload>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::AutobuildConfigForZipUpload::build(
+            AutobuildConfigForZipUploadVariables { upload_url },
+        ))
+        .await
+        .map(|res| res.autobuild_config_for_zip_upload)
+}
+
+/// Trigger an autobuild deployment for an uploaded archive or repository.
+pub async fn deploy_via_autobuild(
+    client: &WasmerClient,
+    vars: DeployViaAutobuildVars,
+) -> Result<Option<types::DeployViaAutobuildPayload>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::DeployViaAutobuild::build(vars))
+        .await
+        .map(|res| res.deploy_via_autobuild)
+}
 /// Push a package to the registry.
 pub async fn push_package_release(
     client: &WasmerClient,
@@ -1008,6 +1123,41 @@ pub async fn get_deploy_app_versions(
         .await?;
     let versions = res.get_deploy_app.context("app not found")?.versions;
     Ok(versions)
+}
+
+/// Get app deployments for an app.
+pub async fn app_deployments(
+    client: &WasmerClient,
+    vars: types::GetAppDeploymentsVariables,
+) -> Result<Vec<types::Deployment>, anyhow::Error> {
+    let res = client
+        .run_graphql_strict(types::GetAppDeployments::build(vars))
+        .await?;
+    let builds = res
+        .get_deploy_app
+        .and_then(|x| x.deployments)
+        .context("no data returned")?
+        .edges
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.node)
+        .collect();
+
+    Ok(builds)
+}
+
+/// Get an app deployment by ID.
+pub async fn app_deployment(
+    client: &WasmerClient,
+    id: String,
+) -> Result<types::AutobuildRepository, anyhow::Error> {
+    let node = get_node(client, id.clone())
+        .await?
+        .with_context(|| format!("app deployment with id '{id}' not found"))?;
+    match node {
+        types::Node::AutobuildRepository(x) => Ok(*x),
+        _ => anyhow::bail!("invalid node type returned"),
+    }
 }
 
 /// Load all versions of an app.
@@ -1262,6 +1412,39 @@ pub async fn get_app_version_by_id_with_app(
     Ok((app, version))
 }
 
+pub async fn user_apps_page(
+    client: &WasmerClient,
+    sort: types::DeployAppsSortBy,
+    cursor: Option<String>,
+) -> Result<Paginated<types::DeployApp>, anyhow::Error> {
+    let user = client
+        .run_graphql(types::GetCurrentUserWithApps::build(
+            GetCurrentUserWithAppsVars {
+                after: cursor,
+                first: Some(10),
+                sort: Some(sort),
+            },
+        ))
+        .await?
+        .viewer
+        .context("not logged in")?;
+
+    let apps: Vec<_> = user
+        .apps
+        .edges
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.node)
+        .collect();
+
+    let out = Paginated {
+        items: apps,
+        next_cursor: user.apps.page_info.end_cursor,
+    };
+
+    Ok(out)
+}
+
 /// List all apps that are accessible by the current user.
 ///
 /// NOTE: this will only include the first pages and does not provide pagination.
@@ -1273,6 +1456,7 @@ pub async fn user_apps(
         let user = client
             .run_graphql(types::GetCurrentUserWithApps::build(
                 GetCurrentUserWithAppsVars {
+                    first: Some(10),
                     after: cursor,
                     sort: Some(sort),
                 },
@@ -1339,6 +1523,43 @@ pub async fn user_accessible_apps(
 /// Get apps for a specific namespace.
 ///
 /// NOTE: only retrieves the first page and does not do pagination.
+pub async fn namespace_apps_page(
+    client: &WasmerClient,
+    namespace: String,
+    sort: types::DeployAppsSortBy,
+    cursor: Option<String>,
+) -> Result<Paginated<types::DeployApp>, anyhow::Error> {
+    let namespace = namespace.clone();
+
+    let res = client
+        .run_graphql(types::GetNamespaceApps::build(GetNamespaceAppsVars {
+            name: namespace.to_string(),
+            after: cursor,
+            sort: Some(sort),
+        }))
+        .await?
+        .get_namespace
+        .context("namespace not found")?
+        .apps;
+
+    let apps: Vec<_> = res
+        .edges
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.node)
+        .collect();
+
+    let out = Paginated {
+        items: apps,
+        next_cursor: res.page_info.end_cursor,
+    };
+
+    Ok(out)
+}
+
+/// Get apps for a specific namespace.
+///
+/// NOTE: only retrieves the first page and does not do pagination.
 pub async fn namespace_apps(
     client: &WasmerClient,
     namespace: String,
@@ -1357,7 +1578,7 @@ pub async fn namespace_apps(
 
         let ns = res
             .get_namespace
-            .with_context(|| format!("failed to get namespace '{}'", namespace))?;
+            .with_context(|| format!("failed to get namespace '{namespace}'"))?;
 
         let apps: Vec<_> = ns
             .apps
@@ -1596,31 +1817,9 @@ pub fn get_package_releases_stream(
     )
 }
 
-/// Generate a new Edge token.
-pub async fn generate_deploy_token_raw(
-    client: &WasmerClient,
-    app_version_id: String,
-) -> Result<String, anyhow::Error> {
-    let res = client
-        .run_graphql(types::GenerateDeployToken::build(
-            types::GenerateDeployTokenVars { app_version_id },
-        ))
-        .await?;
-
-    res.generate_deploy_token
-        .map(|x| x.token)
-        .context("no token returned")
-}
-
-#[derive(Debug, PartialEq)]
-pub enum GenerateTokenBy {
-    Id(NetworkTokenV1),
-}
-
 #[derive(Debug, PartialEq)]
 pub enum TokenKind {
     SSH,
-    Network(GenerateTokenBy),
 }
 
 pub async fn generate_deploy_config_token_raw(
@@ -1632,15 +1831,33 @@ pub async fn generate_deploy_config_token_raw(
             types::GenerateDeployConfigTokenVars {
                 input: match token_kind {
                     TokenKind::SSH => "{}".to_string(),
-                    TokenKind::Network(by) => match by {
-                        GenerateTokenBy::Id(token) => serde_json::to_string(&token)?,
-                    },
                 },
             },
         ))
         .await?;
 
     res.generate_deploy_config_token
+        .map(|x| x.token)
+        .context("no token returned")
+}
+
+/// Generate an SSH token for accesing Edge over SSH or SFTP.
+///
+/// If an app id is provided, the token will be scoped to that app,
+/// and using the token will open an ssh context for that app.
+pub async fn generate_ssh_token(
+    client: &WasmerClient,
+    app_id: Option<String>,
+) -> Result<String, anyhow::Error> {
+    let res = client
+        .run_graphql_strict(types::GenerateSshToken::build(
+            types::GenerateSshTokenVariables {
+                app_id: app_id.map(cynic::Id::new),
+            },
+        ))
+        .await?;
+
+    res.generate_ssh_token
         .map(|x| x.token)
         .context("no token returned")
 }

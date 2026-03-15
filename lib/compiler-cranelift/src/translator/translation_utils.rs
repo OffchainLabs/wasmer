@@ -2,13 +2,14 @@
 
 use super::func_environ::TargetEnvironment;
 use crate::std::string::ToString;
-use core::u32;
-use cranelift_codegen::binemit::Reloc;
-use cranelift_codegen::ir::{self, AbiParam};
-use cranelift_codegen::isa::TargetFrontendConfig;
+use cranelift_codegen::{
+    binemit::Reloc,
+    ir::{self, AbiParam},
+    isa::TargetFrontendConfig,
+};
 use cranelift_frontend::FunctionBuilder;
-use wasmer_compiler::wasmparser;
-use wasmer_types::{FunctionType, LibCall, RelocationKind, Type, WasmError, WasmResult};
+use wasmer_compiler::{types::relocation::RelocationKind, wasm_unsupported, wasmparser};
+use wasmer_types::{FunctionType, LibCall, Type, WasmError, WasmResult};
 
 /// Helper function translate a Function signature into Cranelift Ir
 pub fn signature_to_cranelift_ir(
@@ -54,6 +55,9 @@ pub fn type_to_irtype(ty: Type, target_config: TargetFrontendConfig) -> WasmResu
         Type::F64 => Ok(ir::types::F64),
         Type::V128 => Ok(ir::types::I8X16),
         Type::ExternRef | Type::FuncRef => reference_type(target_config),
+        Type::ExceptionRef => Err(wasm_unsupported!(
+            "exnrefs are not supported yet in cranelift"
+        )),
         // ty => Err(wasm_unsupported!("type_to_type: wasm type {:?}", ty)),
     }
 }
@@ -84,8 +88,8 @@ pub fn irreloc_to_relocationkind(reloc: Reloc) -> RelocationKind {
         Reloc::X86CallPLTRel4 => RelocationKind::X86CallPLTRel4,
         Reloc::X86GOTPCRel4 => RelocationKind::X86GOTPCRel4,
         Reloc::Arm64Call => RelocationKind::Arm64Call,
-        Reloc::RiscvCall => RelocationKind::RiscvCall,
-        _ => panic!("The relocation {} is not yet supported.", reloc),
+        Reloc::RiscvCallPlt => RelocationKind::RiscvCall,
+        _ => panic!("The relocation {reloc} is not yet supported."),
     }
 }
 
@@ -115,8 +119,7 @@ pub fn block_with_params<'a, PE: TargetEnvironment + ?Sized>(
                     builder.append_block_param(block, environ.reference_type());
                 } else {
                     return Err(WasmError::Unsupported(format!(
-                        "unsupported reference type: {:?}",
-                        ty
+                        "unsupported reference type: {ty:?}"
                     )));
                 }
             }

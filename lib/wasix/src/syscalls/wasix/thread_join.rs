@@ -10,11 +10,13 @@ use crate::syscalls::*;
 /// ## Parameters
 ///
 /// * `tid` - Handle of the thread to wait on
-//#[instrument(level = "debug", skip_all, fields(%join_tid), ret)]
+//#[instrument(level = "trace", skip_all, fields(%join_tid), ret)]
 pub fn thread_join<M: MemorySize + 'static>(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     join_tid: Tid,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     thread_join_internal::<M>(ctx, join_tid)
 }
 
@@ -22,7 +24,6 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     join_tid: Tid,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
     if let Some(_child_exit_code) = unsafe { handle_rewind::<M, i32>(&mut ctx) } {
         return Ok(Errno::Success);
     }
@@ -37,10 +38,7 @@ pub(super) fn thread_join_internal<M: MemorySize + 'static>(
             other_thread
                 .join()
                 .await
-                .map_err(|err| {
-                    err.as_exit_code()
-                        .unwrap_or(ExitCode::Errno(Errno::Unknown))
-                })
+                .map_err(|err| err.as_exit_code().unwrap_or(ExitCode::from(Errno::Unknown)))
                 .unwrap_or_else(|a| a)
                 .raw()
         })?;

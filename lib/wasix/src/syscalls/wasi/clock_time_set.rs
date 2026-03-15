@@ -9,11 +9,13 @@ use crate::syscalls::*;
 /// - `Timestamp *time`
 ///     The value of the clock in nanoseconds
 #[instrument(level = "trace", skip_all, fields(?clock_id, %time), ret)]
-pub fn clock_time_set<M: MemorySize>(
+pub fn clock_time_set(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     clock_id: Snapshot0Clockid,
     time: Timestamp,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let ret = clock_time_set_internal(&mut ctx, clock_id, time);
     let env = ctx.data();
 
@@ -22,7 +24,7 @@ pub fn clock_time_set<M: MemorySize>(
         if env.enable_journal {
             JournalEffector::save_clock_time_set(&mut ctx, clock_id, time).map_err(|err| {
                 tracing::error!("failed to save clock time set event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             })?;
         }
     }

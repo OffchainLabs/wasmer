@@ -17,6 +17,7 @@ use wasmer_wasix_types::{
 
 use crate::{
     os::task::process::{WasiProcessId, WasiProcessInner},
+    state::LinkError,
     syscalls::HandleRewindType,
     WasiRuntimeError,
 };
@@ -318,6 +319,7 @@ impl WasiThread {
     pub fn set_or_get_exit_code_for_signal(&self, sig: Signal) -> ExitCode {
         let default_exitcode: ExitCode = match sig {
             Signal::Sigquit | Signal::Sigabrt => Errno::Success.into(),
+            Signal::Sigpipe => Errno::Pipe.into(),
             _ => Errno::Intr.into(),
         };
         // This will only set the status code if its not already set
@@ -372,7 +374,7 @@ impl WasiThread {
         struct SignalPoller<'a> {
             thread: &'a WasiThread,
         }
-        impl<'a> std::future::Future for SignalPoller<'a> {
+        impl std::future::Future for SignalPoller<'_> {
             type Output = ();
             fn poll(
                 self: std::pin::Pin<&mut Self>,
@@ -400,6 +402,13 @@ impl WasiThread {
                 None
             }
             false => Some(ret),
+        }
+    }
+
+    pub fn signals_subscribe(&self, waker: &Waker) {
+        let mut guard = self.state.signals.lock().unwrap();
+        if !guard.1.iter().any(|w| w.will_wake(waker)) {
+            guard.1.push(waker.clone());
         }
     }
 
@@ -617,7 +626,9 @@ pub enum WasiThreadError {
     MemoryCreateFailed(MemoryError),
     #[error("{0}")]
     ExportError(ExportError),
-    #[error("Failed to create the instance")]
+    #[error("Linker error: {0}")]
+    LinkError(Arc<LinkError>),
+    #[error("Failed to create the instance - {0}")]
     // Note: Boxed so we can keep the error size down
     InstanceCreateFailed(Box<InstantiationError>),
     #[error("Initialization function failed - {0}")]
@@ -634,6 +645,7 @@ impl From<WasiThreadError> for Errno {
             WasiThreadError::MethodNotFound => Errno::Inval,
             WasiThreadError::MemoryCreateFailed(_) => Errno::Nomem,
             WasiThreadError::ExportError(_) => Errno::Noexec,
+            WasiThreadError::LinkError(_) => Errno::Noexec,
             WasiThreadError::InstanceCreateFailed(_) => Errno::Noexec,
             WasiThreadError::InitFailed(_) => Errno::Noexec,
             WasiThreadError::InvalidWasmContext => Errno::Noexec,

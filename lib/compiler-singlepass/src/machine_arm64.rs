@@ -2,22 +2,29 @@ use dynasmrt::{aarch64::Aarch64Relocation, VecAssembler};
 #[cfg(feature = "unwind")]
 use gimli::{write::CallFrameInstruction, AArch64};
 
-use wasmer_compiler::wasmparser::ValType as WpType;
+use wasmer_compiler::{
+    types::{
+        address_map::InstructionAddressMap,
+        function::FunctionBody,
+        relocation::{Relocation, RelocationKind, RelocationTarget},
+        section::CustomSection,
+    },
+    wasmparser::{MemArg, ValType as WpType},
+};
 use wasmer_types::{
-    CallingConvention, CompileError, CpuFeature, CustomSection, FunctionBody, FunctionIndex,
-    FunctionType, InstructionAddressMap, Relocation, RelocationKind, RelocationTarget, SourceLoc,
-    Target, TrapCode, TrapInformation, VMOffsets,
+    target::{CallingConvention, CpuFeature, Target},
+    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, VMOffsets,
 };
 
-use crate::arm64_decl::new_machine_state;
-use crate::arm64_decl::{GPR, NEON};
-use crate::codegen_error;
-use crate::common_decl::*;
-use crate::emitter_arm64::*;
-use crate::location::Location as AbstractLocation;
-use crate::location::Reg;
-use crate::machine::*;
-use crate::unwind::{UnwindInstructions, UnwindOps};
+use crate::{
+    arm64_decl::{new_machine_state, GPR, NEON},
+    codegen_error,
+    common_decl::*,
+    emitter_arm64::*,
+    location::{Location as AbstractLocation, Reg},
+    machine::*,
+    unwind::{UnwindInstructions, UnwindOps},
+};
 
 type Assembler = VecAssembler<Aarch64Relocation>;
 type Location = AbstractLocation<GPR, NEON>;
@@ -95,7 +102,7 @@ fn dwarf_index(reg: u16) -> gimli::Register {
     match reg {
         0..=31 => DWARF_GPR[reg as usize],
         64..=95 => DWARF_NEON[reg as usize - 64],
-        _ => panic!("Unknown register index {}", reg),
+        _ => panic!("Unknown register index {reg}"),
     }
 }
 
@@ -2302,7 +2309,7 @@ impl Machine for MachineARM64 {
     // assembler finalize
     fn assembler_finalize(self) -> Result<Vec<u8>, CompileError> {
         self.assembler.finalize().map_err(|e| {
-            CompileError::Codegen(format!("Assembler failed finalization with: {:?}", e))
+            CompileError::Codegen(format!("Assembler failed finalization with: {e:?}"))
         })
     }
 
@@ -5033,7 +5040,7 @@ impl Machine for MachineARM64 {
             dest
         };
         self.assembler
-            .emit_cbz_label(Size::S64, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S64, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_udiv(Size::S64, src1, src2, dest)?;
         // unsigned remainder : src1 - (src1/src2)*src2
@@ -5071,7 +5078,7 @@ impl Machine for MachineARM64 {
             dest
         };
         self.assembler
-            .emit_cbz_label(Size::S64, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S64, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_sdiv(Size::S64, src1, src2, dest)?;
         // unsigned remainder : src1 - (src1/src2)*src2

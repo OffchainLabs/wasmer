@@ -6,14 +6,14 @@ use crate::syscalls::*;
 /// Inputs:
 /// - `Fd fd`
 ///     The file descriptor to sync
-#[instrument(level = "debug", skip_all, fields(%fd), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd), ret)]
 pub fn fd_datasync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
     let state = env.state.clone();
     let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-    if !fd_entry.rights.contains(Rights::FD_DATASYNC) {
+    if !fd_entry.inner.rights.contains(Rights::FD_DATASYNC) {
         return Ok(Errno::Access);
     }
 

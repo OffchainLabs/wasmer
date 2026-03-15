@@ -1,9 +1,8 @@
 //! Runtime library support for Wasmer.
 
 #![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
-#![deny(trivial_numeric_casts, unused_extern_crates)]
 #![warn(unused_import_braces)]
-#![allow(clippy::new_without_default, clippy::vtable_address_comparisons)]
+#![allow(clippy::new_without_default, ambiguous_wide_pointer_comparisons)]
 #![warn(
     clippy::float_arithmetic,
     clippy::mut_mut,
@@ -15,6 +14,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod exception_ref;
 mod export;
 mod extern_ref;
 mod function_env;
@@ -35,6 +35,7 @@ pub mod libcalls;
 
 use std::ptr::NonNull;
 
+pub use crate::exception_ref::{VMExceptionObj, VMExceptionRef};
 pub use crate::export::*;
 pub use crate::extern_ref::{VMExternObj, VMExternRef};
 pub use crate::function_env::VMFunctionEnvironment;
@@ -56,8 +57,10 @@ pub use crate::trap::*;
 pub use crate::vmcontext::{
     VMCallerCheckedAnyfunc, VMContext, VMDynamicFunctionContext, VMFunctionContext,
     VMFunctionImport, VMFunctionKind, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition,
-    VMMemoryImport, VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
+    VMMemoryImport, VMSharedSignatureIndex, VMSharedTagIndex, VMTableDefinition, VMTableImport,
+    VMTrampoline,
 };
+pub use store::StoreObject;
 pub use wasmer_types::LibCall;
 pub use wasmer_types::MemoryError;
 pub use wasmer_types::MemoryStyle;
@@ -90,6 +93,7 @@ pub struct VMFunctionBody(u8);
 
 /// A safe wrapper around `VMFunctionBody`.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[repr(transparent)]
 pub struct FunctionBodyPtr(pub *const VMFunctionBody);
 
