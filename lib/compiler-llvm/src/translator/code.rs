@@ -1738,26 +1738,6 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             "typed_func_ptr",
         ));
 
-        /*
-        if self.track_state {
-            if let Some(offset) = opcode_offset {
-                let mut stackmaps = self.stackmaps.borrow_mut();
-                emit_stack_map(
-                    &info,
-                    self.intrinsics,
-                    self.builder,
-                    self.index,
-                    &mut *stackmaps,
-                    StackmapEntryKind::Call,
-                    &self.locals,
-                    state,
-                    ctx,
-                    offset,
-                )
-            }
-        }
-        */
-
         let call_site_local = self.build_indirect_call_or_invoke(
             llvm_func_type,
             typed_func_ptr,
@@ -1810,91 +1790,6 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
     }
 }
 
-/*
-fn emit_stack_map<'ctx>(
-    intrinsics: &Intrinsics<'ctx>,
-    builder: &Builder<'ctx>,
-    local_function_id: usize,
-    target: &mut StackmapRegistry,
-    kind: StackmapEntryKind,
-    locals: &[PointerValue],
-    state: &State<'ctx>,
-    _ctx: &mut CtxType<'ctx>,
-    opcode_offset: usize,
-) {
-    let stackmap_id = target.entries.len();
-
-    let mut params = Vec::with_capacity(2 + locals.len() + state.stack.len());
-
-    params.push(
-        intrinsics
-            .i64_ty
-            .const_int(stackmap_id as u64, false)
-            .as_basic_value_enum(),
-    );
-    params.push(intrinsics.i32_ty.const_zero().as_basic_value_enum());
-
-    let locals: Vec<_> = locals.iter().map(|x| x.as_basic_value_enum()).collect();
-    let mut value_semantics: Vec<ValueSemantic> =
-        Vec::with_capacity(locals.len() + state.stack.len());
-
-    params.extend_from_slice(&locals);
-    value_semantics.extend((0..locals.len()).map(ValueSemantic::WasmLocal));
-
-    params.extend(state.stack.iter().map(|x| x.0));
-    value_semantics.extend((0..state.stack.len()).map(ValueSemantic::WasmStack));
-
-    // FIXME: Information needed for Abstract -> Runtime state transform is not fully preserved
-    // to accelerate compilation and reduce memory usage. Check this again when we try to support
-    // "full" LLVM OSR.
-
-    assert_eq!(params.len(), value_semantics.len() + 2);
-
-    builder.build_call(intrinsics.experimental_stackmap, &params, "");
-
-    target.entries.push(StackmapEntry {
-        kind,
-        local_function_id,
-        local_count: locals.len(),
-        stack_count: state.stack.len(),
-        opcode_offset,
-        value_semantics,
-        is_start: true,
-    });
-}
-
-fn finalize_opcode_stack_map<'ctx>(
-    intrinsics: &Intrinsics<'ctx>,
-    builder: &Builder<'ctx>,
-    local_function_id: usize,
-    target: &mut StackmapRegistry,
-    kind: StackmapEntryKind,
-    opcode_offset: usize,
-) {
-    let stackmap_id = target.entries.len();
-    builder.build_call(
-        intrinsics.experimental_stackmap,
-        &[
-            intrinsics
-                .i64_ty
-                .const_int(stackmap_id as u64, false)
-                .as_basic_value_enum(),
-            intrinsics.i32_ty.const_zero().as_basic_value_enum(),
-        ],
-        "opcode_stack_map_end",
-    );
-    target.entries.push(StackmapEntry {
-        kind,
-        local_function_id,
-        local_count: 0,
-        stack_count: 0,
-        opcode_offset,
-        value_semantics: vec![],
-        is_start: false,
-    });
-}
- */
-
 pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     m0_param: Option<PointerValue<'ctx>>,
     context: &'ctx Context,
@@ -1908,14 +1803,6 @@ pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     unreachable_depth: usize,
     memory_styles: &'a PrimaryMap<MemoryIndex, MemoryStyle>,
     _table_styles: &'a PrimaryMap<TableIndex, TableStyle>,
-
-    // This is support for stackmaps:
-    /*
-    stackmaps: Rc<RefCell<StackmapRegistry>>,
-    index: usize,
-    opcode_offset: usize,
-    track_state: bool,
-    */
     module: &'a Module<'ctx>,
     module_translation: &'a ModuleTranslationState,
     wasm_module: &'a ModuleInfo,
@@ -2307,7 +2194,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 // For each result of the block we're branching to,
                 // pop a value off the value stack and load it into
                 // the corresponding phi.
-                for (phi, value) in phis.iter().zip(values.into_iter()) {
+                for (phi, value) in phis.iter().zip(values) {
                     phi.add_incoming(&[(&value, current_block)]);
                 }
 
@@ -3088,25 +2975,6 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         self.m0_param,
                     )?;
 
-                    /*
-                    if self.track_state {
-                        if let Some(offset) = opcode_offset {
-                            let mut stackmaps = self.stackmaps.borrow_mut();
-                            emit_stack_map(
-                                &info,
-                                self.intrinsics,
-                                self.builder,
-                                self.index,
-                                &mut *stackmaps,
-                                StackmapEntryKind::Call,
-                                &self.locals,
-                                state,
-                                ctx,
-                                offset,
-                            )
-                        }
-                    }
-                    */
                     let call_site = self.build_indirect_call_or_invoke(
                         llvm_func_type,
                         func,
@@ -3116,21 +2984,6 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     for (attr, attr_loc) in attrs {
                         call_site.add_attribute(attr_loc, attr);
                     }
-                    /*
-                    if self.track_state {
-                        if let Some(offset) = opcode_offset {
-                            let mut stackmaps = self.stackmaps.borrow_mut();
-                            finalize_opcode_stack_map(
-                                self.intrinsics,
-                                self.builder,
-                                self.index,
-                                &mut *stackmaps,
-                                StackmapEntryKind::Call,
-                                offset,
-                            )
-                        }
-                    }
-                    */
 
                     self.abi
                         .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
@@ -13789,6 +13642,110 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 }
 
                 self.state.reachable = false;
+            }
+            Operator::I64Add128 | Operator::I64Sub128 => {
+                let (rhs_hi, rhs_hi_info) = self.state.pop1_extra()?;
+                let (rhs_lo, rhs_lo_info) = self.state.pop1_extra()?;
+                let (lhs_hi, lhs_hi_info) = self.state.pop1_extra()?;
+                let (lhs_lo, lhs_lo_info) = self.state.pop1_extra()?;
+
+                let lhs_lo = self
+                    .apply_pending_canonicalization(lhs_lo, lhs_lo_info)?
+                    .into_int_value();
+                let lhs_hi = self
+                    .apply_pending_canonicalization(lhs_hi, lhs_hi_info)?
+                    .into_int_value();
+                let rhs_lo = self
+                    .apply_pending_canonicalization(rhs_lo, rhs_lo_info)?
+                    .into_int_value();
+                let rhs_hi = self
+                    .apply_pending_canonicalization(rhs_hi, rhs_hi_info)?
+                    .into_int_value();
+
+                let idx0 = self.intrinsics.i32_ty.const_zero();
+                let idx1 = self.intrinsics.i32_ty.const_int(1, false);
+
+                let lhs = self.intrinsics.i64x2_ty.get_undef();
+                let lhs = err!(self.builder.build_insert_element(lhs, lhs_lo, idx0, ""));
+                let lhs = err!(self.builder.build_insert_element(lhs, lhs_hi, idx1, ""));
+                let lhs = err!(
+                    self.builder
+                        .build_bit_cast(lhs, self.intrinsics.i128_ty, "a")
+                )
+                .into_int_value();
+
+                let rhs = self.intrinsics.i64x2_ty.get_undef();
+                let rhs = err!(self.builder.build_insert_element(rhs, rhs_lo, idx0, ""));
+                let rhs = err!(self.builder.build_insert_element(rhs, rhs_hi, idx1, ""));
+                let rhs = err!(
+                    self.builder
+                        .build_bit_cast(rhs, self.intrinsics.i128_ty, "b")
+                )
+                .into_int_value();
+
+                let result = err!(match op {
+                    Operator::I64Add128 => self.builder.build_int_add(lhs, rhs, ""),
+                    Operator::I64Sub128 => self.builder.build_int_sub(lhs, rhs, ""),
+                    _ => unreachable!(),
+                });
+                let result = err!(self.builder.build_bit_cast(
+                    result,
+                    self.intrinsics.i64x2_ty,
+                    ""
+                ))
+                .into_vector_value();
+                let result_lo = err!(self.builder.build_extract_element(result, idx0, ""));
+                let result_hi = err!(self.builder.build_extract_element(result, idx1, ""));
+
+                self.state.push1(result_lo);
+                self.state.push1(result_hi);
+            }
+            Operator::I64MulWideS | Operator::I64MulWideU => {
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_int_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_int_value();
+
+                let lhs = err!(match op {
+                    Operator::I64MulWideS => {
+                        self.builder
+                            .build_int_s_extend(lhs, self.intrinsics.i128_ty, "a")
+                    }
+                    Operator::I64MulWideU => {
+                        self.builder
+                            .build_int_z_extend(lhs, self.intrinsics.i128_ty, "a")
+                    }
+                    _ => unreachable!(),
+                });
+                let rhs = err!(match op {
+                    Operator::I64MulWideS => {
+                        self.builder
+                            .build_int_s_extend(rhs, self.intrinsics.i128_ty, "b")
+                    }
+                    Operator::I64MulWideU => {
+                        self.builder
+                            .build_int_z_extend(rhs, self.intrinsics.i128_ty, "b")
+                    }
+                    _ => unreachable!(),
+                });
+
+                let result = err!(self.builder.build_int_mul(lhs, rhs, ""));
+                let result = err!(self.builder.build_bit_cast(
+                    result,
+                    self.intrinsics.i64x2_ty,
+                    ""
+                ))
+                .into_vector_value();
+                let idx0 = self.intrinsics.i32_ty.const_zero();
+                let idx1 = self.intrinsics.i32_ty.const_int(1, false);
+                let result_lo = err!(self.builder.build_extract_element(result, idx0, ""));
+                let result_hi = err!(self.builder.build_extract_element(result, idx1, ""));
+
+                self.state.push1(result_lo);
+                self.state.push1(result_hi);
             }
             _ => {
                 return Err(CompileError::Codegen(format!(
