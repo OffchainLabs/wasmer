@@ -9,18 +9,19 @@ use std::{
     io::Write,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use derivative::*;
+use futures::future::Either;
 use linked_hash_set::LinkedHashSet;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 #[allow(unused_imports, dead_code)]
 use tracing::{debug, error, info, trace, warn};
 use virtual_fs::{
     ArcBoxFile, ArcFile, AsyncWriteExt, CombineFile, DeviceFile, DuplexPipe, FileSystem, Pipe,
     PipeRx, PipeTx, RootFileSystemBuilder, StaticFile, VirtualFile,
 };
+use virtual_mio::block_on;
 #[cfg(feature = "sys")]
 use wasmer::Engine;
 use wasmer_config::package::PackageSource;
@@ -28,15 +29,14 @@ use wasmer_wasix_types::{types::__WASI_STDIN_FILENO, wasi::Errno};
 
 use super::{cconst::ConsoleConst, common::*, task::TaskJoinHandle};
 use crate::{
-    bin_factory::{spawn_exec, BinFactory, BinaryPackage},
+    Runtime, SpawnError, WasiEnv, WasiEnvBuilder, WasiRuntimeError,
+    bin_factory::{BinFactory, BinaryPackage, spawn_exec},
     capabilities::Capabilities,
     os::task::{control_plane::WasiControlPlane, process::WasiProcess},
-    runtime::task_manager::InlineWaker,
-    Runtime, SpawnError, WasiEnv, WasiEnvBuilder, WasiRuntimeError,
+    runners::wasi::{PackageOrHash, RuntimeOrEngine},
 };
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct Console {
     user_agent: Option<String>,
     boot_cmd: String,
@@ -179,7 +179,7 @@ impl Console {
             }
         };
 
-        let resolved_package = InlineWaker::block_on(BinaryPackage::from_registry(
+        let resolved_package = block_on(BinaryPackage::from_registry(
             &webc_ident,
             self.runtime.as_ref(),
         ));
@@ -188,7 +188,7 @@ impl Console {
             Ok(pkg) => pkg,
             Err(e) => {
                 let mut stderr = self.stderr.clone();
-                InlineWaker::block_on(async {
+                block_on(async {
                     let mut buffer = Vec::new();
                     writeln!(buffer, "Error: {e}").ok();
                     let mut source = e.source();
@@ -222,7 +222,7 @@ impl Console {
         }
 
         let builder = crate::runners::wasi::WasiRunner::new()
-            .with_envs(self.env.clone().into_iter())
+            .with_envs(self.env.clone())
             .with_args(args)
             .with_capabilities(self.capabilities.clone())
             .with_stdin(Box::new(self.stdin.clone()))
@@ -231,8 +231,8 @@ impl Console {
             .prepare_webc_env(
                 prog,
                 &wasi_opts,
-                Some(&pkg),
-                self.runtime.clone(),
+                PackageOrHash::Package(&pkg),
+                RuntimeOrEngine::Runtime(self.runtime.clone()),
                 Some(root_fs),
             )
             // TODO: better error conversion
@@ -242,20 +242,17 @@ impl Console {
 
         // Display the welcome message
         if !self.whitelabel && !self.no_welcome {
-            InlineWaker::block_on(self.draw_welcome());
+            block_on(self.draw_welcome());
         }
 
         let wasi_process = env.process.clone();
 
         if let Err(err) = env.uses(self.uses.clone()) {
             let mut stderr = self.stderr.clone();
-            InlineWaker::block_on(async {
-                virtual_fs::AsyncWriteExt::write_all(
-                    &mut stderr,
-                    format!("{}\r\n", err).as_bytes(),
-                )
-                .await
-                .ok();
+            block_on(async {
+                virtual_fs::AsyncWriteExt::write_all(&mut stderr, format!("{err}\r\n").as_bytes())
+                    .await
+                    .ok();
             });
             tracing::debug!("failed to load used dependency - {}", err);
             return Err(SpawnError::BadRequest);
@@ -274,14 +271,13 @@ impl Console {
                 .write(true)
                 .open(&path)
                 .map_err(|err| SpawnError::Other(err.into()))?;
-            InlineWaker::block_on(file.copy_reference(Box::new(StaticFile::new(data))))
+            block_on(file.copy_reference(Box::new(StaticFile::new(data))))
                 .map_err(|err| SpawnError::Other(err.into()))?;
         }
 
         // Build the config
         // Run the binary
-        let store = self.runtime.new_store();
-        let process = InlineWaker::block_on(spawn_exec(pkg, prog, store, env, &self.runtime))?;
+        let process = block_on(spawn_exec(pkg, prog, env, &self.runtime))?;
 
         // Return the process
         Ok((process, wasi_process))
@@ -315,8 +311,8 @@ mod tests {
     use std::{io::Read, sync::Arc};
 
     use crate::{
-        runtime::{package_loader::BuiltinPackageLoader, task_manager::tokio::TokioTaskManager},
         PluggableRuntime,
+        runtime::{package_loader::BuiltinPackageLoader, task_manager::tokio::TokioTaskManager},
     };
 
     /// Test that [`Console`] correctly runs a command with arguments and
@@ -338,8 +334,7 @@ mod tests {
         let tm = TokioTaskManager::new(tokio_rt);
         let mut rt = PluggableRuntime::new(Arc::new(tm));
         let client = rt.http_client().unwrap().clone();
-        rt.set_engine(Some(wasmer::Engine::default()))
-            .set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
+        rt.set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
 
         let env: HashMap<String, String> = [("MYENV1".to_string(), "VAL1".to_string())]
             .into_iter()
@@ -366,7 +361,6 @@ mod tests {
                 )
                 .await?;
 
-                stdin_tx.close();
                 std::mem::drop(stdin_tx);
 
                 let res = handle.wait_finished().await?;
@@ -393,8 +387,7 @@ mod tests {
         let tm = TokioTaskManager::new(tokio_rt);
         let mut rt = PluggableRuntime::new(Arc::new(tm));
         let client = rt.http_client().unwrap().clone();
-        rt.set_engine(Some(wasmer::Engine::default()))
-            .set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
+        rt.set_package_loader(BuiltinPackageLoader::new().with_shared_http_client(client));
 
         let cmd = "wasmer-tests/python-env-dump --help";
 

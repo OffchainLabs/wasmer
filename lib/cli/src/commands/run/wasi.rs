@@ -2,29 +2,32 @@ use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{mpsc::Sender, Arc},
+    sync::{Arc, mpsc::Sender},
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
+use itertools::Itertools;
 use tokio::runtime::Handle;
 use url::Url;
 use virtual_fs::{DeviceFile, FileSystem, PassthruFileSystem, RootFileSystemBuilder};
+use virtual_net::ruleset::Ruleset;
 use wasmer::{Engine, Function, Instance, Memory32, Memory64, Module, RuntimeError, Store, Value};
 use wasmer_config::package::PackageSource as PackageSpecifier;
-use wasmer_registry::wasmer_env::WasmerEnv;
 use wasmer_types::ModuleHash;
 #[cfg(feature = "journal")]
 use wasmer_wasix::journal::{LogFileJournal, SnapshotTrigger};
 use wasmer_wasix::{
+    PluggableRuntime, RewindState, Runtime, WasiEnv, WasiEnvBuilder, WasiError, WasiFunctionEnv,
+    WasiVersion,
     bin_factory::BinaryPackage,
     capabilities::Capabilities,
     default_fs_backing, get_wasi_versions,
     http::HttpClient,
-    journal::{CompactingLogFileJournal, DynJournal},
-    os::{tty_sys::SysTty, TtyBridge},
+    journal::{CompactingLogFileJournal, DynJournal, DynReadableJournal},
+    os::{TtyBridge, tty_sys::SysTty},
     rewind_ext,
     runners::MAPPED_CURRENT_DIR_DEFAULT_PATH,
     runners::{MappedCommand, MappedDirectory},
@@ -35,21 +38,22 @@ use wasmer_wasix::{
             BackendSource, FileSystemSource, InMemorySource, MultiSource, Source, WebSource,
         },
         task_manager::{
-            tokio::{RuntimeOrHandle, TokioTaskManager},
             VirtualTaskManagerExt,
+            tokio::{RuntimeOrHandle, TokioTaskManager},
         },
     },
     types::__WASI_STDIN_FILENO,
     wasmer_wasix_types::wasi::Errno,
-    PluggableRuntime, RewindState, Runtime, WasiEnv, WasiEnvBuilder, WasiError, WasiFunctionEnv,
-    WasiVersion,
 };
 
-use crate::utils::{parse_envvar, parse_mapdir};
+use crate::{
+    config::{UserRegistry, WasmerEnv},
+    utils::{parse_envvar, parse_mapdir, parse_volume},
+};
 
 use super::{
+    CliPackageSource, ExecutableTarget,
     capabilities::{self, PkgCapabilityCache},
-    ExecutableTarget, PackageSource,
 };
 
 const WAPM_SOURCE_CACHE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -57,17 +61,30 @@ const WAPM_SOURCE_CACHE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Parser, Clone, Default)]
 /// WASI Options
 pub struct Wasi {
-    /// WASI pre-opened directory
-    #[clap(long = "dir", name = "DIR", group = "wasi")]
-    pub(crate) pre_opened_directories: Vec<PathBuf>,
-
     /// Map a host directory to a different location for the Wasm module
     #[clap(
-        long = "mapdir",
-        name = "GUEST_DIR:HOST_DIR",
-        value_parser=parse_mapdir,
+        long = "volume",
+        name = "[HOST_DIR:]GUEST_DIR",
+        value_parser = parse_volume,
     )]
+    pub(crate) volumes: Vec<MappedDirectory>,
+
+    // Legacy option
+    #[clap(long = "dir", group = "wasi", hide = true)]
+    pub(crate) pre_opened_directories: Vec<PathBuf>,
+
+    // Legacy option
+    #[clap(
+        long = "mapdir",
+        value_parser = parse_mapdir,
+        hide = true
+     )]
     pub(crate) mapped_dirs: Vec<MappedDirectory>,
+
+    /// Set the module's initial CWD to this path; does not work with
+    /// WASI preview 1 modules.
+    #[clap(long = "cwd")]
+    pub(crate) cwd: Option<PathBuf>,
 
     /// Pass custom environment variables
     #[clap(
@@ -97,16 +114,41 @@ pub struct Wasi {
     /// Enable networking with the host network.
     ///
     /// Allows WASI modules to open TCP and UDP connections, create sockets, ...
-    #[clap(long = "net")]
-    pub networking: bool,
+    ///
+    /// Optionally, a set of network filters could be defined which allows fine-grained
+    /// control over the network sandbox.
+    ///
+    /// Rule Syntax:
+    ///
+    /// <rule-type>:<allow|deny>=<rule-expression>
+    ///
+    /// Examples:
+    ///
+    ///  - Allow a specific domain and port: dns:allow=example.com:80
+    ///
+    ///  - Deny a domain and all its subdomains on all ports: dns:deny=*danger.xyz:*
+    ///
+    ///  - Allow opening ipv4 sockets only on a specific IP and port: ipv4:allow=127.0.0.1:80/in.
+    #[clap(long = "net", require_equals = true)]
+    // Note that when --net is passed to the cli, the first Option will be initialized: Some(None)
+    // and when --net=<ruleset> is specified, the inner Option will be initialized: Some(Some(ruleset))
+    pub networking: Option<Option<String>>,
 
     /// Disables the TTY bridge
     #[clap(long = "no-tty")]
     pub no_tty: bool,
 
-    /// Enables asynchronous threading
-    #[clap(long = "enable-async-threads")]
-    pub enable_async_threads: bool,
+    /// Enables or disables asynchronous threading.
+    ///
+    /// If omitted, the runtime default is used.
+    #[clap(
+        long = "enable-async-threads",
+        require_equals = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = clap::ArgAction::Set
+    )]
+    pub enable_async_threads: Option<bool>,
 
     /// Enables an exponential backoff (measured in milli-seconds) of
     /// the process CPU usage when there are no active run tokens (when set
@@ -114,6 +156,15 @@ pub struct Wasi {
     /// (default = off)
     #[clap(long = "enable-cpu-backoff")]
     pub enable_cpu_backoff: Option<u64>,
+
+    /// Specifies one or more journal files that Wasmer will use to restore
+    /// the state of the WASM process as it executes.
+    ///
+    /// The state of the WASM process and its sandbox will be reapplied using
+    /// the journals in the order that you specify here.
+    #[cfg(feature = "journal")]
+    #[clap(long = "journal")]
+    pub read_only_journals: Vec<PathBuf>,
 
     /// Specifies one or more journal files that Wasmer will use to restore
     /// and save the state of the WASM process as it executes.
@@ -125,8 +176,8 @@ pub struct Wasi {
     /// and opened for read and write. New journal events will be written to this
     /// file
     #[cfg(feature = "journal")]
-    #[clap(long = "journal")]
-    pub journals: Vec<PathBuf>,
+    #[clap(long = "journal-writable")]
+    pub writable_journals: Vec<PathBuf>,
 
     /// Flag that indicates if the journal will be automatically compacted
     /// as it fills up and when the process exits
@@ -152,7 +203,8 @@ pub struct Wasi {
     /// and written to the journal file.
     ///
     /// If not specified, the default is to snapshot when the process idles, when
-    /// the process exits or periodically if an interval argument is also supplied.
+    /// the process exits or periodically if an interval argument is also supplied,
+    /// as well as when the process requests a snapshot explicitly.
     ///
     /// Additionally if the snapshot-on is not specified it will also take a snapshot
     /// on the first stdin, environ or socket listen - this can be used to accelerate
@@ -168,6 +220,17 @@ pub struct Wasi {
     #[clap(long = "snapshot-period")]
     pub snapshot_interval: Option<u64>,
 
+    /// If specified, the runtime will stop executing the WASM module after the first snapshot
+    /// is taken.
+    #[cfg(feature = "journal")]
+    #[clap(long = "stop-after-snapshot")]
+    pub stop_after_snapshot: bool,
+
+    /// Skip writes to stdout and stderr when replying journal events to bootstrap a module.
+    #[cfg(feature = "journal")]
+    #[clap(long = "skip-journal-stdio")]
+    pub skip_stdio_during_bootstrap: bool,
+
     /// Allow instances to send http requests.
     ///
     /// Access to domains is granted by default.
@@ -177,6 +240,13 @@ pub struct Wasi {
     /// Require WASI modules to only import 1 version of WASI.
     #[clap(long = "deny-multiple-wasi-versions")]
     pub deny_multiple_wasi_versions: bool,
+
+    /// Disable the cache for the compiled modules.
+    ///
+    /// Cache is used to speed up the loading of modules, as the
+    /// generated artifacts are cached.
+    #[clap(long = "disable-cache")]
+    disable_cache: bool,
 }
 
 pub struct RunProperties {
@@ -186,10 +256,17 @@ pub struct RunProperties {
     pub args: Vec<String>,
 }
 
+fn endpoint_to_folder(url: &Url) -> String {
+    url.to_string()
+        .replace("registry.wasmer.io", "wasmer.io")
+        .replace("registry.wasmer.wtf", "wasmer.wtf")
+        .replace(|c| "/:?&=#%\\".contains(c), "_")
+}
+
 #[allow(dead_code)]
 impl Wasi {
     pub fn map_dir(&mut self, alias: &str, target_on_disk: PathBuf) {
-        self.mapped_dirs.push(MappedDirectory {
+        self.volumes.push(MappedDirectory {
             guest: alias.to_string(),
             host: target_on_disk,
         });
@@ -213,6 +290,18 @@ impl Wasi {
         // Get the wasi version in non-strict mode, so no other imports
         // are allowed
         get_wasi_versions(module, false).is_some()
+    }
+
+    pub(crate) fn all_volumes(&self) -> Vec<MappedDirectory> {
+        self.volumes
+            .iter()
+            .cloned()
+            .chain(self.pre_opened_directories.iter().map(|d| MappedDirectory {
+                host: d.clone(),
+                guest: d.to_str().expect("must be a valid path string").to_string(),
+            }))
+            .chain(self.mapped_dirs.iter().cloned())
+            .collect_vec()
     }
 
     pub fn prepare(
@@ -246,7 +335,7 @@ impl Wasi {
             uses.push(pkg);
         }
 
-        let builder = WasiEnv::builder(program_name)
+        let mut builder = WasiEnv::builder(program_name)
             .runtime(Arc::clone(&rt))
             .args(args)
             .envs(self.env_vars.clone())
@@ -259,91 +348,12 @@ impl Wasi {
                 .with_tty(Box::new(DeviceFile::new(__WASI_STDIN_FILENO)))
                 .build();
 
-            let mut mapped_dirs = Vec::new();
-
-            // Process the --dirs flag and merge it with --mapdir.
-            let mut have_current_dir = false;
-            for dir in &self.pre_opened_directories {
-                let mapping = if dir == Path::new(".") {
-                    if have_current_dir {
-                        bail!("Cannot pre-open the current directory twice: --dir=. must only be specified once");
-                    }
-                    have_current_dir = true;
-
-                    let current_dir =
-                        std::env::current_dir().context("could not determine current directory")?;
-
-                    MappedDirectory {
-                        host: current_dir,
-                        guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                    }
-                } else {
-                    let resolved = dir.canonicalize().with_context(|| {
-                        format!(
-                            "could not canonicalize path for argument '--dir {}'",
-                            dir.display()
-                        )
-                    })?;
-
-                    if &resolved != dir {
-                        bail!(
-                            "Invalid argument '--dir {}': path must either be absolute, or '.'",
-                            dir.display(),
-                        );
-                    }
-
-                    let guest = resolved
-                        .to_str()
-                        .with_context(|| {
-                            format!(
-                                "invalid argument '--dir {}': path must be valid utf-8",
-                                dir.display(),
-                            )
-                        })?
-                        .to_string();
-
-                    MappedDirectory {
-                        host: resolved,
-                        guest,
-                    }
-                };
-
-                mapped_dirs.push(mapping);
-            }
-
-            for MappedDirectory { host, guest } in &self.mapped_dirs {
-                let resolved_host = host.canonicalize().with_context(|| {
-                    format!(
-                        "could not canonicalize path for argument '--mapdir {}:{}'",
-                        host.display(),
-                        guest,
-                    )
-                })?;
-
-                let mapping = if guest == "." {
-                    if have_current_dir {
-                        bail!("Cannot pre-open the current directory twice: '--mapdir=?:.' / '--dir=.' must only be specified once");
-                    }
-                    have_current_dir = true;
-
-                    MappedDirectory {
-                        host: resolved_host,
-                        guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                    }
-                } else {
-                    MappedDirectory {
-                        host: resolved_host,
-                        guest: guest.clone(),
-                    }
-                };
-                mapped_dirs.push(mapping);
-            }
-
+            let (have_current_dir, mut mapped_dirs) = self.build_mapped_directories(false)?;
             if !mapped_dirs.is_empty() {
                 // TODO: should we expose the common ancestor instead of root?
                 let fs_backing: Arc<dyn FileSystem + Send + Sync> =
-                    Arc::new(PassthruFileSystem::new(default_fs_backing()));
-                for MappedDirectory { host, guest } in self.mapped_dirs.clone() {
+                    Arc::new(PassthruFileSystem::new_arc(default_fs_backing()));
+                for MappedDirectory { host, guest } in self.all_volumes() {
                     let host = if !host.is_absolute() {
                         Path::new("/").join(host)
                     } else {
@@ -353,16 +363,23 @@ impl Wasi {
                 }
             }
 
+            if let Some(cwd) = self.cwd.as_ref() {
+                if !cwd.starts_with("/") {
+                    bail!("The argument to --cwd must be an absolute path");
+                }
+                builder = builder.current_dir(cwd.clone());
+            }
+
             // Open the root of the new filesystem
-            let b = builder
+            builder = builder
                 .sandbox_fs(root_fs)
                 .preopen_dir(Path::new("/"))
                 .unwrap();
 
             if have_current_dir {
-                b.map_dir(".", MAPPED_CURRENT_DIR_DEFAULT_PATH)?
+                builder.map_dir(".", MAPPED_CURRENT_DIR_DEFAULT_PATH)?
             } else {
-                b.map_dir(".", "/")?
+                builder.map_dir(".", "/")?
             }
         };
 
@@ -376,18 +393,40 @@ impl Wasi {
             if let Some(interval) = self.snapshot_interval {
                 builder.with_snapshot_interval(std::time::Duration::from_millis(interval));
             }
-            for journal in self.build_journals()? {
-                builder.add_journal(journal);
+            if self.stop_after_snapshot {
+                builder.with_stop_running_after_snapshot(true);
             }
+            let (r, w) = self.build_journals()?;
+            for journal in r {
+                builder.add_read_only_journal(journal);
+            }
+            for journal in w {
+                builder.add_writable_journal(journal);
+            }
+            builder.with_skip_stdio_during_bootstrap(self.skip_stdio_during_bootstrap);
         }
 
         Ok(builder)
     }
 
     #[cfg(feature = "journal")]
-    pub fn build_journals(&self) -> anyhow::Result<Vec<Arc<DynJournal>>> {
-        let mut ret = Vec::new();
-        for journal in self.journals.clone() {
+    #[allow(clippy::type_complexity)]
+    pub fn build_journals(
+        &self,
+    ) -> anyhow::Result<(Vec<Arc<DynReadableJournal>>, Vec<Arc<DynJournal>>)> {
+        let mut readable = Vec::new();
+        for journal in self.read_only_journals.clone() {
+            if matches!(std::fs::metadata(&journal), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                bail!("Read-only journal file does not exist: {journal:?}");
+            }
+
+            readable
+                .push(Arc::new(LogFileJournal::new_readonly(journal)?) as Arc<DynReadableJournal>);
+        }
+
+        let mut writable = Vec::new();
+        for journal in self.writable_journals.clone() {
             if self.enable_compaction {
                 let mut journal = CompactingLogFileJournal::new(journal)?;
                 if !self.without_compact_on_drop {
@@ -396,12 +435,12 @@ impl Wasi {
                 if self.with_compact_on_growth.is_normal() && self.with_compact_on_growth != 0f32 {
                     journal = journal.with_compact_on_factor_size(self.with_compact_on_growth);
                 }
-                ret.push(Arc::new(journal) as Arc<DynJournal>);
+                writable.push(Arc::new(journal) as Arc<DynJournal>);
             } else {
-                ret.push(Arc::new(LogFileJournal::new(journal)?));
+                writable.push(Arc::new(LogFileJournal::new(journal)?));
             }
         }
-        Ok(ret)
+        Ok((readable, writable))
     }
 
     #[cfg(not(feature = "journal"))]
@@ -411,77 +450,49 @@ impl Wasi {
 
     pub fn build_mapped_directories(
         &self,
-    ) -> Result<(bool, bool, Vec<MappedDirectory>), anyhow::Error> {
+        is_wasix: bool,
+    ) -> Result<(bool, Vec<MappedDirectory>), anyhow::Error> {
         let mut mapped_dirs = Vec::new();
 
-        // Process the --dirs flag and merge it with --mapdir.
+        // Process the --volume flag.
         let mut have_current_dir = false;
-        for dir in &self.pre_opened_directories {
-            let mapping = if dir == Path::new(".") {
-                if have_current_dir {
-                    bail!("Cannot pre-open the current directory twice: --dir=. must only be specified once");
-                }
-                have_current_dir = true;
-
-                let current_dir =
-                    std::env::current_dir().context("could not determine current directory")?;
-
-                MappedDirectory {
-                    host: current_dir,
-                    guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                }
-            } else {
-                let resolved = dir.canonicalize().with_context(|| {
-                    format!(
-                        "could not canonicalize path for argument '--dir {}'",
-                        dir.display()
-                    )
-                })?;
-
-                if &resolved != dir {
-                    bail!(
-                        "Invalid argument '--dir {}': path must either be absolute, or '.'",
-                        dir.display(),
-                    );
-                }
-
-                let guest = resolved
-                    .to_str()
-                    .with_context(|| {
-                        format!(
-                            "invalid argument '--dir {}': path must be valid utf-8",
-                            dir.display(),
-                        )
-                    })?
-                    .to_string();
-
-                MappedDirectory {
-                    host: resolved,
-                    guest,
-                }
-            };
-
-            mapped_dirs.push(mapping);
-        }
-
-        for MappedDirectory { host, guest } in &self.mapped_dirs {
+        for MappedDirectory { host, guest } in &self.all_volumes() {
             let resolved_host = host.canonicalize().with_context(|| {
                 format!(
-                    "could not canonicalize path for argument '--mapdir {}:{}'",
+                    "could not canonicalize path for argument '--volume {}:{}'",
                     host.display(),
                     guest,
                 )
             })?;
 
+            if guest == "/" && is_wasix {
+                // Note: it appears we canonicalize the path before this point and showing the value of
+                // `host` in the error message may throw users off, so we use a placeholder.
+                tracing::warn!(
+                    "Mounting on the guest's virtual root with --volume <HOST_DIR>:/ breaks WASIX modules' filesystems"
+                );
+            }
+
             let mapping = if guest == "." {
                 if have_current_dir {
-                    bail!("Cannot pre-open the current directory twice: '--mapdir=?:.' / '--dir=.' must only be specified once");
+                    bail!(
+                        "Cannot pre-open the current directory twice: '--volume=.' must only be specified once"
+                    );
                 }
                 have_current_dir = true;
 
+                let host = if host == Path::new(".") {
+                    std::env::current_dir().context("could not determine current directory")?
+                } else {
+                    host.clone()
+                };
                 MappedDirectory {
                     host: resolved_host,
-                    guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
+                    guest: if is_wasix {
+                        MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string()
+                    } else {
+                        "/".to_string()
+                    },
                 }
             } else {
                 MappedDirectory {
@@ -492,9 +503,7 @@ impl Wasi {
             mapped_dirs.push(mapping);
         }
 
-        let is_tmp_mapped = mapped_dirs.iter().any(|d| d.guest == "/tmp");
-
-        Ok((have_current_dir, is_tmp_mapped, mapped_dirs))
+        Ok((have_current_dir, mapped_dirs))
     }
 
     pub fn build_mapped_commands(&self) -> Result<Vec<MappedCommand>, anyhow::Error> {
@@ -533,7 +542,9 @@ impl Wasi {
             caps.http_client = wasmer_wasix::http::HttpClientCapabilityV1::new_allow_all();
         }
 
-        caps.threading.enable_asynchronous_threading = self.enable_async_threads;
+        if let Some(enable_async_threads) = self.enable_async_threads {
+            caps.threading.enable_asynchronous_threading = enable_async_threads;
+        }
         caps.threading.enable_exponential_cpu_backoff =
             self.enable_cpu_backoff.map(Duration::from_millis);
 
@@ -547,32 +558,52 @@ impl Wasi {
         pkg_cache_path: &Path,
         rt_or_handle: I,
         preferred_webc_version: webc::Version,
-    ) -> Result<impl Runtime + Send + Sync>
+        compiler_debug_dir_used: bool,
+    ) -> Result<impl Runtime + Send + Sync + use<I>>
     where
         I: Into<RuntimeOrHandle>,
     {
         let tokio_task_manager = Arc::new(TokioTaskManager::new(rt_or_handle.into()));
         let mut rt = PluggableRuntime::new(tokio_task_manager.clone());
 
-        let has_networking = self.networking
+        let has_networking = self.networking.is_some()
             || capabilities::get_cached_capability(pkg_cache_path)
                 .ok()
                 .is_some_and(|v| v.enable_networking);
 
+        let ruleset = self
+            .networking
+            .clone()
+            .flatten()
+            .map(|ruleset| Ruleset::from_str(&ruleset))
+            .transpose()?;
+
+        let network = if let Some(ruleset) = ruleset {
+            virtual_net::host::LocalNetworking::with_ruleset(ruleset)
+        } else {
+            virtual_net::host::LocalNetworking::default()
+        };
+
         if has_networking {
-            rt.set_networking_implementation(virtual_net::host::LocalNetworking::default());
+            rt.set_networking_implementation(network);
         } else {
             let net = super::capabilities::net::AskingNetworking::new(
                 pkg_cache_path.to_path_buf(),
-                Arc::new(virtual_net::host::LocalNetworking::default()),
+                Arc::new(network),
             );
 
             rt.set_networking_implementation(net);
         }
 
         #[cfg(feature = "journal")]
-        for journal in self.build_journals()? {
-            rt.add_journal(journal);
+        {
+            let (r, w) = self.build_journals()?;
+            for journal in r {
+                rt.add_read_only_journal(journal);
+            }
+            for journal in w {
+                rt.add_writable_journal(journal);
+            }
         }
 
         if !self.no_tty {
@@ -591,14 +622,16 @@ impl Wasi {
 
         let registry = self.prepare_source(env, client, preferred_webc_version)?;
 
-        let cache_dir = env.cache_dir().join("compiled");
-        let module_cache = wasmer_wasix::runtime::module_cache::in_memory()
-            .with_fallback(FileSystemCache::new(cache_dir, tokio_task_manager));
+        if !self.disable_cache && !compiler_debug_dir_used {
+            let cache_dir = env.cache_dir().join("compiled");
+            let module_cache = wasmer_wasix::runtime::module_cache::in_memory()
+                .with_fallback(FileSystemCache::new(cache_dir, tokio_task_manager));
+            rt.set_module_cache(module_cache);
+        }
 
         rt.set_package_loader(package_loader)
-            .set_module_cache(module_cache)
             .set_source(registry)
-            .set_engine(Some(engine));
+            .set_engine(engine);
 
         Ok(rt)
     }
@@ -626,7 +659,13 @@ impl Wasi {
         Ok(Self {
             deny_multiple_wasi_versions: true,
             env_vars: std::env::vars().collect(),
-            pre_opened_directories: vec![dir],
+            volumes: vec![MappedDirectory {
+                host: dir.clone(),
+                guest: dir
+                    .to_str()
+                    .expect("dir must be a valid string")
+                    .to_string(),
+            }],
             ..Self::default()
         })
     }
@@ -635,7 +674,7 @@ impl Wasi {
         &self,
         env: &WasmerEnv,
         client: Arc<dyn HttpClient + Send + Sync>,
-    ) -> Result<impl PackageLoader + Send + Sync> {
+    ) -> Result<BuiltinPackageLoader> {
         let checkout_dir = env.cache_dir().join("checkouts");
         let tokens = tokens_by_authority(env)?;
 
@@ -652,8 +691,8 @@ impl Wasi {
         env: &WasmerEnv,
         client: Arc<dyn HttpClient + Send + Sync>,
         preferred_webc_version: webc::Version,
-    ) -> Result<impl Source + Send + Sync> {
-        let mut source = MultiSource::new();
+    ) -> Result<MultiSource> {
+        let mut source = MultiSource::default();
 
         // Note: This should be first so our "preloaded" sources get a chance to
         // override the main registry.
@@ -666,7 +705,10 @@ impl Wasi {
         source.add_source(preloaded);
 
         let graphql_endpoint = self.graphql_endpoint(env)?;
-        let cache_dir = env.cache_dir().join("queries");
+        let cache_dir = env
+            .cache_dir()
+            .join("queries")
+            .join(endpoint_to_folder(&graphql_endpoint));
         let mut wapm_source = BackendSource::new(graphql_endpoint, Arc::clone(&client))
             .with_local_cache(cache_dir, WAPM_SOURCE_CACHE_TIMEOUT)
             .with_preferred_webc_version(preferred_webc_version);
@@ -703,8 +745,7 @@ impl Wasi {
 }
 
 fn parse_registry(r: &str) -> Result<Url> {
-    let url = wasmer_registry::format_graphql(r).parse()?;
-    Ok(url)
+    UserRegistry::from(r).graphql_endpoint()
 }
 
 fn tokens_by_authority(env: &WasmerEnv) -> Result<HashMap<String, String>> {
@@ -712,17 +753,17 @@ fn tokens_by_authority(env: &WasmerEnv) -> Result<HashMap<String, String>> {
     let config = env.config()?;
 
     for credentials in config.registry.tokens {
-        if let Ok(url) = Url::parse(&credentials.registry) {
-            if url.has_authority() {
-                tokens.insert(url.authority().to_string(), credentials.token);
-            }
+        if let Ok(url) = Url::parse(&credentials.registry)
+            && url.has_authority()
+        {
+            tokens.insert(url.authority().to_string(), credentials.token);
         }
     }
 
-    if let (Ok(current_registry), Some(token)) = (env.registry_endpoint(), env.token()) {
-        if current_registry.has_authority() {
-            tokens.insert(current_registry.authority().to_string(), token);
-        }
+    if let (Ok(current_registry), Some(token)) = (env.registry_endpoint(), env.token())
+        && current_registry.has_authority()
+    {
+        tokens.insert(current_registry.authority().to_string(), token);
     }
 
     // Note: The global wasmer.toml config file stores URLs for the GraphQL
@@ -739,10 +780,10 @@ fn tokens_by_authority(env: &WasmerEnv) -> Result<HashMap<String, String>> {
 
     let mut frontend_tokens = HashMap::new();
     for (hostname, token) in &tokens {
-        if let Some(frontend_url) = hostname.strip_prefix("registry.") {
-            if !tokens.contains_key(frontend_url) {
-                frontend_tokens.insert(frontend_url.to_string(), token.clone());
-            }
+        if let Some(frontend_url) = hostname.strip_prefix("registry.")
+            && !tokens.contains_key(frontend_url)
+        {
+            frontend_tokens.insert(frontend_url.to_string(), token.clone());
         }
     }
     tokens.extend(frontend_tokens);

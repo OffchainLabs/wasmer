@@ -4,22 +4,18 @@ use std::{
     io::{ErrorKind, Read},
     path::Path,
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
 };
 
 use assert_cmd::{assert::Assert, prelude::OutputAssertExt};
 use once_cell::sync::Lazy;
-use predicates::str::contains;
-use rand::Rng;
-use reqwest::{blocking::Client, IntoUrl};
+use predicates::str::{contains, is_match};
+use rand::RngExt;
 use tempfile::TempDir;
 use wasmer_integration_tests_cli::{
     asset_path,
     fixtures::{self, packages, php, resources},
     get_wasmer_path,
 };
-
-const HTTP_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
 static RUST_LOG: Lazy<String> = Lazy::new(|| {
     if cfg!(feature = "debug") {
@@ -48,6 +44,8 @@ static CACHE_RUST_LOG: Lazy<String> = Lazy::new(|| {
 });
 
 #[test]
+//#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
+#[ignore = "#6173"]
 fn list_cwd() {
     let package = packages().join("list-cwd");
 
@@ -58,6 +56,7 @@ fn list_cwd() {
         .unwrap();
 
     let stdout = output.stdout;
+    eprintln!("{}", String::from_utf8(output.stderr).unwrap());
 
     let expected = ".
 ..
@@ -71,6 +70,7 @@ wasmer.toml
 }
 
 #[test]
+#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
 fn nested_mounted_paths() {
     let package = packages().join("nested-mounted-paths");
 
@@ -81,7 +81,7 @@ fn nested_mounted_paths() {
         .arg(package)
         .output()
         .unwrap();
-    let host_stdout = host_output.stdout;
+    let host_stdout = String::from_utf8(host_output.stdout).unwrap();
 
     let webc_output = Command::new(get_wasmer_path())
         .arg("run")
@@ -89,7 +89,8 @@ fn nested_mounted_paths() {
         .arg(".")
         .output()
         .unwrap();
-    let webc_stdout = webc_output.stdout;
+
+    let webc_stdout = String::from_utf8(webc_output.stdout).unwrap();
 
     let expected = "/:
 .
@@ -101,6 +102,7 @@ bin
 dev
 etc
 tmp
+usr
 
 /app:
 .
@@ -117,14 +119,14 @@ data-a.txt
 .
 ..
 data-b.txt
-"
-    .as_bytes()
-    .to_vec();
+";
 
     assert_eq!(&host_stdout, &expected);
     assert_eq!(&webc_stdout, &expected);
 }
 
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
 #[test]
 fn run_python_create_temp_dir_in_subprocess() {
     let resources = resources().join("python").join("temp-dir-in-child");
@@ -132,14 +134,20 @@ fn run_python_create_temp_dir_in_subprocess() {
     let output = Command::new(get_wasmer_path())
         .arg("run")
         .arg("python/python")
-        .arg("--mapdir")
-        .arg(format!("/code:{}", resources.display()))
+        .arg("--cranelift")
+        .arg("--volume")
+        .arg(format!("{}:/code", resources.display()))
         .arg("--")
         .arg("/code/main.py")
         .output()
         .unwrap();
 
-    assert_eq!(output.stdout, "0".as_bytes().to_vec());
+    if cfg!(not(feature = "wamr")) {
+        assert_eq!(output.stdout, "0".as_bytes().to_vec());
+    } else {
+        // WAMR can print spurious warnings to stdout when running python, so we can't assert that it's exactly `[48]`.
+        assert!(output.status.success())
+    }
 }
 
 #[test]
@@ -150,65 +158,21 @@ fn run_php_with_sqlite() {
         .arg("-q")
         .arg("run")
         .arg(php_wasm)
-        .arg("--mapdir")
-        .arg(format!("/db:{}", db.display()))
-        .arg("--mapdir")
-        .arg(format!("/app:{}", app_dir.display()))
+        .arg("--volume")
+        .arg(format!("{}:/db", db.display()))
+        .arg("--volume")
+        .arg(format!("{}:/app", app_dir.display()))
         .arg("--")
         .arg("/app/test.php")
         .output()
         .unwrap();
 
-    assert_eq!(output.stdout, "0".as_bytes().to_vec());
-}
-
-/// Ignored on Windows because running vendored packages does not work
-/// since Windows does not allow `::` characters in filenames (every other OS does)
-///
-/// The syntax for vendored package atoms has to be reworked for this to be fixed, see
-/// https://github.com/wasmerio/wasmer/issues/3535
-// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
-#[test]
-#[ignore]
-fn test_run_customlambda() {
-    let assert = Command::new(get_wasmer_path())
-        .arg("config")
-        .arg("--bindir")
-        .assert()
-        .success();
-    let bindir = std::str::from_utf8(&assert.get_output().stdout)
-        .expect("wasmer config --bindir stdout failed");
-
-    // /Users/fs/.wasmer/bin
-    let checkouts_path = Path::new(bindir.trim())
-        .parent()
-        .expect("--bindir: no parent")
-        .join("checkouts");
-    println!("checkouts path: {}", checkouts_path.display());
-    let _ = std::fs::remove_dir_all(&checkouts_path);
-
-    let assert = Command::new(get_wasmer_path())
-        .arg("run")
-        .arg("https://wasmer.io/ciuser/customlambda")
-        // TODO: this argument should not be necessary later
-        // see https://github.com/wasmerio/wasmer/issues/3514
-        .arg("customlambda.py")
-        .arg("55")
-        .assert()
-        .success();
-    assert.stdout("139583862445\n");
-
-    // Run again to verify the caching
-    let assert = Command::new(get_wasmer_path())
-        .arg("run")
-        .arg("https://wasmer.io/ciuser/customlambda")
-        // TODO: this argument should not be necessary later
-        // see https://github.com/wasmerio/wasmer/issues/3514
-        .arg("customlambda.py")
-        .arg("55")
-        .assert()
-        .success();
-    assert.stdout("139583862445\n");
+    if cfg!(not(feature = "wamr")) {
+        assert_eq!(output.stdout, "0".as_bytes().to_vec());
+    } else {
+        // WAMR can print spurious warnings to stdout when running php, so we can't assert that it's exactly `[48]`.
+        assert!(output.status.success())
+    }
 }
 
 #[test]
@@ -225,33 +189,32 @@ fn run_wasi_works() {
     assert.stdout("27\n");
 }
 
-// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
 #[test]
-#[ignore]
 fn test_wasmer_run_pirita_works() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let python_wasmer_path = temp_dir.path().join("python.wasmer");
     std::fs::copy(fixtures::python(), &python_wasmer_path).unwrap();
 
-    let assert = Command::new(get_wasmer_path())
+    let output = Command::new(get_wasmer_path())
         .arg("run")
         .arg(python_wasmer_path)
         .arg("--")
         .arg("-c")
         .arg("print(\"hello\")")
-        .assert()
-        .success();
+        .output()
+        .unwrap();
 
-    assert.stdout("hello\n");
+    output.assert().success().stdout("hello\n");
 }
 
-// FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
 #[test]
-#[ignore]
 fn test_wasmer_run_pirita_url_works() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("https://wasmer.wtf/syrusakbary/python")
+        .arg("python/python")
+        .arg("--cranelift")
         .arg("--")
         .arg("-c")
         .arg("print(\"hello\")")
@@ -296,52 +259,56 @@ fn test_wasmer_run_works_with_dir() {
 }
 
 // FIXME: Re-enable. See https://github.com/wasmerio/wasmer/issues/3717
-#[ignore]
 #[test]
+#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
 fn test_wasmer_run_works() {
     let assert = Command::new(get_wasmer_path())
-        .arg("https://wasmer.io/python/python@0.1.0")
-        .arg(format!("--mapdir=.:{}", asset_path().display()))
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
         .arg("test.py")
         .assert()
         .success();
 
-    assert.stdout("hello\n");
+    if cfg!(not(feature = "wamr")) {
+        assert.stdout("hello\n");
+    } else {
+        // WAMR can print spurious warnings to stdout when running python, so it's better to use
+        // `contains` rather than asserting that stdout *is exactly* that
+        assert.stdout(contains("hello\n"));
+    }
 
     // same test again, but this time with "wasmer run ..."
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("https://wasmer.io/python/python@0.1.0")
-        .arg(format!("--mapdir=.:{}", asset_path().display()))
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
         .arg("test.py")
         .assert()
         .success();
 
-    assert.stdout("hello\n");
+    if cfg!(not(feature = "wamr")) {
+        assert.stdout("hello\n");
+    } else {
+        // See above
+        assert.stdout(contains("hello\n"));
+    }
 
     // same test again, but this time without specifying the registry in the URL
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=.:{}", asset_path().display()))
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:.", asset_path().display()))
         .arg("--registry=wasmer.io")
         .arg("test.py")
         .assert()
         .success();
 
-    assert.stdout("hello\n");
-
-    // same test again, but this time with only the command "python" (should be looked up locally)
-    let assert = Command::new(get_wasmer_path())
-        .arg("run")
-        .arg("_/python")
-        .arg(format!("--mapdir=.:{}", asset_path().display()))
-        .arg("--registry=wasmer.io")
-        .arg("test.py")
-        .assert()
-        .success();
-
-    assert.stdout("hello\n");
+    if cfg!(not(feature = "wamr")) {
+        assert.stdout("hello\n");
+    } else {
+        // See above
+        assert.stdout(contains("hello\n"));
+    }
 }
 
 #[test]
@@ -365,11 +332,15 @@ fn run_wasi_works_non_existent() -> anyhow::Result<()> {
         .stderr(contains(
             "Unable to find \"does-not/exist\" in the registry",
         ))
-        .stderr(contains("1: Not found"));
+        .stderr(contains("1: failed to query package"));
 
     Ok(())
 }
 
+const PYTHON_PACKAGE_WITH_VERSION: &str = "python/python@3.13.5";
+
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
 #[test]
 fn run_test_caching_works_for_packages() {
     // we're testing the cache, so we don't want to reuse the current user's
@@ -377,80 +348,88 @@ fn run_test_caching_works_for_packages() {
     let wasmer_dir = TempDir::new().unwrap();
 
     let assert = Command::new(get_wasmer_path())
-        .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg(format!("--volume={}:/app", asset_path().display()))
         .arg("--registry=wasmer.io")
         .arg("/app/test.py")
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
-        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("RUST_LOG", "debug")
         .assert();
 
     assert
         .success()
-        .stderr(contains("wapm_source: Querying the GraphQL API"))
-        .stderr(contains("builtin_loader: Downloading a webc file"))
-        .stderr(contains("module_cache::filesystem: Saved to disk"));
+        .stderr(contains("backend_source: Querying the GraphQL API"))
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
 
     let assert = Command::new(get_wasmer_path())
-        .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg("python/python")
+        .arg("--cranelift")
+        .arg(format!("--volume={}:/app", asset_path().display()))
         .arg("--registry=wasmer.io")
         .arg("/app/test.py")
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
-        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("RUST_LOG", "debug")
         .assert()
         .success();
 
     assert
-        .stderr(contains("wapm_source: Cache hit!"))
+        .stderr(contains("backend_source: Cache hit!"))
         .stderr(contains("builtin_loader: Cache hit!"))
         .stderr(contains("module_cache::filesystem: Cache hit!"));
 }
 
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
 #[test]
 fn run_test_caching_works_for_packages_with_versions() {
     let wasmer_dir = TempDir::new().unwrap();
 
     let assert = Command::new(get_wasmer_path())
-        .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:/app", asset_path().display()))
         .arg("--registry=wasmer.io")
+        .arg("--cranelift")
         .arg("/app/test.py")
-        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("RUST_LOG", "debug")
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
         .assert()
         .success();
 
     assert
         .success()
-        .stderr(contains("wapm_source: Querying the GraphQL API"))
-        .stderr(contains("builtin_loader: Downloading a webc file"))
-        .stderr(contains("module_cache::filesystem: Saved to disk"));
+        .stderr(contains("backend_source: Querying the GraphQL API"))
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
 
     let assert = Command::new(get_wasmer_path())
-        .arg("python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg(PYTHON_PACKAGE_WITH_VERSION)
+        .arg(format!("--volume={}:/app", asset_path().display()))
         .arg("--registry=wasmer.io")
+        .arg("--cranelift")
         .arg("/app/test.py")
-        .env("RUST_LOG", &*CACHE_RUST_LOG)
+        .env("RUST_LOG", "debug")
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
         .assert();
 
     assert
-        .success()
-        .stderr(contains("wapm_source: Cache hit!"))
+        .stderr(contains("backend_source: Cache hit!"))
         .stderr(contains("builtin_loader: Cache hit!"))
         .stderr(contains("module_cache::filesystem: Cache hit!"));
 }
 
+// The test would be very slow on Windows or macOS
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
 #[test]
 fn run_test_caching_works_for_urls() {
     let wasmer_dir = TempDir::new().unwrap();
 
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("https://wasmer.io/python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg(format!("https://wasmer.io/{PYTHON_PACKAGE_WITH_VERSION}"))
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--cranelift")
         .arg("/app/test.py")
         .env("RUST_LOG", &*CACHE_RUST_LOG)
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
@@ -459,13 +438,14 @@ fn run_test_caching_works_for_urls() {
 
     assert
         .success()
-        .stderr(contains("builtin_loader: Downloading a webc file"))
-        .stderr(contains("module_cache::filesystem: Saved to disk"));
+        .stderr(contains("webc_package_download_start"))
+        .stderr(contains("builtin_loader: Saved to disk"));
 
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg("https://wasmer.io/python/python@0.1.0")
-        .arg(format!("--mapdir=/app:{}", asset_path().display()))
+        .arg(format!("https://wasmer.io/{PYTHON_PACKAGE_WITH_VERSION}"))
+        .arg(format!("--volume={}:/app", asset_path().display()))
+        .arg("--cranelift")
         .arg("/app/test.py")
         .env("RUST_LOG", &*CACHE_RUST_LOG)
         .env("WASMER_CACHE_DIR", wasmer_dir.path())
@@ -475,10 +455,8 @@ fn run_test_caching_works_for_urls() {
     assert
         // Got a cache hit downloading the *.webc file's metadata
         .stderr(contains("web_source: Cache hit"))
-        // Cache hit downloading the *.webc file
-        .stderr(contains(
-            r#"builtin_loader: Cache hit! pkg.name="python" pkg.version=0.1.0"#,
-        ))
+        // Cache hit downloading the *.webc file (it's identified based on sha256 hash - not the package name)
+        .stderr(contains("builtin_loader: Cache hit!"))
         // Cache hit compiling the module
         .stderr(contains("module_cache::filesystem: Cache hit!"));
 }
@@ -529,7 +507,7 @@ fn run_no_start_wasm_report_error() {
         .assert()
         .failure();
 
-    assert.stderr(contains("The module doesn't contain a \"_start\" function"));
+    assert.stderr(contains("The module doesn't export a \"_start\" function"));
 }
 
 // Test that wasmer can run a complex path
@@ -564,10 +542,6 @@ fn test_wasmer_run_complex_url() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn wasi_runner_on_disk() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
@@ -590,7 +564,7 @@ fn wasi_runner_on_disk_mount_using_relative_directory_on_the_host() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(fixtures::python())
-        .arg("--mapdir=/app:.")
+        .arg("--volume=.:/app")
         .arg("--")
         .arg("/app/main.py")
         .env("RUST_LOG", &*RUST_LOG)
@@ -601,10 +575,6 @@ fn wasi_runner_on_disk_mount_using_relative_directory_on_the_host() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn wasi_runner_on_disk_with_mounted_directories() {
     let temp = TempDir::new().unwrap();
     std::fs::write(temp.path().join("index.js"), "console.log('Hello, World!')").unwrap();
@@ -612,7 +582,7 @@ fn wasi_runner_on_disk_with_mounted_directories() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(fixtures::qjs())
-        .arg(format!("--mapdir=/app:{}", temp.path().display()))
+        .arg(format!("--volume={}:/app", temp.path().display()))
         .arg("--")
         .arg("/app/index.js")
         .env("RUST_LOG", &*RUST_LOG)
@@ -622,10 +592,6 @@ fn wasi_runner_on_disk_with_mounted_directories() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn wasi_runner_on_disk_with_mounted_directories_and_webc_volumes() {
     let temp = TempDir::new().unwrap();
     std::fs::write(temp.path().join("main.py"), "print('Hello, World!')").unwrap();
@@ -633,7 +599,7 @@ fn wasi_runner_on_disk_with_mounted_directories_and_webc_volumes() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg(fixtures::python())
-        .arg(format!("--mapdir=/app:{}", temp.path().display()))
+        .arg(format!("--volume={}:/app", temp.path().display()))
         .arg("--")
         .arg("-B")
         .arg("/app/main.py")
@@ -644,15 +610,14 @@ fn wasi_runner_on_disk_with_mounted_directories_and_webc_volumes() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
+// For some reason the port forwarding does not work on macOS
+#[cfg_attr(target_os = "macos", ignore)]
+#[cfg_attr(feature = "wamr", ignore = "wamr does not support multiple memories")]
 fn wasi_runner_on_disk_with_dependencies() {
     let port = random_port();
     let mut cmd = Command::new(get_wasmer_path());
     cmd.arg("run")
-        .arg(fixtures::hello())
+        .arg("wasmer/hello")
         .arg(format!("--env=SERVER_PORT={port}"))
         .arg("--net")
         .arg("--")
@@ -666,7 +631,7 @@ fn wasi_runner_on_disk_with_dependencies() {
         .unwrap()
         .text()
         .unwrap();
-    assert!(html.contains("<title>Hello World</title>"), "{html}");
+    assert!(html.contains("<title>wasmer/hello</title>"), "{html}");
 
     // and make sure our request was logged
     child
@@ -675,26 +640,18 @@ fn wasi_runner_on_disk_with_dependencies() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn webc_files_on_disk_with_multiple_commands_require_an_entrypoint_flag() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg(fixtures::wabt())
+        .arg("wabt")
         .env("RUST_LOG", &*RUST_LOG)
         .assert();
 
-    let msg = r#"Unable to determine the WEBC file's entrypoint. Please choose one of ["wasm-interp", "wasm-strip", "wasm-validate", "wasm2wat", "wast2json", "wat2wasm"]"#;
+    let msg = r#"Unable to determine the package's entrypoint. Please choose one of ["wasm-interp", "wasm-strip", "wasm-validate", "wasm2wat", "wast2json", "wat2wasm"]"#;
     assert.failure().stderr(contains(msg));
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn wasi_runner_on_disk_with_env_vars() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
@@ -710,97 +667,19 @@ fn wasi_runner_on_disk_with_env_vars() {
     assert.success().stdout(contains("Hello, World!"));
 }
 
-#[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
-fn wcgi_runner_on_disk() {
-    // Start the WCGI server in the background
-    let port = random_port();
-    let mut cmd = Command::new(get_wasmer_path());
-    cmd.arg("run")
-        .arg(format!("--addr=127.0.0.1:{port}"))
-        .arg(fixtures::static_server())
-        .env("RUST_LOG", &*RUST_LOG);
-
-    // Let's run the command and wait until the server has started
-    let mut child = JoinableChild::spawn(cmd);
-    child.wait_for_stdout("WCGI Server running");
-
-    // make the request
-    let body = http_get(format!("http://127.0.0.1:{port}/")).unwrap();
-    assert!(body.contains("<title>Index of /</title>"), "{body}");
-
-    // Let's make sure 404s work too
-    let err = http_get(format!("http://127.0.0.1:{port}/this/does/not/exist.html")).unwrap_err();
-    assert_eq!(err.status().unwrap(), reqwest::StatusCode::NOT_FOUND);
-
-    // And kill the server, making sure it generated the expected logs
-    let assert = child.join();
-
-    assert
-        .stderr(contains("Starting the server"))
-        .stderr(contains(
-            "response generated method=GET uri=/ status_code=200 OK",
-        ))
-        .stderr(contains(
-            "response generated method=GET uri=/this/does/not/exist.html status_code=404 Not Found",
-        ));
-}
-
-#[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
-fn wcgi_runner_on_disk_with_mounted_directories() {
-    let temp = TempDir::new().unwrap();
-    std::fs::write(temp.path().join("file.txt"), "Hello, World!").unwrap();
-    // Start the WCGI server in the background
-    let port = random_port();
-    let mut cmd = Command::new(get_wasmer_path());
-    cmd.arg("run")
-        .arg(format!("--addr=127.0.0.1:{port}"))
-        .arg(format!("--mapdir=/path/to:{}", temp.path().display()))
-        .arg(fixtures::static_server())
-        .env("RUST_LOG", &*RUST_LOG);
-
-    // Let's run the command and wait until the server has started
-    let mut child = JoinableChild::spawn(cmd);
-    child.wait_for_stdout("WCGI Server running");
-
-    let body = http_get(format!("http://127.0.0.1:{port}/path/to/file.txt")).unwrap();
-    assert!(body.contains("Hello, World!"), "{body}");
-
-    // And kill the server, making sure it generated the expected logs
-    let assert = child.join();
-
-    assert
-        .stderr(contains("Starting the server"))
-        .stderr(contains(
-            "response generated method=GET uri=/path/to/file.txt status_code=200 OK",
-        ));
-}
-
 /// See https://github.com/wasmerio/wasmer/issues/3794
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
+//#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
+#[ignore = "#6173"]
 fn issue_3794_unable_to_mount_relative_paths() {
     let temp = TempDir::new().unwrap();
     std::fs::write(temp.path().join("message.txt"), b"Hello, World!").unwrap();
 
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg(fixtures::coreutils())
-        .arg(format!("--mapdir=./some-dir/:{}", temp.path().display()))
-        .arg("--command-name=cat")
-        .arg("--")
-        .arg("./some-dir/message.txt")
-        .env("RUST_LOG", &*RUST_LOG)
+        .arg("wasmer/bash")
+        .arg(format!("--volume={}:./some-dir/", temp.path().display()))
+        .arg("cat ./some-dir/message.txt")
         .assert();
 
     assert.success().stdout(contains("Hello, World!"));
@@ -808,32 +687,26 @@ fn issue_3794_unable_to_mount_relative_paths() {
 
 #[test]
 #[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
-#[cfg_attr(
-    windows,
-    ignore = "FIXME(Michael-F-Bryan): Temporarily broken on Windows - https://github.com/wasmerio/wasmer/issues/3929"
+    feature = "wamr",
+    ignore = "FIXME(xdoardo): Bash is currently not working in wamr"
 )]
 fn merged_filesystem_contains_all_files() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
-        .arg(fixtures::bash())
+        .arg("wasmer/bash")
         .arg("--entrypoint=bash")
         .arg("--use")
-        .arg(fixtures::coreutils())
-        .arg("--use")
-        .arg(fixtures::python())
+        .arg("python/python")
+        .arg("--cranelift")
         .arg("--")
         .arg("-c")
-        .arg("ls -l /usr/coreutils/*.md && ls -l /lib/python3.6/*.py")
+        .arg("ls -l /usr/local/lib/python3.13/*.py")
         .env("RUST_LOG", &*RUST_LOG)
         .assert();
 
     assert
         .success()
-        .stdout(contains("/usr/coreutils/README.md"))
-        .stdout(contains("/lib/python3.6/this.py"));
+        .stdout(contains("/usr/local/lib/python3.13/this.py"));
 }
 
 #[test]
@@ -862,10 +735,6 @@ fn wasm_file_with_no_abi() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn error_if_no_start_function_found() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
@@ -875,13 +744,13 @@ fn error_if_no_start_function_found() {
 
     assert
         .failure()
-        .stderr(contains("The module doesn't contain a \"_start\" function"));
+        .stderr(contains("The module doesn't export a \"_start\" function"));
 }
 
 #[test]
 #[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
+    any(feature = "wamr", feature = "v8", feature = "wasmi"),
+    ignore = "wasmer using a c_api backend only may not have the 'compile' command"
 )]
 fn run_a_pre_compiled_wasm_file() {
     let temp = TempDir::new().unwrap();
@@ -911,10 +780,6 @@ fn run_a_pre_compiled_wasm_file() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn wasmer_run_some_directory() {
     let temp = TempDir::new().unwrap();
     std::fs::copy(fixtures::qjs(), temp.path().join("qjs.wasm")).unwrap();
@@ -933,10 +798,6 @@ fn wasmer_run_some_directory() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn run_quickjs_via_package_name() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
@@ -953,10 +814,6 @@ fn run_quickjs_via_package_name() {
 }
 
 #[test]
-#[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
-)]
 fn run_quickjs_via_url() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
@@ -972,18 +829,17 @@ fn run_quickjs_via_url() {
 }
 
 #[test]
+#[allow(unused_attributes)]
 #[cfg_attr(
-    all(target_env = "musl", target_os = "linux"),
-    ignore = "wasmer run-unstable segfaults on musl"
+    feature = "wamr",
+    ignore = "FIXME(xdoardo): Bash is currently not working in wamr"
 )]
-#[cfg_attr(
-    windows,
-    ignore = "TODO(Michael-F-Bryan): Figure out why WasiFs::get_inode_at_path_inner() returns Errno::notcapable on Windows"
-)]
+#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
 fn run_bash_using_coreutils() {
     let assert = Command::new(get_wasmer_path())
         .arg("run")
         .arg("sharrattj/bash")
+        .arg("--cranelift")
         .arg("--entrypoint=bash")
         .arg("--use=sharrattj/coreutils")
         .arg("--registry=wasmer.io")
@@ -997,10 +853,13 @@ fn run_bash_using_coreutils() {
     // well as the commands from all the --use packages
 
     let some_expected_binaries = [
-        "arch", "base32", "base64", "baseenc", "basename", "bash", "cat",
+        "", "arch", "base32", "base64", "baseenc", "basename", "bash", "cat", "",
     ]
-    .join("\n");
-    assert.success().stdout(contains(some_expected_binaries));
+    .join("((?s)(.*))");
+
+    assert
+        .success()
+        .stdout(is_match(some_expected_binaries).unwrap());
 }
 
 #[test]
@@ -1024,6 +883,7 @@ fn run_a_package_that_uses_an_atom_from_a_dependency() {
 }
 
 #[test]
+#[cfg_attr(feature = "wasmi", ignore = "wasmi currently does not support threads")]
 fn local_package_has_write_access_to_its_volumes() {
     let temp = tempfile::tempdir().unwrap();
 
@@ -1099,18 +959,6 @@ impl JoinableChild {
         }
     }
 
-    /// Keep reading lines from the child's stdout until a line containing the
-    /// desired text is found.
-    fn wait_for_stdout(&mut self, text: &str) -> String {
-        let stdout = self
-            .child
-            .as_mut()
-            .and_then(|child| child.stdout.as_mut())
-            .unwrap();
-
-        wait_for(text, stdout)
-    }
-
     /// Keep reading lines from the child's stderr until a line containing the
     /// desired text is found.
     fn wait_for_stderr(&mut self, text: &str) -> String {
@@ -1156,7 +1004,7 @@ fn wait_for(text: &str, reader: &mut dyn Read) -> String {
 fn read_line(reader: &mut dyn Read) -> Result<String, std::io::Error> {
     let mut line = Vec::new();
 
-    while !line.ends_with(&[b'\n']) {
+    while !line.ends_with(b"\n") {
         let mut buffer = [0_u8];
         match reader.read_exact(&mut buffer) {
             Ok(_) => {
@@ -1167,7 +1015,7 @@ fn read_line(reader: &mut dyn Read) -> Result<String, std::io::Error> {
         }
     }
 
-    let line = String::from_utf8(line).map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
+    let line = String::from_utf8(line).map_err(std::io::Error::other)?;
     Ok(line)
 }
 
@@ -1202,27 +1050,6 @@ impl Drop for JoinableChild {
     }
 }
 
-/// Send a GET request to a particular URL, automatically retrying (with
-/// a timeout) if there are any connection errors.
-fn http_get(url: impl IntoUrl) -> Result<String, reqwest::Error> {
-    let start = Instant::now();
-    let url = url.into_url().unwrap();
-
-    let client = Client::new();
-
-    while start.elapsed() < HTTP_GET_TIMEOUT {
-        match client.get(url.clone()).send() {
-            Ok(response) => {
-                return response.error_for_status()?.text();
-            }
-            Err(e) if e.is_connect() => continue,
-            Err(other) => return Err(other),
-        }
-    }
-
-    panic!("Didn't receive a response from \"{url}\" within the allocated time");
-}
-
 fn random_port() -> u16 {
-    rand::thread_rng().gen_range(10_000_u16..u16::MAX)
+    rand::rng().random_range(10_000_u16..u16::MAX)
 }

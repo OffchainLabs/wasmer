@@ -1,6 +1,6 @@
+use crate::{WasiEnv, WasiRuntimeError, journal::SnapshotTrigger};
 #[cfg(feature = "journal")]
-use crate::{journal::JournalEffector, syscalls::do_checkpoint_from_outside, unwind, WasiResult};
-use crate::{journal::SnapshotTrigger, WasiEnv, WasiRuntimeError};
+use crate::{WasiResult, journal::JournalEffector, syscalls::do_checkpoint_from_outside, unwind};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "journal")]
 use std::collections::HashSet;
@@ -9,8 +9,8 @@ use std::{
     convert::TryInto,
     ops::Range,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
+        atomic::{AtomicU32, Ordering},
     },
     task::Waker,
     time::Duration,
@@ -25,17 +25,17 @@ use wasmer_wasix_types::{
 };
 
 use crate::{
-    os::task::signal::WasiSignalInterval, syscalls::platform_clock_time_get, WasiThread,
-    WasiThreadHandle, WasiThreadId,
+    WasiThread, WasiThreadHandle, WasiThreadId, os::task::signal::WasiSignalInterval,
+    syscalls::platform_clock_time_get,
 };
 
 use super::{
+    TaskStatus,
     backoff::WasiProcessCpuBackoff,
     control_plane::{ControlPlaneError, WasiControlPlaneHandle},
     signal::{SignalDeliveryError, SignalHandlerAbi},
     task_join_handle::OwnedTaskStatus,
     thread::WasiMemoryLayout,
-    TaskStatus,
 };
 
 /// Represents the ID of a sub-process
@@ -171,6 +171,9 @@ pub struct WasiProcessInner {
     /// If true then the journaling will be disabled after the
     /// next snapshot is taken
     pub disable_journaling_after_checkpoint: bool,
+    /// If true then the process will stop running after the
+    /// next snapshot is taken
+    pub stop_running_after_checkpoint: bool,
     /// List of situations that the process will checkpoint on
     #[cfg(feature = "journal")]
     pub snapshot_on: HashSet<SnapshotTrigger>,
@@ -226,7 +229,7 @@ impl WasiProcessInner {
         use wasmer::AsStoreMut;
         use wasmer_types::OnCalledAction;
 
-        use crate::{os::task::thread::RewindResultType, rewind_ext, WasiError};
+        use crate::{WasiError, os::task::thread::RewindResultType, rewind_ext};
         let guard = inner.0.lock().unwrap();
         if guard.checkpoint == WasiProcessCheckpoint::Execute {
             // No checkpoint so just carry on
@@ -308,6 +311,14 @@ impl WasiProcessInner {
 
                 ctx.data().thread.set_checkpointing(false);
                 trace!("checkpoint finished");
+
+                if guard.stop_running_after_checkpoint {
+                    trace!("will stop running now");
+                    // Need to stop recording journal events so we don't also record the
+                    // thread and process exit events
+                    ctx.data_mut().enable_journal = false;
+                    return OnCalledAction::Finish;
+                }
 
                 // Rewind the stack and carry on
                 return match rewind_ext::<M>(
@@ -427,6 +438,7 @@ impl WasiProcess {
                 #[cfg(feature = "journal")]
                 snapshot_memory_hash: Default::default(),
                 disable_journaling_after_checkpoint: false,
+                stop_running_after_checkpoint: false,
                 backoff: WasiProcessCpuBackoff::new(max_cpu_backoff_time, max_cpu_cool_off_time),
             }),
             Condvar::new(),
@@ -544,6 +556,11 @@ impl WasiProcess {
         Ok(WasiThreadHandle::new(ctrl, &self.inner))
     }
 
+    pub fn all_threads(&self) -> Vec<WasiThreadId> {
+        let inner = self.inner.0.lock().unwrap();
+        inner.threads.keys().cloned().collect()
+    }
+
     /// Gets a reference to a particular thread
     pub fn get_thread(&self, tid: &WasiThreadId) -> Option<WasiThread> {
         let inner = self.inner.0.lock().unwrap();
@@ -595,6 +612,21 @@ impl WasiProcess {
         self.wait_for_checkpoint_finish()
     }
 
+    /// Takes a snapshot of the process and shuts it down after the snapshot
+    /// is taken.
+    ///
+    /// Note: If you ignore the returned future the checkpoint will still
+    /// occur but it will execute asynchronously
+    pub fn snapshot_and_stop(
+        &self,
+        trigger: SnapshotTrigger,
+    ) -> std::pin::Pin<Box<dyn futures::Future<Output = ()> + Send + Sync>> {
+        let mut guard = self.inner.0.lock().unwrap();
+        guard.stop_running_after_checkpoint = true;
+        guard.checkpoint = WasiProcessCheckpoint::Snapshot { trigger };
+        self.wait_for_checkpoint_finish()
+    }
+
     /// Takes a snapshot of the process
     ///
     /// Note: If you ignore the returned future the checkpoint will still
@@ -612,6 +644,12 @@ impl WasiProcess {
     pub fn disable_journaling_after_checkpoint(&self) {
         let mut guard = self.inner.0.lock().unwrap();
         guard.disable_journaling_after_checkpoint = true;
+    }
+
+    /// Stop running once a checkpoint is taken
+    pub fn stop_running_after_checkpoint(&self) {
+        let mut guard = self.inner.0.lock().unwrap();
+        guard.stop_running_after_checkpoint = true;
     }
 
     /// Wait for the checkout process to finish
@@ -757,10 +795,7 @@ impl WasiProcess {
                 })
             }
         }
-        futures::future::join_all(waits.into_iter())
-            .await
-            .into_iter()
-            .next()
+        futures::future::join_all(waits).await.into_iter().next()
     }
 
     /// Waits for any of the children to finished

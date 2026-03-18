@@ -1,5 +1,5 @@
 use crate::{commands::AsyncCliCommand, config::WasmerEnv, opts::ListFormatOpts};
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 
 /// List available Edge regions.
 #[derive(clap::Parser, Debug)]
@@ -26,7 +26,7 @@ impl AsyncCliCommand for CmdAppRegionsList {
 
     async fn run_async(self) -> Result<Self::Output, anyhow::Error> {
         let client = self.env.client()?;
-        let regions = wasmer_api::query::get_all_app_regions(&client).await?;
+        let regions = wasmer_backend_api::query::get_all_app_regions(&client).await?;
 
         println!("{}", self.fmt.format.render(regions.as_slice()));
 

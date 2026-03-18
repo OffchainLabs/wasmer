@@ -1,11 +1,11 @@
 use crate::{
     commands::AsyncCliCommand,
-    config::{WasmerConfig, WasmerEnv, DEFAULT_PROD_REGISTRY},
+    config::{DEFAULT_PROD_REGISTRY, WasmerConfig, WasmerEnv},
 };
 use colored::Colorize;
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 
-/// Subcommand for log in a user into Wasmer (using a browser or provided a token)
+/// Log out from Wasmer
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Logout {
     #[clap(flatten)]
@@ -39,7 +39,7 @@ impl AsyncCliCommand for Logout {
             .client()
             .map_err(|_| anyhow::anyhow!("Not logged into registry {host_str}"))?;
 
-        let user = wasmer_api::query::current_user(&client)
+        let user = wasmer_backend_api::query::current_user(&client)
             .await
             .map_err(|e| anyhow::anyhow!("Not logged into registry {host_str}: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("Not logged into registry {host_str}"))?;
@@ -92,7 +92,7 @@ impl AsyncCliCommand for Logout {
                 };
 
                 if should_revoke {
-                    wasmer_api::query::revoke_token(&client, token).await?;
+                    wasmer_backend_api::query::revoke_token(&client, token).await?;
                     println!(
                         "Token for user {} in registry {host_str} correctly revoked",
                         user.username.bold()

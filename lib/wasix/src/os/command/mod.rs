@@ -2,12 +2,11 @@ pub mod builtins;
 
 use std::{collections::HashMap, sync::Arc};
 
-use wasmer::{FunctionEnvMut, Store};
+use virtual_mio::block_on;
+use wasmer::FunctionEnvMut;
 use wasmer_wasix_types::wasi::Errno;
 
-use crate::{
-    runtime::task_manager::InlineWaker, syscalls::stderr_write, Runtime, SpawnError, WasiEnv,
-};
+use crate::{Runtime, SpawnError, WasiEnv, syscalls::stderr_write};
 
 use super::task::{OwnedTaskStatus, TaskJoinHandle, TaskStatus};
 
@@ -19,7 +18,7 @@ where
     /// Returns the canonical name of the command.
     fn name(&self) -> &str;
 
-    /// Retrieve the command as as a [`std::any::Any`] reference.
+    /// Retrieve the command as a [`std::any::Any`] reference.
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Executes the command.
@@ -27,7 +26,6 @@ where
         &self,
         parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
         path: &str,
-        store: &mut Option<Store>,
         config: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError>;
 }
@@ -86,17 +84,16 @@ impl Commands {
         &self,
         parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
         path: &str,
-        store: &mut Option<Store>,
         builder: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError> {
         let path = path.to_string();
         if let Some(cmd) = self.commands.get(&path) {
-            cmd.exec(parent_ctx, path.as_str(), store, builder)
+            cmd.exec(parent_ctx, path.as_str(), builder)
         } else {
             unsafe {
-                InlineWaker::block_on(stderr_write(
+                block_on(stderr_write(
                     parent_ctx,
-                    format!("wasm command unknown - {}\r\n", path).as_bytes(),
+                    format!("wasm command unknown - {path}\r\n").as_bytes(),
                 ))
             }
             .ok();

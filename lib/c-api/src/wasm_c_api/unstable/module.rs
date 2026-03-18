@@ -55,7 +55,7 @@ use wasmer_api::Module;
 /// #    .success();
 /// # }
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_module_name(
     module: &wasm_module_t,
     // own
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn wasmer_module_name(
 /// #    .success();
 /// # }
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_module_set_name(
     module: &mut wasm_module_t,
     // own
@@ -167,12 +167,12 @@ pub unsafe extern "C" fn wasmer_module_set_name(
 /// # Example
 ///
 /// See the module's documentation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_module_new(
     engine: Option<&mut wasm_engine_t>,
     bytes: Option<&wasm_byte_vec_t>,
 ) -> Option<Box<wasm_module_t>> {
-    let engine: wasmer_api::Engine = engine?.inner.clone().into();
+    let engine: wasmer_api::Engine = engine?.inner.clone();
     let bytes = bytes?;
 
     let module = c_try!(Module::from_binary(&engine, bytes.as_slice()));

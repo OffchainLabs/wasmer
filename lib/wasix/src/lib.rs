@@ -1,8 +1,9 @@
 // FIXME: merge with ./lib.rs_upstream
 
+#![allow(clippy::result_large_err)]
 #![doc(html_favicon_url = "https://wasmer.io/images/icons/favicon-32x32.png")]
 #![doc(html_logo_url = "https://github.com/wasmerio.png?size=200")]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Wasmer's WASI implementation
 //!
@@ -14,12 +15,21 @@
 //! [WASI plugin example](https://github.com/wasmerio/wasmer/blob/main/examples/plugin.rs)
 //! for an example of how to extend WASI using the WASI FS API.
 
-#[cfg(all(not(feature = "sys"), not(feature = "js")))]
-compile_error!("At least the `sys` or the `js` feature must be enabled. Please, pick one.");
-
-#[cfg(all(feature = "sys", feature = "js"))]
+#[cfg(all(
+    not(feature = "sys"),
+    not(feature = "js"),
+    not(feature = "sys-minimal")
+))]
 compile_error!(
-    "Cannot have both `sys` and `js` features enabled at the same time. Please, pick one."
+    "At least the `sys` or the `js` or `sys-minimal` feature must be enabled. Please, pick one."
+);
+
+#[cfg(any(
+    all(feature = "js", feature = "sys"),
+    all(feature = "js", feature = "sys-minimal")
+))]
+compile_error!(
+    "Cannot have both `sys` and `js` or `sys-minimal` and `sys` features enabled at the same time. Please, pick one."
 );
 
 #[cfg(all(feature = "sys", target_arch = "wasm32"))]
@@ -27,7 +37,7 @@ compile_error!("The `sys` feature must be enabled only for non-`wasm32` target."
 
 #[cfg(all(feature = "js", not(target_arch = "wasm32")))]
 compile_error!(
-    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasi`)."
+    "The `js` feature must be enabled only for the `wasm32` target (either `wasm32-unknown-unknown` or `wasm32-wasip1`)."
 );
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -61,14 +71,13 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use os::task::control_plane::ControlPlaneError;
 use thiserror::Error;
-use tracing::error;
 // re-exports needed for OS
 pub use wasmer;
 pub use wasmer_wasix_types;
 
 use wasmer::{
-    imports, namespace, AsStoreMut, Exports, FunctionEnv, Imports, Memory32, MemoryAccessError,
-    MemorySize, RuntimeError,
+    AsStoreMut, Exports, FunctionEnv, Imports, Memory32, MemoryAccessError, MemorySize,
+    RuntimeError, imports, namespace,
 };
 
 pub use virtual_fs;
@@ -81,30 +90,31 @@ pub use virtual_net::{
     host::{LocalNetworking, LocalTcpListener, LocalTcpStream, LocalUdpSocket},
     io_err_into_net_error,
 };
+#[cfg(feature = "napi-v8")]
+pub use wasmer_napi::{NapiCtx, NapiCtxBuilder, NapiLimits, NapiRuntimeHooks, module_needs_napi};
 use wasmer_wasix_types::wasi::{Errno, ExitCode};
 
 pub use crate::{
-    fs::{default_fs_backing, Fd, WasiFs, WasiInodes, VIRTUAL_ROOT_FD},
+    fs::{Fd, VIRTUAL_ROOT_FD, WasiFs, WasiInodes, default_fs_backing},
     os::{
+        WasiTtyState,
         task::{
             control_plane::WasiControlPlane,
             process::{WasiProcess, WasiProcessId},
             thread::{WasiThread, WasiThreadError, WasiThreadHandle, WasiThreadId},
         },
-        WasiTtyState,
     },
     rewind::*,
-    runtime::{task_manager::VirtualTaskManager, PluggableRuntime, Runtime},
+    runtime::{PluggableRuntime, Runtime, task_manager::VirtualTaskManager},
     state::{
-        WasiEnv, WasiEnvBuilder, WasiEnvInit, WasiFunctionEnv, WasiInstanceHandles,
-        WasiStateCreationError, ALL_RIGHTS,
+        ALL_RIGHTS, WasiEnv, WasiEnvBuilder, WasiEnvInit, WasiFunctionEnv,
+        WasiModuleInstanceHandles, WasiModuleTreeHandles, WasiStateCreationError,
     },
     syscalls::{journal::wait_for_snapshot, rewind, rewind_ext, types, unwind},
     utils::is_wasix_module,
     utils::{
-        get_wasi_version, get_wasi_versions, is_wasi_module,
-        store::{capture_store_snapshot, restore_store_snapshot, StoreSnapshot},
-        WasiVersion,
+        WasiVersion, get_wasi_version, get_wasi_versions, is_wasi_module,
+        store::{StoreSnapshot, capture_store_snapshot, restore_store_snapshot},
     },
 };
 
@@ -114,10 +124,14 @@ pub use crate::{
 pub enum WasiError {
     #[error("WASI exited with code: {0}")]
     Exit(ExitCode),
+    #[error("WASI thread exited")]
+    ThreadExit,
     #[error("WASI deep sleep: {0:?}")]
     DeepSleep(DeepSleepWork),
     #[error("The WASI version could not be determined")]
     UnknownWasiVersion,
+    #[error("Dynamically-linked symbol not found or has bad type: {0}")]
+    DlSymbolResolutionFailed(String),
 }
 
 pub type WasiResult<T> = Result<Result<T, Errno>, WasiError>;
@@ -221,7 +235,7 @@ impl std::fmt::Display for ExtendedFsError {
         write!(f, "fs error: {}", self.error)?;
 
         if let Some(msg) = &self.message {
-            write!(f, " | {}", msg)?;
+            write!(f, " | {msg}")?;
         }
 
         Ok(())
@@ -240,25 +254,28 @@ impl SpawnError {
     /// [`NotFound`]: SpawnError::NotFound
     #[must_use]
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::NotFound { .. } | Self::MissingEntrypoint { .. })
+        matches!(
+            self,
+            Self::NotFound { .. } | Self::MissingEntrypoint { .. } | Self::BinaryNotFound { .. }
+        )
     }
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum WasiRuntimeError {
-    #[error("WASI state setup failed")]
+    #[error("WASI state setup failed: {0}")]
     Init(#[from] WasiStateCreationError),
-    #[error("Loading exports failed")]
+    #[error("Loading exports failed: {0}")]
     Export(#[from] wasmer::ExportError),
-    #[error("Instantiation failed")]
+    #[error("Instantiation failed: {0}")]
     Instantiation(#[from] wasmer::InstantiationError),
-    #[error("WASI error")]
+    #[error("WASI error: {0}")]
     Wasi(#[from] WasiError),
-    #[error("Process manager error")]
+    #[error("Process manager error: {0}")]
     ControlPlane(#[from] ControlPlaneError),
     #[error("{0}")]
     Runtime(#[from] RuntimeError),
-    #[error("Memory access error")]
+    #[error("Memory access error: {0}")]
     Thread(#[from] WasiThreadError),
     #[error("{0}")]
     Anyhow(#[from] Arc<anyhow::Error>),
@@ -267,7 +284,7 @@ pub enum WasiRuntimeError {
 impl WasiRuntimeError {
     /// Retrieve the concrete exit code returned by an instance.
     ///
-    /// Returns [`None`] if a general execution error ocurred.
+    /// Returns [`None`] if a general execution error occurred.
     pub fn as_exit_code(&self) -> Option<ExitCode> {
         if let WasiRuntimeError::Wasi(WasiError::Exit(code)) = self {
             Some(*code)
@@ -281,48 +298,36 @@ impl WasiRuntimeError {
             None
         }
     }
-}
 
-#[allow(clippy::result_large_err)]
-pub(crate) fn run_wasi_func(
-    func: &wasmer::Function,
-    store: &mut impl AsStoreMut,
-    params: &[wasmer::Value],
-) -> Result<Box<[wasmer::Value]>, WasiRuntimeError> {
-    func.call(store, params).map_err(|err| {
-        if let Some(_werr) = err.downcast_ref::<WasiError>() {
-            let werr = err.downcast::<WasiError>().unwrap();
-            WasiRuntimeError::Wasi(werr)
+    pub fn display<'a>(&'a self, store: &'a mut impl AsStoreMut) -> WasiRuntimeErrorDisplay<'a> {
+        if let WasiRuntimeError::Runtime(err) = self {
+            WasiRuntimeErrorDisplay::Runtime(err.display(store))
         } else {
-            WasiRuntimeError::Runtime(err)
+            WasiRuntimeErrorDisplay::Other(self)
         }
-    })
+    }
 }
 
-/// Run a main function.
-///
-/// This is usually called "_start" in WASI modules.
-/// The function will not receive arguments or return values.
-///
-/// An exit code that is not 0 will be returned as a `WasiError::Exit`.
-#[allow(clippy::result_large_err)]
-pub(crate) fn run_wasi_func_start(
-    func: &wasmer::Function,
-    store: &mut impl AsStoreMut,
-) -> Result<(), WasiRuntimeError> {
-    run_wasi_func(func, store, &[])?;
-    Ok(())
+pub enum WasiRuntimeErrorDisplay<'a> {
+    Runtime(wasmer::RuntimeErrorDisplay<'a>),
+    Other(&'a WasiRuntimeError),
+}
+
+impl std::fmt::Display for WasiRuntimeErrorDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WasiRuntimeErrorDisplay::Runtime(display) => write!(f, "{display}"),
+            WasiRuntimeErrorDisplay::Other(err) => write!(f, "{err}"),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct WasiVFork {
-    /// The unwound stack before the vfork occured
-    pub rewind_stack: BytesMut,
-    /// The memory stack before the vfork occured
-    pub memory_stack: BytesMut,
-    /// The mutable parts of the store
-    pub store_data: Bytes,
-    /// The environment before the vfork occured
+    /// The information needed to rewind the stack with asyncify
+    pub asyncify: Option<WasiVForkAsyncify>,
+
+    /// The environment before the vfork occurred
     pub env: Box<WasiEnv>,
 
     /// Handle of the thread we have forked (dropping this handle
@@ -330,21 +335,28 @@ pub struct WasiVFork {
     pub handle: WasiThreadHandle,
 }
 
+#[derive(Debug, Clone)]
+pub struct WasiVForkAsyncify {
+    /// The unwound stack before the vfork occurred
+    pub rewind_stack: BytesMut,
+    /// The mutable parts of the store
+    pub store_data: Bytes,
+    /// Whether the store is 64-bit
+    pub is_64bit: bool,
+}
+
 impl Clone for WasiVFork {
     fn clone(&self) -> Self {
         Self {
-            rewind_stack: self.rewind_stack.clone(),
-            memory_stack: self.memory_stack.clone(),
-            store_data: self.store_data.clone(),
+            asyncify: self.asyncify.clone(),
             env: Box::new(self.env.as_ref().clone()),
             handle: self.handle.clone(),
         }
     }
 }
 
-/// Create an [`Imports`] with an existing [`WasiEnv`]. `WasiEnv`
-/// needs a [`WasiState`], that can be constructed from a
-/// [`WasiEnvBuilder`](state::WasiEnvBuilder).
+/// Create an [`Imports`] with an existing [`WasiEnv`]. [`WasiEnv`] values are
+/// typically constructed with [`WasiEnvBuilder`].
 pub fn generate_import_object_from_env(
     store: &mut impl AsStoreMut,
     ctx: &FunctionEnv<WasiEnv>,
@@ -361,8 +373,7 @@ pub fn generate_import_object_from_env(
 
     let exports_wasi_generic = wasi_exports_generic(store, ctx);
 
-    #[allow(unused_mut)]
-    let mut imports_wasi_generic = imports! {
+    let imports_wasi_generic = imports! {
         "wasi" => exports_wasi_generic,
     };
 
@@ -490,13 +501,20 @@ fn wasi_snapshot_preview1_exports(
 }
 
 fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
+    let engine_supports_async = store.as_store_ref().engine().supports_async();
+
     use syscalls::*;
     let namespace = namespace! {
         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory32>),
         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory32>),
+        "call_dynamic" => Function::new_typed_with_env(&mut store, env, call_dynamic::<Memory32>),
+        "reflect_signature" => Function::new_typed_with_env(&mut store, env, reflect_signature::<Memory32>),
         "clock_res_get" => Function::new_typed_with_env(&mut store, env, clock_res_get::<Memory32>),
         "clock_time_get" => Function::new_typed_with_env(&mut store, env, clock_time_get::<Memory32>),
-        "clock_time_set" => Function::new_typed_with_env(&mut store, env, clock_time_set::<Memory32>),
+        "clock_time_set" => Function::new_typed_with_env(&mut store, env, clock_time_set),
+        "closure_prepare" => Function::new_typed_with_env(&mut store, env, closure_prepare::<Memory32>),
+        "closure_allocate" => Function::new_typed_with_env(&mut store, env, closure_allocate::<Memory32>),
+        "closure_free" => Function::new_typed_with_env(&mut store, env, closure_free),
         "environ_get" => Function::new_typed_with_env(&mut store, env, environ_get::<Memory32>),
         "environ_sizes_get" => Function::new_typed_with_env(&mut store, env, environ_sizes_get::<Memory32>),
         "epoll_create" => Function::new_typed_with_env(&mut store, env, epoll_create::<Memory32>),
@@ -520,6 +538,9 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "fd_readdir" => Function::new_typed_with_env(&mut store, env, fd_readdir::<Memory32>),
         "fd_renumber" => Function::new_typed_with_env(&mut store, env, fd_renumber),
         "fd_dup" => Function::new_typed_with_env(&mut store, env, fd_dup::<Memory32>),
+        "fd_dup2" => Function::new_typed_with_env(&mut store, env, fd_dup2::<Memory32>),
+        "fd_fdflags_get" => Function::new_typed_with_env(&mut store, env, fd_fdflags_get::<Memory32>),
+        "fd_fdflags_set" => Function::new_typed_with_env(&mut store, env, fd_fdflags_set),
         "fd_event" => Function::new_typed_with_env(&mut store, env, fd_event::<Memory32>),
         "fd_seek" => Function::new_typed_with_env(&mut store, env, fd_seek::<Memory32>),
         "fd_sync" => Function::new_typed_with_env(&mut store, env, fd_sync),
@@ -531,6 +552,7 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "path_filestat_set_times" => Function::new_typed_with_env(&mut store, env, path_filestat_set_times::<Memory32>),
         "path_link" => Function::new_typed_with_env(&mut store, env, path_link::<Memory32>),
         "path_open" => Function::new_typed_with_env(&mut store, env, path_open::<Memory32>),
+        "path_open2" => Function::new_typed_with_env(&mut store, env, path_open2::<Memory32>),
         "path_readlink" => Function::new_typed_with_env(&mut store, env, path_readlink::<Memory32>),
         "path_remove_directory" => Function::new_typed_with_env(&mut store, env, path_remove_directory::<Memory32>),
         "path_rename" => Function::new_typed_with_env(&mut store, env, path_rename::<Memory32>),
@@ -539,13 +561,20 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "poll_oneoff" => Function::new_typed_with_env(&mut store, env, poll_oneoff::<Memory32>),
         "proc_exit" => Function::new_typed_with_env(&mut store, env, proc_exit::<Memory32>),
         "proc_fork" => Function::new_typed_with_env(&mut store, env, proc_fork::<Memory32>),
+        "proc_fork_env" => Function::new_typed_with_env(&mut store, env, proc_fork_env::<Memory32>),
         "proc_join" => Function::new_typed_with_env(&mut store, env, proc_join::<Memory32>),
-        "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal::<Memory32>),
+        "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal),
+        "proc_signals_get" => Function::new_typed_with_env(&mut store, env, proc_signals_get::<Memory32>),
+        "proc_signals_sizes_get" => Function::new_typed_with_env(&mut store, env, proc_signals_sizes_get::<Memory32>),
         "proc_exec" => Function::new_typed_with_env(&mut store, env, proc_exec::<Memory32>),
         "proc_exec2" => Function::new_typed_with_env(&mut store, env, proc_exec2::<Memory32>),
+        "proc_exec3" => Function::new_typed_with_env(&mut store, env, proc_exec3::<Memory32>),
+        "proc_exit2" => Function::new_typed_with_env(&mut store, env, proc_exit2::<Memory32>),
         "proc_raise" => Function::new_typed_with_env(&mut store, env, proc_raise),
         "proc_raise_interval" => Function::new_typed_with_env(&mut store, env, proc_raise_interval),
+        "proc_snapshot" => Function::new_typed_with_env(&mut store, env, proc_snapshot::<Memory32>),
         "proc_spawn" => Function::new_typed_with_env(&mut store, env, proc_spawn::<Memory32>),
+        "proc_spawn2" => Function::new_typed_with_env(&mut store, env, proc_spawn2::<Memory32>),
         "proc_id" => Function::new_typed_with_env(&mut store, env, proc_id::<Memory32>),
         "proc_parent" => Function::new_typed_with_env(&mut store, env, proc_parent::<Memory32>),
         "random_get" => Function::new_typed_with_env(&mut store, env, random_get::<Memory32>),
@@ -553,6 +582,9 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "tty_set" => Function::new_typed_with_env(&mut store, env, tty_set::<Memory32>),
         "getcwd" => Function::new_typed_with_env(&mut store, env, getcwd::<Memory32>),
         "chdir" => Function::new_typed_with_env(&mut store, env, chdir::<Memory32>),
+        "dl_invalid_handle" => Function::new_typed_with_env(&mut store, env, dl_invalid_handle),
+        "dlopen" => Function::new_typed_with_env(&mut store, env, dlopen::<Memory32>),
+        "dlsym" => Function::new_typed_with_env(&mut store, env, dlsym::<Memory32>),
         "callback_signal" => Function::new_typed_with_env(&mut store, env, callback_signal::<Memory32>),
         "thread_spawn" => Function::new_typed_with_env(&mut store, env, thread_spawn_v2::<Memory32>),
         "thread_spawn_v2" => Function::new_typed_with_env(&mut store, env, thread_spawn_v2::<Memory32>),
@@ -565,6 +597,9 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sched_yield" => Function::new_typed_with_env(&mut store, env, sched_yield::<Memory32>),
         "stack_checkpoint" => Function::new_typed_with_env(&mut store, env, stack_checkpoint::<Memory32>),
         "stack_restore" => Function::new_typed_with_env(&mut store, env, stack_restore::<Memory32>),
+        "context_create" => Function::new_typed_with_env(&mut store, env, context_create::<Memory32>),
+        "context_switch" => if engine_supports_async { Function::new_typed_with_env_async(&mut store, env, context_switch) } else { Function::new_typed_with_env(&mut store, env, context_switch_not_supported) },
+        "context_destroy" => Function::new_typed_with_env(&mut store, env, context_destroy),
         "futex_wait" => Function::new_typed_with_env(&mut store, env, futex_wait::<Memory32>),
         "futex_wake" => Function::new_typed_with_env(&mut store, env, futex_wake::<Memory32>),
         "futex_wake_all" => Function::new_typed_with_env(&mut store, env, futex_wake_all::<Memory32>),
@@ -585,6 +620,7 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sock_addr_local" => Function::new_typed_with_env(&mut store, env, sock_addr_local::<Memory32>),
         "sock_addr_peer" => Function::new_typed_with_env(&mut store, env, sock_addr_peer::<Memory32>),
         "sock_open" => Function::new_typed_with_env(&mut store, env, sock_open::<Memory32>),
+        "sock_pair" => Function::new_typed_with_env(&mut store, env, sock_pair::<Memory32>),
         "sock_set_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_set_opt_flag),
         "sock_get_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_get_opt_flag::<Memory32>),
         "sock_set_opt_time" => Function::new_typed_with_env(&mut store, env, sock_set_opt_time::<Memory32>),
@@ -612,13 +648,20 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
 }
 
 fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
+    let engine_supports_async = store.as_store_ref().engine().supports_async();
+
     use syscalls::*;
     let namespace = namespace! {
         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory64>),
         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory64>),
+        "call_dynamic" => Function::new_typed_with_env(&mut store, env, call_dynamic::<Memory64>),
+        "reflect_signature" => Function::new_typed_with_env(&mut store, env, reflect_signature::<Memory64>),
         "clock_res_get" => Function::new_typed_with_env(&mut store, env, clock_res_get::<Memory64>),
         "clock_time_get" => Function::new_typed_with_env(&mut store, env, clock_time_get::<Memory64>),
-        "clock_time_set" => Function::new_typed_with_env(&mut store, env, clock_time_set::<Memory64>),
+        "clock_time_set" => Function::new_typed_with_env(&mut store, env, clock_time_set),
+        "closure_prepare" => Function::new_typed_with_env(&mut store, env, closure_prepare::<Memory64>),
+        "closure_allocate" => Function::new_typed_with_env(&mut store, env, closure_allocate::<Memory64>),
+        "closure_free" => Function::new_typed_with_env(&mut store, env, closure_free),
         "environ_get" => Function::new_typed_with_env(&mut store, env, environ_get::<Memory64>),
         "environ_sizes_get" => Function::new_typed_with_env(&mut store, env, environ_sizes_get::<Memory64>),
         "epoll_create" => Function::new_typed_with_env(&mut store, env, epoll_create::<Memory64>),
@@ -642,6 +685,9 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "fd_readdir" => Function::new_typed_with_env(&mut store, env, fd_readdir::<Memory64>),
         "fd_renumber" => Function::new_typed_with_env(&mut store, env, fd_renumber),
         "fd_dup" => Function::new_typed_with_env(&mut store, env, fd_dup::<Memory64>),
+        "fd_dup2" => Function::new_typed_with_env(&mut store, env, fd_dup2::<Memory64>),
+        "fd_fdflags_get" => Function::new_typed_with_env(&mut store, env, fd_fdflags_get::<Memory64>),
+        "fd_fdflags_set" => Function::new_typed_with_env(&mut store, env, fd_fdflags_set),
         "fd_event" => Function::new_typed_with_env(&mut store, env, fd_event::<Memory64>),
         "fd_seek" => Function::new_typed_with_env(&mut store, env, fd_seek::<Memory64>),
         "fd_sync" => Function::new_typed_with_env(&mut store, env, fd_sync),
@@ -653,6 +699,7 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "path_filestat_set_times" => Function::new_typed_with_env(&mut store, env, path_filestat_set_times::<Memory64>),
         "path_link" => Function::new_typed_with_env(&mut store, env, path_link::<Memory64>),
         "path_open" => Function::new_typed_with_env(&mut store, env, path_open::<Memory64>),
+        "path_open2" => Function::new_typed_with_env(&mut store, env, path_open2::<Memory64>),
         "path_readlink" => Function::new_typed_with_env(&mut store, env, path_readlink::<Memory64>),
         "path_remove_directory" => Function::new_typed_with_env(&mut store, env, path_remove_directory::<Memory64>),
         "path_rename" => Function::new_typed_with_env(&mut store, env, path_rename::<Memory64>),
@@ -661,13 +708,20 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "poll_oneoff" => Function::new_typed_with_env(&mut store, env, poll_oneoff::<Memory64>),
         "proc_exit" => Function::new_typed_with_env(&mut store, env, proc_exit::<Memory64>),
         "proc_fork" => Function::new_typed_with_env(&mut store, env, proc_fork::<Memory64>),
+        "proc_fork_env" => Function::new_typed_with_env(&mut store, env, proc_fork_env::<Memory64>),
         "proc_join" => Function::new_typed_with_env(&mut store, env, proc_join::<Memory64>),
-        "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal::<Memory64>),
+        "proc_signal" => Function::new_typed_with_env(&mut store, env, proc_signal),
+        "proc_signals_get" => Function::new_typed_with_env(&mut store, env, proc_signals_get::<Memory64>),
+        "proc_signals_sizes_get" => Function::new_typed_with_env(&mut store, env, proc_signals_sizes_get::<Memory64>),
         "proc_exec" => Function::new_typed_with_env(&mut store, env, proc_exec::<Memory64>),
         "proc_exec2" => Function::new_typed_with_env(&mut store, env, proc_exec2::<Memory64>),
+        "proc_exec3" => Function::new_typed_with_env(&mut store, env, proc_exec3::<Memory64>),
+        "proc_exit2" => Function::new_typed_with_env(&mut store, env, proc_exit2::<Memory64>),
         "proc_raise" => Function::new_typed_with_env(&mut store, env, proc_raise),
         "proc_raise_interval" => Function::new_typed_with_env(&mut store, env, proc_raise_interval),
+        "proc_snapshot" => Function::new_typed_with_env(&mut store, env, proc_snapshot::<Memory64>),
         "proc_spawn" => Function::new_typed_with_env(&mut store, env, proc_spawn::<Memory64>),
+        "proc_spawn2" => Function::new_typed_with_env(&mut store, env, proc_spawn2::<Memory64>),
         "proc_id" => Function::new_typed_with_env(&mut store, env, proc_id::<Memory64>),
         "proc_parent" => Function::new_typed_with_env(&mut store, env, proc_parent::<Memory64>),
         "random_get" => Function::new_typed_with_env(&mut store, env, random_get::<Memory64>),
@@ -675,6 +729,9 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "tty_set" => Function::new_typed_with_env(&mut store, env, tty_set::<Memory64>),
         "getcwd" => Function::new_typed_with_env(&mut store, env, getcwd::<Memory64>),
         "chdir" => Function::new_typed_with_env(&mut store, env, chdir::<Memory64>),
+        "dl_invalid_handle" => Function::new_typed_with_env(&mut store, env, dl_invalid_handle),
+        "dlopen" => Function::new_typed_with_env(&mut store, env, dlopen::<Memory64>),
+        "dlsym" => Function::new_typed_with_env(&mut store, env, dlsym::<Memory64>),
         "callback_signal" => Function::new_typed_with_env(&mut store, env, callback_signal::<Memory64>),
         "thread_spawn" => Function::new_typed_with_env(&mut store, env, thread_spawn_v2::<Memory64>),
         "thread_spawn_v2" => Function::new_typed_with_env(&mut store, env, thread_spawn_v2::<Memory64>),
@@ -687,6 +744,9 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sched_yield" => Function::new_typed_with_env(&mut store, env, sched_yield::<Memory64>),
         "stack_checkpoint" => Function::new_typed_with_env(&mut store, env, stack_checkpoint::<Memory64>),
         "stack_restore" => Function::new_typed_with_env(&mut store, env, stack_restore::<Memory64>),
+        "context_create" => Function::new_typed_with_env(&mut store, env, context_create::<Memory64>),
+        "context_switch" => if engine_supports_async { Function::new_typed_with_env_async(&mut store, env, context_switch) } else { Function::new_typed_with_env(&mut store, env, context_switch_not_supported) },
+        "context_destroy" => Function::new_typed_with_env(&mut store, env, context_destroy),
         "futex_wait" => Function::new_typed_with_env(&mut store, env, futex_wait::<Memory64>),
         "futex_wake" => Function::new_typed_with_env(&mut store, env, futex_wake::<Memory64>),
         "futex_wake_all" => Function::new_typed_with_env(&mut store, env, futex_wake_all::<Memory64>),
@@ -707,6 +767,7 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
         "sock_addr_local" => Function::new_typed_with_env(&mut store, env, sock_addr_local::<Memory64>),
         "sock_addr_peer" => Function::new_typed_with_env(&mut store, env, sock_addr_peer::<Memory64>),
         "sock_open" => Function::new_typed_with_env(&mut store, env, sock_open::<Memory64>),
+        "sock_pair" => Function::new_typed_with_env(&mut store, env, sock_pair::<Memory64>),
         "sock_set_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_set_opt_flag),
         "sock_get_opt_flag" => Function::new_typed_with_env(&mut store, env, sock_get_opt_flag::<Memory64>),
         "sock_set_opt_time" => Function::new_typed_with_env(&mut store, env, sock_set_opt_time::<Memory64>),
@@ -733,27 +794,13 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
     namespace
 }
 
-pub type InstanceInitializer =
-    Box<dyn FnOnce(&wasmer::Instance, &dyn wasmer::AsStoreRef) -> Result<(), anyhow::Error>>;
-
-type ModuleInitializer =
-    Box<dyn FnOnce(&wasmer::Instance, &dyn wasmer::AsStoreRef) -> Result<(), anyhow::Error>>;
-
-/// No-op module initializer.
-fn stub_initializer(
-    _instance: &wasmer::Instance,
-    _store: &dyn wasmer::AsStoreRef,
-) -> Result<(), anyhow::Error> {
-    Ok(())
-}
-
 // TODO: split function into two variants, one for JS and one for sys.
 // (this will make code less messy)
 fn import_object_for_all_wasi_versions(
     _module: &wasmer::Module,
     store: &mut impl AsStoreMut,
     env: &FunctionEnv<WasiEnv>,
-) -> (Imports, ModuleInitializer) {
+) -> Imports {
     let exports_wasi_generic = wasi_exports_generic(store, env);
     let exports_wasi_unstable = wasi_unstable_exports(store, env);
     let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env);
@@ -770,9 +817,7 @@ fn import_object_for_all_wasi_versions(
         "wasix_64v1" => exports_wasix_64v1,
     };
 
-    let init = Box::new(stub_initializer) as ModuleInitializer;
-
-    (imports, init)
+    imports
 }
 
 /// Combines a state generating function with the import list for legacy WASI
@@ -857,5 +902,24 @@ where
         } else {
             tokio::task::spawn_blocking(f).await
         }
+    }
+}
+
+pub(crate) fn flatten_runtime_error(err: RuntimeError) -> RuntimeError {
+    let e_ref = err.downcast_ref::<WasiRuntimeError>();
+    match e_ref {
+        Some(WasiRuntimeError::Wasi(_)) => {
+            let Ok(WasiRuntimeError::Wasi(err)) = err.downcast::<WasiRuntimeError>() else {
+                unreachable!()
+            };
+            RuntimeError::user(Box::new(err))
+        }
+        Some(WasiRuntimeError::Runtime(_)) => {
+            let Ok(WasiRuntimeError::Runtime(err)) = err.downcast::<WasiRuntimeError>() else {
+                unreachable!()
+            };
+            flatten_runtime_error(err)
+        }
+        _ => err,
     }
 }

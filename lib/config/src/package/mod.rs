@@ -22,7 +22,7 @@ pub use self::{
 
 use std::{
     borrow::Cow,
-    collections::{hash_map::HashMap, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Display},
     path::{Path, PathBuf},
     str::FromStr,
@@ -30,7 +30,7 @@ use std::{
 
 use indexmap::IndexMap;
 use semver::{Version, VersionReq};
-use serde::{de::Error as _, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use thiserror::Error;
 
 /// The ABI is a hint to WebAssembly runtimes about what additional imports to
@@ -40,8 +40,6 @@ use thiserror::Error;
 #[derive(Clone, Copy, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Abi {
-    #[serde(rename = "emscripten")]
-    Emscripten,
     #[default]
     #[serde(rename = "none")]
     None,
@@ -55,7 +53,6 @@ impl Abi {
     /// Get the ABI's human-friendly name.
     pub fn to_str(&self) -> &str {
         match self {
-            Abi::Emscripten => "emscripten",
             Abi::Wasi => "wasi",
             Abi::WASM4 => "wasm4",
             Abi::None => "generic",
@@ -84,7 +81,6 @@ impl FromStr for Abi {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "emscripten" => Ok(Abi::Emscripten),
             "wasi" => Ok(Abi::Wasi),
             "wasm4" => Ok(Abi::WASM4),
             "generic" => Ok(Abi::None),
@@ -185,6 +181,10 @@ pub struct Package {
 }
 
 impl Package {
+    pub fn new_empty() -> Self {
+        PackageBuilder::default().build().unwrap()
+    }
+
     /// Create a [`PackageBuilder`] populated with all mandatory fields.
     pub fn builder(
         name: impl Into<String>,
@@ -254,8 +254,7 @@ pub struct CommandV2 {
     pub module: ModuleReference,
     /// The runner to use when running this command.
     ///
-    /// This may be a URL, or the well-known runners `wasi`, `wcgi`, or
-    /// `emscripten`.
+    /// This may be a URL, or the well-known runners `wasi` or `wcgi`
     pub runner: String,
     /// Extra annotations that will be consumed by the runner.
     pub annotations: Option<CommandAnnotations>,
@@ -386,7 +385,7 @@ fn toml_to_cbor_value(val: &toml::Value) -> ciborium::Value {
         toml::Value::Integer(i) => ciborium::Value::Integer(ciborium::value::Integer::from(*i)),
         toml::Value::Float(f) => ciborium::Value::Float(*f),
         toml::Value::Boolean(b) => ciborium::Value::Bool(*b),
-        toml::Value::Datetime(d) => ciborium::Value::Text(format!("{}", d)),
+        toml::Value::Datetime(d) => ciborium::Value::Text(format!("{d}")),
         toml::Value::Array(sq) => {
             ciborium::Value::Array(sq.iter().map(toml_to_cbor_value).collect())
         }
@@ -500,10 +499,25 @@ pub struct Module {
     pub kind: Option<String>,
     /// WebAssembly interfaces this module requires.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub interfaces: Option<HashMap<String, String>>,
+    pub interfaces: Option<IndexMap<String, String>>,
     /// Interface definitions that can be used to generate bindings to this
     /// module.
     pub bindings: Option<Bindings>,
+    /// Miscellaneous annotations from the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<UserAnnotations>,
+}
+
+/// Miscellaneous annotations specified by the user.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct UserAnnotations {
+    pub suggested_compiler_optimizations: SuggestedCompilerOptimizations,
+}
+
+/// Deprecated.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
+pub struct SuggestedCompilerOptimizations {
+    pub pass_params: Option<bool>,
 }
 
 /// The interface exposed by a [`Module`].
@@ -713,9 +727,9 @@ pub struct Manifest {
     /// Metadata about the package itself.
     pub package: Option<Package>,
     /// The package's dependencies.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     #[builder(default)]
-    pub dependencies: HashMap<String, VersionReq>,
+    pub dependencies: IndexMap<String, VersionReq>,
     /// The mappings used when making bundled assets available to WebAssembly
     /// instances, in the form guest -> host.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -732,6 +746,16 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub fn new_empty() -> Self {
+        Self {
+            package: None,
+            dependencies: IndexMap::new(),
+            fs: IndexMap::new(),
+            modules: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
     /// Create a [`ManifestBuilder`] populated with all mandatory fields.
     pub fn builder(package: Package) -> ManifestBuilder {
         ManifestBuilder::new(package)
@@ -833,15 +857,14 @@ impl Manifest {
             }
         }
 
-        if let Some(package) = &self.package {
-            if let Some(entrypoint) = package.entrypoint.as_deref() {
-                if !commands.contains_key(entrypoint) {
-                    return Err(ValidationError::InvalidEntrypoint {
-                        entrypoint: entrypoint.to_string(),
-                        available_commands: commands.keys().map(ToString::to_string).collect(),
-                    });
-                }
-            }
+        if let Some(package) = &self.package
+            && let Some(entrypoint) = package.entrypoint.as_deref()
+            && !commands.contains_key(entrypoint)
+        {
+            return Err(ValidationError::InvalidEntrypoint {
+                entrypoint: entrypoint.to_string(),
+                available_commands: commands.keys().map(ToString::to_string).collect(),
+            });
         }
 
         Ok(())
@@ -901,7 +924,7 @@ impl ManifestBuilder {
     /// Add a dependency to the [`Manifest`].
     pub fn with_dependency(&mut self, name: impl Into<String>, version: VersionReq) -> &mut Self {
         self.dependencies
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(IndexMap::new)
             .insert(name.into(), version);
         self
     }
@@ -938,7 +961,7 @@ pub enum ManifestError {
 #[non_exhaustive]
 pub enum ValidationError {
     #[error(
-        "missing ABI field on module, \"{module}\", used by command, \"{command}\"; an ABI of `wasi` or `emscripten` is required",
+        "missing ABI field on module, \"{module}\", used by command, \"{command}\"; an ABI of `wasi` is required"
     )]
     MissingABI { command: String, module: String },
     #[error("missing module, \"{module}\", in manifest used by command, \"{command}\"")]
@@ -946,7 +969,9 @@ pub enum ValidationError {
         command: String,
         module: ModuleReference,
     },
-    #[error("The \"{command}\" command refers to a nonexistent dependency, \"{dependency}\" in \"{module_ref}\"")]
+    #[error(
+        "The \"{command}\" command refers to a nonexistent dependency, \"{dependency}\" in \"{module_ref}\""
+    )]
     MissingDependency {
         command: String,
         dependency: String,
@@ -967,7 +992,7 @@ pub enum ValidationError {
 mod tests {
     use std::fmt::Debug;
 
-    use serde::{de::DeserializeOwned, Deserialize};
+    use serde::{Deserialize, de::DeserializeOwned};
     use toml::toml;
 
     use super::*;
@@ -990,7 +1015,7 @@ mod tests {
                 entrypoint: None,
                 private: false,
             }),
-            dependencies: HashMap::new(),
+            dependencies: IndexMap::new(),
             modules: vec![Module {
                 name: "test".to_string(),
                 abi: Abi::Wasi,
@@ -998,6 +1023,7 @@ mod tests {
                 interfaces: None,
                 kind: Some("https://webc.org/kind/wasi".to_string()),
                 source: Path::new("test.wasm").to_path_buf(),
+                annotations: None,
             }],
             commands: Vec::new(),
             fs: vec![
@@ -1022,12 +1048,12 @@ license = "MIT"
 
 [[module]]
 name = "mod"
-source = "target/wasm32-wasi/release/mod.wasm"
+source = "target/wasm32-wasip1/release/mod.wasm"
 interfaces = {"wasi" = "0.0.0-unstable"}
 
 [[module]]
 name = "mod-with-exports"
-source = "target/wasm32-wasi/release/mod-with-exports.wasm"
+source = "target/wasm32-wasip1/release/mod-with-exports.wasm"
 bindings = { wit-exports = "exports.wit", wit-bindgen = "0.0.0" }
 
 [[command]]
@@ -1045,7 +1071,7 @@ module = "mod"
             modules[1],
             Module {
                 name: "mod-with-exports".to_string(),
-                source: PathBuf::from("target/wasm32-wasi/release/mod-with-exports.wasm"),
+                source: PathBuf::from("target/wasm32-wasip1/release/mod-with-exports.wasm"),
                 abi: Abi::None,
                 kind: None,
                 interfaces: None,
@@ -1053,6 +1079,7 @@ module = "mod"
                     wit_exports: PathBuf::from("exports.wit"),
                     wit_bindgen: "0.0.0".parse().unwrap()
                 })),
+                annotations: None
             },
         );
     }

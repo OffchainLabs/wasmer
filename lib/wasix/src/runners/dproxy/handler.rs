@@ -8,18 +8,16 @@ use http_body_util::BodyExt;
 use tower::Service;
 
 use super::super::Body;
-use crate::runners::dproxy::shard::Shard;
 use crate::Runtime;
+use crate::runners::dproxy::shard::Shard;
 
-use super::factory::DProxyInstanceFactory;
 use super::Config;
+use super::factory::DProxyInstanceFactory;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct SharedState {
     pub(crate) config: Config,
     pub(crate) command_name: String,
-    #[derivative(Debug = "ignore")]
     pub(crate) runtime: Arc<dyn Runtime + Send + Sync>,
     pub(crate) factory: DProxyInstanceFactory,
 }

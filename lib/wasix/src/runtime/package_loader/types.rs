@@ -1,7 +1,7 @@
 use std::{fmt::Debug, ops::Deref};
 
 use anyhow::Error;
-use webc::compat::Container;
+use webc::Container;
 
 use crate::{
     bin_factory::BinaryPackage,
@@ -10,7 +10,7 @@ use crate::{
 
 pub fn to_module_hash(value: webc::metadata::AtomSignature) -> wasmer_types::ModuleHash {
     match value {
-        webc::metadata::AtomSignature::Sha256(bytes) => wasmer_types::ModuleHash::Sha256(bytes),
+        webc::metadata::AtomSignature::Sha256(bytes) => wasmer_types::ModuleHash::from_bytes(bytes),
     }
 }
 

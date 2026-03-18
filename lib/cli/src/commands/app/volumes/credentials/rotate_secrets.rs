@@ -1,8 +1,8 @@
 use super::ItemFormatOpts;
 use crate::{
     commands::{
-        app::util::{AppIdent, AppIdentOpts},
         AsyncCliCommand,
+        app::util::{AppIdent, AppIdentOpts},
     },
     config::WasmerEnv,
 };
@@ -28,7 +28,7 @@ impl AsyncCliCommand for CmdAppVolumesRotateSecrets {
         let client = self.env.client()?;
         let (_ident, app) = self.ident.load_app(&client).await?;
 
-        wasmer_api::query::rotate_s3_secrets(&client, app.id).await?;
+        wasmer_backend_api::query::rotate_s3_secrets(&client, app.id).await?;
 
         // Don't print it here and leave it implied, so users can append the output
         // of `wasmer app volumes credentials` without worrying about this message.

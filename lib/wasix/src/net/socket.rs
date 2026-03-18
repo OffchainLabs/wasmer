@@ -4,23 +4,22 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard},
     task::{Context, Poll},
     time::Duration,
 };
 
-use derivative::Derivative;
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use virtual_mio::InterestHandler;
 use virtual_net::{
-    net_error_into_io_err, NetworkError, VirtualIcmpSocket, VirtualNetworking, VirtualRawSocket,
-    VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
+    NetworkError, VirtualIcmpSocket, VirtualNetworking, VirtualRawSocket, VirtualTcpListener,
+    VirtualTcpSocket, VirtualUdpSocket, net_error_into_io_err,
 };
 use wasmer_types::MemorySize;
 use wasmer_wasix_types::wasi::{Addressfamily, Errno, Rights, SockProto, Sockoption, Socktype};
 
-use crate::{net::net_error_into_wasi_err, VirtualTaskManager};
+use crate::{VirtualTaskManager, net::net_error_into_wasi_err};
 
 #[derive(Debug)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -33,8 +32,7 @@ pub enum InodeHttpSocketType {
     Headers,
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct SocketProperties {
     pub family: Addressfamily,
     pub ty: Socktype,
@@ -51,7 +49,6 @@ pub struct SocketProperties {
     pub read_timeout: Option<Duration>,
     pub accept_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
-    #[derivative(Debug = "ignore")]
     pub handler: Option<Box<dyn InterestHandler + Send + Sync>>,
 }
 
@@ -117,37 +114,40 @@ pub enum WasiSocketOption {
     Proto,
 }
 
-impl From<Sockoption> for WasiSocketOption {
-    fn from(opt: Sockoption) -> Self {
+impl TryFrom<Sockoption> for WasiSocketOption {
+    type Error = Errno;
+
+    fn try_from(opt: Sockoption) -> Result<Self, Self::Error> {
         use WasiSocketOption::*;
         match opt {
-            Sockoption::Noop => Noop,
-            Sockoption::ReusePort => ReusePort,
-            Sockoption::ReuseAddr => ReuseAddr,
-            Sockoption::NoDelay => NoDelay,
-            Sockoption::DontRoute => DontRoute,
-            Sockoption::OnlyV6 => OnlyV6,
-            Sockoption::Broadcast => Broadcast,
-            Sockoption::MulticastLoopV4 => MulticastLoopV4,
-            Sockoption::MulticastLoopV6 => MulticastLoopV6,
-            Sockoption::Promiscuous => Promiscuous,
-            Sockoption::Listening => Listening,
-            Sockoption::LastError => LastError,
-            Sockoption::KeepAlive => KeepAlive,
-            Sockoption::Linger => Linger,
-            Sockoption::OobInline => OobInline,
-            Sockoption::RecvBufSize => RecvBufSize,
-            Sockoption::SendBufSize => SendBufSize,
-            Sockoption::RecvLowat => RecvLowat,
-            Sockoption::SendLowat => SendLowat,
-            Sockoption::RecvTimeout => RecvTimeout,
-            Sockoption::SendTimeout => SendTimeout,
-            Sockoption::ConnectTimeout => ConnectTimeout,
-            Sockoption::AcceptTimeout => AcceptTimeout,
-            Sockoption::Ttl => Ttl,
-            Sockoption::MulticastTtlV4 => MulticastTtlV4,
-            Sockoption::Type => Type,
-            Sockoption::Proto => Proto,
+            Sockoption::Noop => Ok(Noop),
+            Sockoption::ReusePort => Ok(ReusePort),
+            Sockoption::ReuseAddr => Ok(ReuseAddr),
+            Sockoption::NoDelay => Ok(NoDelay),
+            Sockoption::DontRoute => Ok(DontRoute),
+            Sockoption::OnlyV6 => Ok(OnlyV6),
+            Sockoption::Broadcast => Ok(Broadcast),
+            Sockoption::MulticastLoopV4 => Ok(MulticastLoopV4),
+            Sockoption::MulticastLoopV6 => Ok(MulticastLoopV6),
+            Sockoption::Promiscuous => Ok(Promiscuous),
+            Sockoption::Listening => Ok(Listening),
+            Sockoption::LastError => Ok(LastError),
+            Sockoption::KeepAlive => Ok(KeepAlive),
+            Sockoption::Linger => Ok(Linger),
+            Sockoption::OobInline => Ok(OobInline),
+            Sockoption::RecvBufSize => Ok(RecvBufSize),
+            Sockoption::SendBufSize => Ok(SendBufSize),
+            Sockoption::RecvLowat => Ok(RecvLowat),
+            Sockoption::SendLowat => Ok(SendLowat),
+            Sockoption::RecvTimeout => Ok(RecvTimeout),
+            Sockoption::SendTimeout => Ok(SendTimeout),
+            Sockoption::ConnectTimeout => Ok(ConnectTimeout),
+            Sockoption::AcceptTimeout => Ok(AcceptTimeout),
+            Sockoption::Ttl => Ok(Ttl),
+            Sockoption::MulticastTtlV4 => Ok(MulticastTtlV4),
+            Sockoption::Type => Ok(Type),
+            Sockoption::Proto => Ok(Proto),
+            _ => Err(Errno::Inval),
         }
     }
 }
@@ -233,7 +233,36 @@ impl InodeSocket {
 
     pub fn poll_write_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut inner = self.inner.protected.write().unwrap();
-        inner.poll_read_ready(cx)
+        inner.poll_write_ready(cx)
+    }
+
+    // When a sendto or connect call comes in for a UDP "pre-socket", it must be bound to
+    // an ephemeral port automatically.
+    // Apparently, clippy fails to recognize the write-locked guard being passed into
+    // the other function, hence the `allow` attribute.
+    #[allow(clippy::await_holding_lock, clippy::readonly_write_lock)]
+    pub async fn auto_bind_udp(
+        &self,
+        tasks: &dyn VirtualTaskManager,
+        net: &dyn VirtualNetworking,
+    ) -> Result<Option<InodeSocket>, Errno> {
+        let timeout = self
+            .opt_time(TimeType::BindTimeout)
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(30));
+        let inner = self.inner.protected.write().unwrap();
+        match &inner.kind {
+            InodeSocketKind::PreSocket { props, .. } if props.ty == Socktype::Dgram => {
+                let addr = match props.family {
+                    Addressfamily::Inet4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    Addressfamily::Inet6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+                    _ => return Err(Errno::Notsup),
+                };
+                Self::bind_internal(tasks, net, addr, timeout, inner).await
+            }
+            _ => Ok(None),
+        }
     }
 
     pub async fn bind(
@@ -247,9 +276,20 @@ impl InodeSocket {
             .ok()
             .flatten()
             .unwrap_or(Duration::from_secs(30));
+        let inner = self.inner.protected.write().unwrap();
+        Self::bind_internal(tasks, net, set_addr, timeout, inner).await
+    }
 
+    // The lock is dropped before awaiting, but clippy doesn't realize it
+    #[allow(clippy::await_holding_lock)]
+    async fn bind_internal(
+        tasks: &dyn VirtualTaskManager,
+        net: &dyn VirtualNetworking,
+        set_addr: SocketAddr,
+        timeout: Duration,
+        mut inner: RwLockWriteGuard<'_, InodeSocketProtected>,
+    ) -> Result<Option<InodeSocket>, Errno> {
         let socket = {
-            let mut inner = self.inner.protected.write().unwrap();
             match &mut inner.kind {
                 InodeSocketKind::PreSocket { props, addr, .. } => {
                     match props.family {
@@ -286,7 +326,6 @@ impl InodeSocket {
                         Socktype::Dgram => {
                             let reuse_port = props.reuse_port;
                             let reuse_addr = props.reuse_addr;
-                            drop(inner);
 
                             net.bind_udp(addr, reuse_port, reuse_addr)
                         }
@@ -332,7 +371,6 @@ impl InodeSocket {
                         Socktype::Dgram => {
                             let reuse_port = props.reuse_port;
                             let reuse_addr = props.reuse_addr;
-                            drop(inner);
 
                             net.bind_udp(addr, reuse_port, reuse_addr)
                         }
@@ -342,6 +380,8 @@ impl InodeSocket {
                 _ => return Err(Errno::Notsup),
             }
         };
+
+        drop(inner);
 
         tokio::select! {
             socket = socket => {
@@ -459,7 +499,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a> Drop for SocketAccepter<'a> {
+        impl Drop for SocketAccepter<'_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.sock.inner.protected.write().unwrap();
@@ -467,7 +507,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a> Future for SocketAccepter<'a> {
+        impl Future for SocketAccepter<'_> {
             type Output = Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr), Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1081,7 +1121,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketSender<'a, 'b> {
+        impl Drop for SocketSender<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1089,7 +1129,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketSender<'a, 'b> {
+        impl Future for SocketSender<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1108,13 +1148,13 @@ impl InodeSocket {
                             }
                         }
                         InodeSocketKind::PreSocket { .. } => {
-                            return Poll::Ready(Err(Errno::Notconn))
+                            return Poll::Ready(Err(Errno::Notconn));
                         }
                         InodeSocketKind::RemoteSocket { is_dead, .. } => {
                             return match is_dead {
                                 true => Poll::Ready(Err(Errno::Connreset)),
                                 false => Poll::Ready(Ok(self.data.len())),
-                            }
+                            };
                         }
                         _ => return Poll::Ready(Err(Errno::Notsup)),
                     };
@@ -1169,7 +1209,7 @@ impl InodeSocket {
             nonblocking: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketSender<'a, 'b> {
+        impl Drop for SocketSender<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1177,7 +1217,7 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketSender<'a, 'b> {
+        impl Future for SocketSender<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
@@ -1191,7 +1231,7 @@ impl InodeSocket {
                             socket.try_send_to(self.data, self.addr)
                         }
                         InodeSocketKind::PreSocket { .. } => {
-                            return Poll::Ready(Err(Errno::Notconn))
+                            return Poll::Ready(Err(Errno::Notconn));
                         }
                         InodeSocketKind::RemoteSocket { is_dead, .. } => {
                             return match is_dead {
@@ -1244,14 +1284,16 @@ impl InodeSocket {
         buf: &mut [MaybeUninit<u8>],
         timeout: Option<Duration>,
         nonblocking: bool,
+        peek: bool,
     ) -> Result<usize, Errno> {
         struct SocketReceiver<'a, 'b> {
             inner: &'a InodeSocketInner,
             data: &'b mut [MaybeUninit<u8>],
             nonblocking: bool,
+            peek: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketReceiver<'a, 'b> {
+        impl Drop for SocketReceiver<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1259,26 +1301,29 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketReceiver<'a, 'b> {
+        impl Future for SocketReceiver<'_, '_> {
             type Output = Result<usize, Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> Poll<Self::Output> {
                 loop {
+                    let peek = self.peek;
                     let mut inner = self.inner.protected.write().unwrap();
                     let res = match &mut inner.kind {
-                        InodeSocketKind::Raw(socket) => socket.try_recv(self.data),
-                        InodeSocketKind::TcpStream { socket, .. } => socket.try_recv(self.data),
+                        InodeSocketKind::Raw(socket) => socket.try_recv(self.data, peek),
+                        InodeSocketKind::TcpStream { socket, .. } => {
+                            socket.try_recv(self.data, peek)
+                        }
                         InodeSocketKind::UdpSocket { socket, peer } => {
                             if let Some(peer) = peer {
-                                match socket.try_recv_from(self.data) {
+                                match socket.try_recv_from(self.data, peek) {
                                     Ok((amt, addr)) if addr == *peer => Ok(amt),
                                     Ok(_) => Err(NetworkError::WouldBlock),
                                     Err(err) => Err(err),
                                 }
                             } else {
-                                match socket.try_recv_from(self.data) {
+                                match socket.try_recv_from(self.data, peek) {
                                     Ok((amt, _)) => Ok(amt),
                                     Err(err) => Err(err),
                                 }
@@ -1291,7 +1336,7 @@ impl InodeSocket {
                             };
                         }
                         InodeSocketKind::PreSocket { .. } => {
-                            return Poll::Ready(Err(Errno::Notconn))
+                            return Poll::Ready(Err(Errno::Notconn));
                         }
                         _ => return Poll::Ready(Err(Errno::Notsup)),
                     };
@@ -1320,6 +1365,7 @@ impl InodeSocket {
             inner: &self.inner,
             data: buf,
             nonblocking,
+            peek,
             handler_registered: false,
         };
         if let Some(timeout) = timeout {
@@ -1338,14 +1384,16 @@ impl InodeSocket {
         buf: &mut [MaybeUninit<u8>],
         timeout: Option<Duration>,
         nonblocking: bool,
+        peek: bool,
     ) -> Result<(usize, SocketAddr), Errno> {
         struct SocketReceiver<'a, 'b> {
             inner: &'a InodeSocketInner,
             data: &'b mut [MaybeUninit<u8>],
             nonblocking: bool,
+            peek: bool,
             handler_registered: bool,
         }
-        impl<'a, 'b> Drop for SocketReceiver<'a, 'b> {
+        impl Drop for SocketReceiver<'_, '_> {
             fn drop(&mut self) {
                 if self.handler_registered {
                     let mut inner = self.inner.protected.write().unwrap();
@@ -1353,18 +1401,19 @@ impl InodeSocket {
                 }
             }
         }
-        impl<'a, 'b> Future for SocketReceiver<'a, 'b> {
+        impl Future for SocketReceiver<'_, '_> {
             type Output = Result<(usize, SocketAddr), Errno>;
             fn poll(
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> Poll<Self::Output> {
+                let peek = self.peek;
                 let mut inner = self.inner.protected.write().unwrap();
                 loop {
                     let res = match &mut inner.kind {
-                        InodeSocketKind::Icmp(socket) => socket.try_recv_from(self.data),
+                        InodeSocketKind::Icmp(socket) => socket.try_recv_from(self.data, peek),
                         InodeSocketKind::UdpSocket { socket, .. } => {
-                            socket.try_recv_from(self.data)
+                            socket.try_recv_from(self.data, peek)
                         }
                         InodeSocketKind::RemoteSocket {
                             is_dead, peer_addr, ..
@@ -1375,7 +1424,7 @@ impl InodeSocket {
                             };
                         }
                         InodeSocketKind::PreSocket { .. } => {
-                            return Poll::Ready(Err(Errno::Notconn))
+                            return Poll::Ready(Err(Errno::Notconn));
                         }
                         _ => return Poll::Ready(Err(Errno::Notsup)),
                     };
@@ -1402,6 +1451,7 @@ impl InodeSocket {
             inner: &self.inner,
             data: buf,
             nonblocking,
+            peek,
             handler_registered: false,
         };
         if let Some(timeout) = timeout {
@@ -1511,19 +1561,6 @@ impl InodeSocketProtected {
     }
 }
 
-#[derive(Default)]
-struct IndefinitePoll {}
-
-impl Future for IndefinitePoll {
-    type Output = ();
-    fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        std::task::Poll::Pending
-    }
-}
-
 // TODO: review allow...
 #[allow(dead_code)]
 pub(crate) fn all_socket_rights() -> Rights {
@@ -1543,4 +1580,172 @@ pub(crate) fn all_socket_rights() -> Rights {
         .union(Rights::SOCK_ADDR_REMOTE)
         .union(Rights::SOCK_RECV_FROM)
         .union(Rights::SOCK_SEND_TO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InodeSocket, InodeSocketKind};
+    use std::{
+        mem::MaybeUninit,
+        net::{Ipv4Addr, Shutdown, SocketAddr},
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use virtual_mio::InterestHandler;
+    use virtual_net::{
+        NetworkError, Result as NetResult, SocketStatus, VirtualConnectedSocket, VirtualIoSource,
+        VirtualSocket, VirtualTcpSocket,
+    };
+
+    #[derive(Debug)]
+    struct MockTcpSocket {
+        read_calls: Arc<AtomicUsize>,
+        write_calls: Arc<AtomicUsize>,
+    }
+
+    impl VirtualIoSource for MockTcpSocket {
+        fn remove_handler(&mut self) {}
+
+        fn poll_read_ready(&mut self, _cx: &mut Context<'_>) -> Poll<NetResult<usize>> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(3))
+        }
+
+        fn poll_write_ready(&mut self, _cx: &mut Context<'_>) -> Poll<NetResult<usize>> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(7))
+        }
+    }
+
+    impl VirtualSocket for MockTcpSocket {
+        fn set_ttl(&mut self, _ttl: u32) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn ttl(&self) -> NetResult<u32> {
+            Ok(64)
+        }
+
+        fn addr_local(&self) -> NetResult<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        }
+
+        fn status(&self) -> NetResult<SocketStatus> {
+            Ok(SocketStatus::Opened)
+        }
+
+        fn set_handler(
+            &mut self,
+            _handler: Box<dyn InterestHandler + Send + Sync>,
+        ) -> NetResult<()> {
+            Ok(())
+        }
+    }
+
+    impl VirtualConnectedSocket for MockTcpSocket {
+        fn set_linger(&mut self, _linger: Option<Duration>) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn linger(&self) -> NetResult<Option<Duration>> {
+            Ok(None)
+        }
+
+        fn try_send(&mut self, _data: &[u8]) -> NetResult<usize> {
+            Err(NetworkError::Unsupported)
+        }
+
+        fn try_flush(&mut self) -> NetResult<()> {
+            Err(NetworkError::Unsupported)
+        }
+
+        fn close(&mut self) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn try_recv(&mut self, _buf: &mut [MaybeUninit<u8>], _peek: bool) -> NetResult<usize> {
+            Err(NetworkError::Unsupported)
+        }
+    }
+
+    impl VirtualTcpSocket for MockTcpSocket {
+        fn set_recv_buf_size(&mut self, _size: usize) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn recv_buf_size(&self) -> NetResult<usize> {
+            Ok(0)
+        }
+
+        fn set_send_buf_size(&mut self, _size: usize) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn send_buf_size(&self) -> NetResult<usize> {
+            Ok(0)
+        }
+
+        fn set_nodelay(&mut self, _reuse: bool) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn nodelay(&self) -> NetResult<bool> {
+            Ok(true)
+        }
+
+        fn set_keepalive(&mut self, _keepalive: bool) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn keepalive(&self) -> NetResult<bool> {
+            Ok(false)
+        }
+
+        fn set_dontroute(&mut self, _keepalive: bool) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn dontroute(&self) -> NetResult<bool> {
+            Ok(false)
+        }
+
+        fn addr_peer(&self) -> NetResult<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)))
+        }
+
+        fn shutdown(&mut self, _how: Shutdown) -> NetResult<()> {
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn inode_socket_poll_write_ready_uses_write_path() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let mut inode = InodeSocket::new(InodeSocketKind::TcpStream {
+            socket: Box::new(MockTcpSocket {
+                read_calls: read_calls.clone(),
+                write_calls: write_calls.clone(),
+            }),
+            write_timeout: None,
+            read_timeout: None,
+        });
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let ready = Pin::new(&mut inode).poll_write_ready(&mut cx);
+
+        assert!(matches!(ready, Poll::Ready(Ok(7))));
+        assert_eq!(read_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(write_calls.load(Ordering::Relaxed), 1);
+    }
 }

@@ -1,6 +1,7 @@
 mod dummy_waker;
 mod owned_mutex_guard;
 pub mod store;
+pub mod thread_local_executor;
 mod thread_parker;
 
 #[cfg(feature = "js")]
@@ -9,23 +10,13 @@ pub(crate) mod web;
 pub use self::{dummy_waker::WasiDummyWaker, thread_parker::WasiParkingLot};
 
 pub(crate) use owned_mutex_guard::{
-    read_owned, write_owned, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, read_owned, write_owned,
 };
-use rand::RngCore;
-use wasmer_types::ModuleHash;
 
 use std::collections::BTreeSet;
 
 use wasmer::Module;
 use wasmer_wasix_types::wasi::Errno;
-
-/// Creates a random xxhash for the module
-pub fn xxhash_random() -> ModuleHash {
-    let mut rand = rand::thread_rng();
-    let mut key = [0u8; 8];
-    rand.fill_bytes(&mut key);
-    ModuleHash::xxhash_from_bytes(key)
-}
 
 /// Check if a provided module is compiled for some version of WASI.
 /// Use [`get_wasi_version`] to find out which version of WASI the module is.

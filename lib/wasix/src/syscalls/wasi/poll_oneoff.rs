@@ -3,10 +3,10 @@ use wasmer_wasix_types::wasi::{Subclockflags, SubscriptionClock, Userdata};
 
 use super::*;
 use crate::{
+    WasiInodes,
     fs::{InodeValFilePollGuard, InodeValFilePollGuardJoin},
     state::PollEventSet,
     syscalls::*,
-    WasiInodes,
 };
 
 /// An event that occurred.
@@ -44,6 +44,7 @@ impl EventResult {
 
 /// ### `poll_oneoff()`
 /// Concurrently poll for a set of events
+///
 /// Inputs:
 /// - `const __wasi_subscription_t *in`
 ///     The events to subscribe to
@@ -51,10 +52,11 @@ impl EventResult {
 ///     The events that have occured
 /// - `u32 nsubscriptions`
 ///     The number of subscriptions and the number of events
+///
 /// Output:
 /// - `u32 nevents`
 ///     The number of events seen
-//#[instrument(level = "trace", skip_all, fields(timeout_ms = field::Empty, fd_guards = field::Empty, seen = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(timeout_ms = field::Empty, fd_guards = field::Empty, seen = field::Empty), ret)]
 pub fn poll_oneoff<M: MemorySize + 'static>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     in_: WasmPtr<Subscription, M>,
@@ -62,7 +64,12 @@ pub fn poll_oneoff<M: MemorySize + 'static>(
     nsubscriptions: M::Offset,
     nevents: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    // An empty subscription list would otherwise block forever in the poll loop.
+    if nsubscriptions == M::ZERO {
+        return Ok(Errno::Inval);
+    }
 
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
@@ -95,7 +102,7 @@ pub fn poll_oneoff<M: MemorySize + 'static>(
             wasi_try_mem!(event_array.index(events_seen as u64).write(event));
             events_seen += 1;
         }
-        let events_seen: M::Offset = wasi_try!(events_seen.try_into().map_err(|_| Errno::Overflow));
+        let events_seen: M::Offset = events_seen.into();
         let out_ptr = nevents.deref(&memory);
         wasi_try_mem!(out_ptr.write(events_seen));
         Errno::Success
@@ -177,7 +184,15 @@ pub(crate) fn poll_fd_guard(
             .map_err(fs_error_into_wasi_err)?,
         _ => {
             let fd_entry = state.fs.get_fd(fd)?;
-            if !fd_entry.rights.contains(Rights::POLL_FD_READWRITE) {
+            let requires_access = match s.type_ {
+                Eventtype::FdRead => Rights::FD_READ,
+                Eventtype::FdWrite => Rights::FD_WRITE,
+                _ => Rights::empty(),
+            };
+
+            if !(fd_entry.inner.rights.contains(Rights::POLL_FD_READWRITE)
+                && fd_entry.inner.rights.contains(requires_access))
+            {
                 return Err(Errno::Access);
             }
             let inode = fd_entry.inode;
@@ -198,16 +213,18 @@ pub(crate) fn poll_fd_guard(
 
 /// ### `poll_oneoff()`
 /// Concurrently poll for a set of events
+///
 /// Inputs:
 /// - `const __wasi_subscription_t *in`
-///     The events to subscribe to
+///   The events to subscribe to
 /// - `__wasi_event_t *out`
-///     The events that have occured
+///   The events that have occured
 /// - `u32 nsubscriptions`
-///     The number of subscriptions and the number of events
+///   The number of subscriptions and the number of events
+///
 /// Output:
 /// - `u32 nevents`
-///     The number of events seen
+///   The number of events seen
 pub(crate) fn poll_oneoff_internal<'a, M: MemorySize, After>(
     mut ctx: FunctionEnvMut<'a, WasiEnv>,
     mut subs: Vec<(Option<WasiFd>, PollEventSet, Subscription)>,
@@ -245,36 +262,12 @@ where
         let fd = match s.type_ {
             Eventtype::FdRead => {
                 let file_descriptor = unsafe { s.data.fd_readwrite.file_descriptor };
-                match file_descriptor {
-                    __WASI_STDIN_FILENO | __WASI_STDOUT_FILENO | __WASI_STDERR_FILENO => (),
-                    fd => {
-                        let fd_entry = match state.fs.get_fd(fd) {
-                            Ok(a) => a,
-                            Err(err) => return Ok(err),
-                        };
-                        if !fd_entry.rights.contains(Rights::POLL_FD_READWRITE) {
-                            return Ok(Errno::Access);
-                        }
-                    }
-                }
                 *fd = Some(file_descriptor);
                 *peb |= (PollEvent::PollIn as PollEventSet);
                 file_descriptor
             }
             Eventtype::FdWrite => {
                 let file_descriptor = unsafe { s.data.fd_readwrite.file_descriptor };
-                match file_descriptor {
-                    __WASI_STDIN_FILENO | __WASI_STDOUT_FILENO | __WASI_STDERR_FILENO => (),
-                    fd => {
-                        let fd_entry = match state.fs.get_fd(fd) {
-                            Ok(a) => a,
-                            Err(err) => return Ok(err),
-                        };
-                        if !fd_entry.rights.contains(Rights::POLL_FD_READWRITE) {
-                            return Ok(Errno::Access);
-                        }
-                    }
-                }
                 *fd = Some(file_descriptor);
                 *peb |= (PollEvent::PollOut as PollEventSet);
                 file_descriptor
@@ -311,8 +304,11 @@ where
                                 1
                             )) as u64;
 
-                            Duration::from_nanos(clock_info.timeout)
-                                - Duration::from_nanos(now as u64)
+                            if clock_info.timeout <= now {
+                                Duration::ZERO
+                            } else {
+                                Duration::from_nanos(clock_info.timeout) - Duration::from_nanos(now)
+                            }
                         } else {
                             // if the timeout is not absolute, just use it as duration
                             Duration::from_nanos(clock_info.timeout)
@@ -326,7 +322,7 @@ where
                     return Ok(Errno::Inval);
                 }
             }
-            Eventtype::Unknown => {
+            _ => {
                 continue;
             }
         };
@@ -353,9 +349,9 @@ where
 
             if fd_guards.len() > 10 {
                 let small_list: Vec<_> = fd_guards.iter().take(10).collect();
-                tracing::Span::current().record("fd_guards", format!("{:?}...", small_list));
+                tracing::Span::current().record("fd_guards", format!("{small_list:?}..."));
             } else {
-                tracing::Span::current().record("fd_guards", format!("{:?}", fd_guards));
+                tracing::Span::current().record("fd_guards", format!("{fd_guards:?}"));
             }
 
             fd_guards
@@ -387,7 +383,7 @@ where
         |ctx: &FunctionEnvMut<'a, WasiEnv>| {
             // The timeout has triggered so lets add that event
             if clock_subs.is_empty() {
-                tracing::warn!("triggered_timeout (without any clock subscriptions)",);
+                tracing::warn!("triggered_timeout (without any clock subscriptions)");
             }
             let mut evts = Vec::new();
             for (clock_info, userdata) in clock_subs {
@@ -399,7 +395,7 @@ where
                 };
                 Span::current().record(
                     "seen",
-                    &format!(
+                    format!(
                         "clock(id={},userdata={})",
                         clock_info.clock_id as u32, evt.userdata
                     ),
@@ -451,9 +447,9 @@ where
                 Ok(evts) => {
                     // If its a timeout then return an event for it
                     if evts.len() == 1 {
-                        Span::current().record("seen", &format!("{:?}", evts.first().unwrap()));
+                        Span::current().record("seen", format!("{:?}", evts.first().unwrap()));
                     } else {
-                        Span::current().record("seen", &format!("trigger_cnt=({})", evts.len()));
+                        Span::current().record("seen", format!("trigger_cnt=({})", evts.len()));
                     }
 
                     // Process the events

@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
+impl<'a> JournalSyscallPlayer<'a, '_> {
     #[allow(clippy::result_large_err)]
     pub(crate) unsafe fn action_close_thread(
         &mut self,
@@ -16,7 +16,7 @@ impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
                 self.differ_memory.clear();
                 self.rewind = None;
             } else {
-                JournalEffector::apply_process_exit(&mut self.ctx, exit_code)
+                unsafe { JournalEffector::apply_process_exit(&mut self.ctx, exit_code) }
                     .map_err(anyhow_err_to_runtime_err)?;
             }
         } else if let Some(differ_ethereal) = differ_ethereal {

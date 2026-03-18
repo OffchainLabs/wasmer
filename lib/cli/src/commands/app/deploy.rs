@@ -1,27 +1,38 @@
-use super::{util::login_user, AsyncCliCommand};
+use super::{AsyncCliCommand, util::login_user};
 use crate::{
-    commands::{app::create::CmdAppCreate, package::publish::PackagePublish, PublishWait},
+    commands::{
+        PublishWait,
+        app::create::{CmdAppCreate, minimal_app_config, write_app_config},
+        package::publish::PackagePublish,
+    },
     config::WasmerEnv,
     opts::ItemFormatOpts,
-    utils::load_package_manifest,
+    utils::{DEFAULT_PACKAGE_MANIFEST_FILE, load_package_manifest},
 };
 use anyhow::Context;
+use bytesize::ByteSize;
 use colored::Colorize;
-use dialoguer::Confirm;
-use is_terminal::IsTerminal;
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
+use dialoguer::{Confirm, theme::ColorfulTheme};
+use indexmap::IndexMap;
+use std::io::IsTerminal as _;
 use std::io::Write;
-use std::{path::PathBuf, str::FromStr, time::Duration};
-use wasmer_api::{
-    types::{DeployApp, DeployAppVersion},
+use std::{path::Path, path::PathBuf, str::FromStr, time::Duration};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description};
+use wasmer_backend_api::{
     WasmerClient,
+    types::{
+        AutoBuildDeployAppLogKind, DeployApp, DeployAppVersion, DeployDeployAppPerishReasonChoices,
+    },
 };
 use wasmer_config::{
     app::AppConfigV1,
     package::{PackageIdent, PackageSource},
 };
+use wasmer_sdk::app::deploy_remote_build::{
+    DeployRemoteEvent, DeployRemoteOpts, deploy_app_remote,
+};
 
-// TODO: apparently edge-util uses a different version of the http crate, which makes the
-// HEADER_APP_VERSION_ID field incompatible with our use here, so it needs to be redeclared.
 static EDGE_HEADER_APP_VERSION_ID: http::HeaderName =
     http::HeaderName::from_static("x-edge-app-version-id");
 
@@ -65,7 +76,7 @@ pub struct CmdAppDeploy {
     #[clap(long)]
     pub no_default: bool,
 
-    /// Do not persist the app version ID in the app.yaml.
+    /// Do not persist the app ID under `app_id` field in app.yaml.
     #[clap(long)]
     pub no_persist_id: bool,
 
@@ -97,6 +108,10 @@ pub struct CmdAppDeploy {
     #[clap(long)]
     pub quiet: bool,
 
+    /// Use Wasmer's remote autobuild pipeline instead of building locally.
+    #[clap(long)]
+    pub build_remote: bool,
+
     // - App creation -
     /// A reference to the template to use when creating an app to deploy.
     ///
@@ -121,6 +136,16 @@ pub struct CmdAppDeploy {
     /// Whether or not to search (and use) a local manifest when creating an app to deploy.
     #[clap(long, conflicts_with = "template", conflicts_with = "package")]
     pub use_local_manifest: bool,
+
+    #[clap(skip)]
+    pub ensure_app_config: bool,
+}
+
+struct RemoteBuildInput {
+    app_config: AppConfigV1,
+    owner: String,
+    original_config: Option<serde_yaml::Value>,
+    config_path: Option<PathBuf>,
 }
 
 impl CmdAppDeploy {
@@ -133,7 +158,7 @@ impl CmdAppDeploy {
         let (manifest_path, manifest) = match load_package_manifest(&manifest_dir_path)? {
             Some(r) => r,
             None => anyhow::bail!(
-                "Could not read or find manifest in path '{}'!",
+                "Could not read or find wasmer.toml manifest in path '{}'!",
                 manifest_dir_path.display()
             ),
         };
@@ -187,7 +212,7 @@ impl CmdAppDeploy {
             anyhow::bail!("No owner specified: use --owner XXX");
         }
 
-        let user = wasmer_api::query::current_user_with_namespaces(client, None).await?;
+        let user = wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
         let owner = crate::utils::prompts::prompt_for_namespace(
             "Who should own this app?",
             None,
@@ -225,6 +250,297 @@ impl CmdAppDeploy {
 
         create_cmd.run_async().await
     }
+
+    fn resolve_app_paths(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let base = if let Some(dir) = &self.dir {
+            dir.clone()
+        } else if let Some(path) = &self.path {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .context("could not determine current directory for deployment")?
+        };
+
+        if base.is_file() {
+            let base_dir = base
+                .parent()
+                .map(PathBuf::from)
+                .context("could not determine parent directory for app config")?;
+            Ok((base, base_dir))
+        } else if base.is_dir() {
+            let config = base.join(AppConfigV1::CANONICAL_FILE_NAME);
+            Ok((config, base))
+        } else {
+            anyhow::bail!("No such file or directory '{}'", base.display());
+        }
+    }
+
+    async fn handle_remote_build(&self, client: &WasmerClient) -> anyhow::Result<()> {
+        let (app_config_path, base_dir_path) = self.resolve_app_paths()?;
+        let wait = if self.no_wait {
+            WaitMode::Deployed
+        } else {
+            WaitMode::Reachable
+        };
+
+        let prep = if app_config_path.is_file() {
+            self.prepare_remote_build_from_file(client, &app_config_path, &base_dir_path)
+                .await?
+        } else {
+            self.prepare_remote_build_without_config(client, &base_dir_path)
+                .await?
+        };
+
+        let RemoteBuildInput {
+            app_config,
+            owner,
+            original_config,
+            config_path,
+        } = prep;
+
+        let opts = DeployAppOpts {
+            app: &app_config,
+            original_config: original_config.clone(),
+            allow_create: true,
+            make_default: !self.no_default,
+            owner: Some(owner.clone()),
+            wait,
+        };
+
+        let app_version = deploy_app_remote(
+            client,
+            DeployRemoteOpts {
+                app: app_config.clone(),
+                owner: Some(owner.clone()),
+            },
+            &base_dir_path,
+            remote_progress_handler(self.quiet),
+        )
+        .await?;
+
+        if let Some(path) = config_path {
+            let mut new_app_config = app_config_from_api(&app_version)?;
+
+            if self.no_persist_id {
+                new_app_config.app_id = None;
+            }
+
+            new_app_config.package = app_config.package.clone();
+
+            if new_app_config != app_config {
+                let new_merged = crate::utils::merge_yaml_values(
+                    &app_config.clone().to_yaml_value()?,
+                    &new_app_config.to_yaml_value()?,
+                );
+                let new_config_raw = serde_yaml::to_string(&new_merged)?;
+                std::fs::write(&path, new_config_raw)
+                    .with_context(|| format!("Could not write file: '{}'", path.display()))?;
+            }
+        }
+
+        wait_app(client, opts.clone(), app_version.clone(), self.quiet).await?;
+
+        if self.fmt.format == Some(crate::utils::render::ItemFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&app_version)?);
+        }
+
+        Ok(())
+    }
+
+    async fn prepare_remote_build_from_file(
+        &self,
+        client: &WasmerClient,
+        app_config_path: &Path,
+        base_dir_path: &Path,
+    ) -> anyhow::Result<RemoteBuildInput> {
+        let config_str = std::fs::read_to_string(app_config_path)
+            .with_context(|| format!("Could not read file '{}'", app_config_path.display()))?;
+
+        let mut app_yaml: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+        let maybe_edge_app = if let Some(app_id) = app_yaml.get("app_id").and_then(|s| s.as_str()) {
+            wasmer_backend_api::query::get_app_by_id(client, app_id.to_owned())
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        let mut owner = self
+            .get_owner(client, &mut app_yaml, maybe_edge_app.as_ref())
+            .await?;
+        let previous_owner = owner.clone();
+        owner = self.ensure_owner_access(client, owner).await?;
+
+        let mapping = app_yaml
+            .as_mapping_mut()
+            .context("app config must be a mapping")?;
+        mapping.insert("owner".into(), owner.clone().into());
+        if owner != previous_owner {
+            mapping.remove("app_id");
+            mapping.remove("name");
+        }
+
+        if mapping.get("name").is_none() && self.app_name.is_some() {
+            mapping.insert(
+                "name".into(),
+                self.app_name.as_ref().unwrap().to_string().into(),
+            );
+        } else if mapping.get("name").is_none() && maybe_edge_app.is_some() {
+            mapping.insert(
+                "name".into(),
+                maybe_edge_app.as_ref().unwrap().name.to_string().into(),
+            );
+        } else if mapping.get("name").is_none() {
+            if !self.non_interactive {
+                let default_name = base_dir_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .map(|s| s.to_owned());
+                let app_name = crate::utils::prompts::prompt_new_app_name(
+                    "Enter the name of the app",
+                    default_name.as_deref(),
+                    &owner,
+                    Some(client),
+                )
+                .await?;
+
+                mapping.insert("name".into(), app_name.into());
+            } else {
+                if !self.quiet {
+                    eprintln!("The app.yaml does not specify any app name.");
+                    eprintln!(
+                        "Please, use the --app_name <app_name> to specify the name of the app."
+                    );
+                }
+
+                anyhow::bail!(
+                    "Cannot proceed with the deployment as the app spec in path {} does not have\n                        a 'name' field.",
+                    app_config_path.display()
+                );
+            }
+        }
+
+        let current_config: AppConfigV1 = serde_yaml::from_value(app_yaml.clone())?;
+        std::fs::write(app_config_path, serde_yaml::to_string(&current_config)?)
+            .with_context(|| format!("Could not write file: '{}'", app_config_path.display()))?;
+
+        let mut app_config = current_config.clone();
+        app_config.owner = Some(owner.clone());
+
+        match &app_config.package {
+            PackageSource::Path(_) => {}
+            other => {
+                anyhow::bail!(
+                    "remote deployments require the app's package to reference a local path (found `{other}`)"
+                );
+            }
+        }
+
+        let original_config = Some(app_config.clone().to_yaml_value()?);
+
+        Ok(RemoteBuildInput {
+            app_config,
+            owner,
+            original_config,
+            config_path: Some(app_config_path.to_path_buf()),
+        })
+    }
+
+    async fn prepare_remote_build_without_config(
+        &self,
+        client: &WasmerClient,
+        base_dir_path: &Path,
+    ) -> anyhow::Result<RemoteBuildInput> {
+        let initial_owner = if let Some(owner) = &self.owner {
+            owner.clone()
+        } else if self.non_interactive {
+            anyhow::bail!("No owner specified: use --owner XXX");
+        } else {
+            let user =
+                wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
+            crate::utils::prompts::prompt_for_namespace(
+                "Who should own this app?",
+                None,
+                Some(&user),
+            )?
+        };
+
+        let owner = self.ensure_owner_access(client, initial_owner).await?;
+
+        let app_name = if let Some(name) = &self.app_name {
+            name.clone()
+        } else if self.non_interactive {
+            anyhow::bail!("Cannot determine app name: use --app_name <app_name>");
+        } else {
+            let default_name = base_dir_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|s| s.to_owned());
+            crate::utils::prompts::prompt_new_app_name(
+                "Enter the name of the app",
+                default_name.as_deref(),
+                &owner,
+                Some(client),
+            )
+            .await?
+        };
+
+        let app_config = AppConfigV1 {
+            name: Some(app_name.clone()),
+            app_id: None,
+            owner: Some(owner.clone()),
+            package: PackageSource::Path(String::from(".")),
+            domains: None,
+            locality: None,
+            env: IndexMap::new(),
+            cli_args: None,
+            capabilities: None,
+            scheduled_tasks: None,
+            volumes: None,
+            health_checks: None,
+            debug: None,
+            scaling: None,
+            redirect: None,
+            jobs: None,
+            extra: IndexMap::new(),
+        };
+
+        let original_config = Some(app_config.clone().to_yaml_value()?);
+
+        Ok(RemoteBuildInput {
+            app_config,
+            owner,
+            original_config,
+            config_path: None,
+        })
+    }
+
+    async fn ensure_owner_access(
+        &self,
+        client: &WasmerClient,
+        owner: String,
+    ) -> anyhow::Result<String> {
+        if wasmer_backend_api::query::viewer_can_deploy_to_namespace(client, &owner).await? {
+            return Ok(owner);
+        }
+
+        eprintln!("It seems you don't have access to {}", owner.bold());
+        if self.non_interactive {
+            anyhow::bail!(
+                "Please, change the owner before deploying or check your current user with `{} whoami`.",
+                std::env::args().next().unwrap_or("wasmer".into())
+            );
+        }
+
+        let user = wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
+        let owner = crate::utils::prompts::prompt_for_namespace(
+            "Who should own this app?",
+            None,
+            Some(&user),
+        )?;
+
+        Ok(owner)
+    }
 }
 
 #[async_trait::async_trait]
@@ -234,26 +550,53 @@ impl AsyncCliCommand for CmdAppDeploy {
     async fn run_async(self) -> Result<Self::Output, anyhow::Error> {
         let client = login_user(&self.env, !self.non_interactive, "deploy an app").await?;
 
-        let base_dir_path = self.dir.clone().unwrap_or_else(|| {
-            self.path
-                .clone()
-                .unwrap_or_else(|| std::env::current_dir().unwrap())
-        });
+        if self.build_remote && self.publish_package {
+            anyhow::bail!("--build-remote cannot be combined with --publish-package");
+        }
 
-        let (app_config_path, base_dir_path) = {
-            if base_dir_path.is_file() {
-                (
-                    base_dir_path.clone(),
-                    base_dir_path.clone().parent().unwrap().to_path_buf(),
-                )
-            } else if base_dir_path.is_dir() {
-                let f = base_dir_path.join(AppConfigV1::CANONICAL_FILE_NAME);
+        if self.build_remote {
+            self.handle_remote_build(&client).await?;
+            return Ok(());
+        }
 
-                (f, base_dir_path.clone())
+        let (app_config_path, base_dir_path) = self.resolve_app_paths()?;
+
+        if !app_config_path.is_file() && self.ensure_app_config {
+            let owner = if let Some(owner) = &self.owner {
+                owner.clone()
+            } else if self.non_interactive {
+                anyhow::bail!("No owner specified: use --owner <owner>");
             } else {
-                anyhow::bail!("No such file or directory '{}'", base_dir_path.display());
-            }
-        };
+                let user =
+                    wasmer_backend_api::query::current_user_with_namespaces(&client, None).await?;
+                crate::utils::prompts::prompt_for_namespace(
+                    "Who should own this app?",
+                    None,
+                    Some(&user),
+                )?
+            };
+
+            let app_name = if let Some(name) = &self.app_name {
+                name.clone()
+            } else if self.non_interactive {
+                anyhow::bail!("No app name specified: use --name <app_name>");
+            } else {
+                let default_name = base_dir_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .map(|s| s.to_owned());
+                crate::utils::prompts::prompt_new_app_name(
+                    "Enter the name of the app",
+                    default_name.as_deref(),
+                    &owner,
+                    Some(&client),
+                )
+                .await?
+            };
+
+            let app_config = minimal_app_config(&owner, &app_name);
+            write_app_config(&app_config, Some(base_dir_path.clone())).await?;
+        }
 
         if !app_config_path.is_file()
             || self.template.is_some()
@@ -264,7 +607,10 @@ impl AsyncCliCommand for CmdAppDeploy {
                 // Create already points back to deploy.
                 return self.create().await;
             } else {
-                anyhow::bail!("No app configuration was found in {}. Create an app before deploying or re-run in interactive mode!", app_config_path.display());
+                anyhow::bail!(
+                    "No app configuration was found in {}. Create an app before deploying or re-run in interactive mode!",
+                    app_config_path.display()
+                );
             }
         }
 
@@ -276,7 +622,7 @@ impl AsyncCliCommand for CmdAppDeploy {
         // We want to allow the user to specify the app name interactively.
         let mut app_yaml: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
         let maybe_edge_app = if let Some(app_id) = app_yaml.get("app_id").and_then(|s| s.as_str()) {
-            wasmer_api::query::get_app_by_id(&client, app_id.to_owned())
+            wasmer_backend_api::query::get_app_by_id(&client, app_id.to_owned())
                 .await
                 .ok()
         } else {
@@ -287,12 +633,16 @@ impl AsyncCliCommand for CmdAppDeploy {
             .get_owner(&client, &mut app_yaml, maybe_edge_app.as_ref())
             .await?;
 
-        if !wasmer_api::query::viewer_can_deploy_to_namespace(&client, &owner).await? {
+        if !wasmer_backend_api::query::viewer_can_deploy_to_namespace(&client, &owner).await? {
             eprintln!("It seems you don't have access to {}", owner.bold());
             if self.non_interactive {
-                anyhow::bail!("Please, change the owner before deploying or check your current user with `{} whoami`.", std::env::args().next().unwrap_or("wasmer".into()));
+                anyhow::bail!(
+                    "Please, change the owner before deploying or check your current user with `{} whoami`.",
+                    std::env::args().next().unwrap_or("wasmer".into())
+                );
             } else {
-                let user = wasmer_api::query::current_user_with_namespaces(&client, None).await?;
+                let user =
+                    wasmer_backend_api::query::current_user_with_namespaces(&client, None).await?;
                 owner = crate::utils::prompts::prompt_for_namespace(
                     "Who should own this app?",
                     None,
@@ -381,8 +731,45 @@ impl AsyncCliCommand for CmdAppDeploy {
         };
 
         let mut app_cfg_new = app_config.clone();
+
+        // If the directory has an app.yaml, but no wasmer.toml manifest,
+        // ask the user to deploy with a remote build instead.
+        if !self.build_remote {
+            let is_local_pkg = app_cfg_new.package.to_string() == ".";
+            let manifest_path = base_dir_path.join(DEFAULT_PACKAGE_MANIFEST_FILE);
+            let manifest_exists = manifest_path.is_file();
+
+            if is_local_pkg && !manifest_exists {
+                if self.non_interactive {
+                    anyhow::bail!(
+                        "The app.yaml references a local package, but no wasmer.toml manifest was found in {} - use --build-remote to deploy with a remote build.",
+                        base_dir_path.display()
+                    );
+                }
+
+                let theme = ColorfulTheme::default();
+                let should_use_remote = Confirm::with_theme(&theme)
+                    .with_prompt(format!(
+                        "No wasmer.toml manifest found in {}. Deploy with a remote build instead?",
+                        base_dir_path.display()
+                    ))
+                    .default(true)
+                    .interact()?;
+
+                if should_use_remote {
+                    self.handle_remote_build(&client).await?;
+                    return Ok(());
+                } else {
+                    anyhow::bail!(
+                        "The app.yaml references a local package, but no wasmer.toml manifest was found in {}",
+                        base_dir_path.display()
+                    );
+                }
+            }
+        }
+
         let opts = match &app_cfg_new.package {
-            PackageSource::Path(ref path) => {
+            PackageSource::Path(path) => {
                 let path = PathBuf::from(path);
 
                 let path = if path.is_absolute() {
@@ -424,14 +811,18 @@ impl AsyncCliCommand for CmdAppDeploy {
                                         "Found local package (manifest path: {}).",
                                         manifest_path.display()
                                     );
-                                    eprintln!("The `package` field in `app.yaml` specified the same named package ({}).", name);
+                                    eprintln!(
+                                        "The `package` field in `app.yaml` specified the same named package ({name})."
+                                    );
                                     eprintln!("This behaviour is deprecated.");
                                 }
 
                                 let theme = dialoguer::theme::ColorfulTheme::default();
                                 if self.non_interactive {
                                     if !self.quiet {
-                                        eprintln!("Hint: replace `package: {}` with `package: .` to replicate the intended behaviour.", n);
+                                        eprintln!(
+                                            "Hint: replace `package: {n}` with `package: .` to replicate the intended behaviour."
+                                        );
                                     }
                                     anyhow::bail!("deprecated deploy behaviour")
                                 } else if Confirm::with_theme(&theme)
@@ -474,8 +865,9 @@ impl AsyncCliCommand for CmdAppDeploy {
                                 } else {
                                     if !self.quiet {
                                         eprintln!(
-                                        "{}: the package will not be published and the deployment will fail if the package does not already exist.",
-                                        "Warning".yellow().bold());
+                                            "{}: the package will not be published and the deployment will fail if the package does not already exist.",
+                                            "Warning".yellow().bold()
+                                        );
                                     }
                                     DeployAppOpts {
                                         app: &app_config,
@@ -521,7 +913,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                         }
                     }
                 } else {
-                    log::info!("Using package {}", app_config.package.to_string());
+                    log::info!("Using package {}", app_config.package);
                     DeployAppOpts {
                         app: &app_config,
                         original_config: Some(app_config.clone().to_yaml_value().unwrap()),
@@ -533,7 +925,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                 }
             }
             _ => {
-                log::info!("Using package {}", app_config.package.to_string());
+                log::info!("Using package {}", app_config.package);
                 DeployAppOpts {
                     app: &app_config,
                     original_config: Some(app_config.clone().to_yaml_value().unwrap()),
@@ -549,13 +941,24 @@ impl AsyncCliCommand for CmdAppDeploy {
         let app = &opts.app;
 
         let pretty_name = if let Some(owner) = &owner {
-            format!("{} ({})", app.name.bold(), owner.bold())
+            format!(
+                "{} ({})",
+                app.name
+                    .as_ref()
+                    .context("App name has to be specified")?
+                    .bold(),
+                owner.bold()
+            )
         } else {
-            app.name.bold().to_string()
+            app.name
+                .as_ref()
+                .context("App name has to be specified")?
+                .bold()
+                .to_string()
         };
 
         if !self.quiet {
-            eprintln!("\nDeploying app {} to Wasmer Edge...\n", pretty_name);
+            eprintln!("\nDeploying app {pretty_name} to Wasmer Edge...\n");
         }
 
         let app_version = deploy_app(&client, opts.clone()).await?;
@@ -587,7 +990,7 @@ impl AsyncCliCommand for CmdAppDeploy {
 
         wait_app(&client, opts.clone(), app_version.clone(), self.quiet).await?;
 
-        if self.fmt.format == crate::utils::render::ItemFormat::Json {
+        if self.fmt.format == Some(crate::utils::render::ItemFormat::Json) {
             println!("{}", serde_json::to_string_pretty(&app_version)?);
         }
 
@@ -602,10 +1005,76 @@ pub struct DeployAppOpts<'a> {
     // Present here to enable forwarding unknown fields to the backend, which
     // preserves forwards-compatibility for schema changes.
     pub original_config: Option<serde_yaml::value::Value>,
+    #[allow(dead_code)]
     pub allow_create: bool,
     pub make_default: bool,
     pub owner: Option<String>,
     pub wait: WaitMode,
+}
+
+fn remote_progress_handler(quiet: bool) -> impl FnMut(DeployRemoteEvent) {
+    move |event| {
+        if quiet {
+            return;
+        }
+
+        match event {
+            DeployRemoteEvent::CreatingArchive { path } => {
+                eprintln!("Creating deployment archive from {}...", path.display());
+            }
+            DeployRemoteEvent::ArchiveCreated {
+                file_count,
+                archive_size,
+            } => {
+                eprintln!(
+                    "Packaging project directory ({} files, {})",
+                    file_count,
+                    ByteSize(archive_size)
+                );
+            }
+            DeployRemoteEvent::GeneratingUploadUrl => {
+                eprintln!("Requesting upload target...");
+            }
+            DeployRemoteEvent::UploadArchiveStart { archive_size } => {
+                eprintln!(
+                    "Uploading archive ({} bytes) to Wasmer...",
+                    ByteSize(archive_size)
+                );
+            }
+            DeployRemoteEvent::DeterminingBuildConfiguration => {
+                eprintln!("Determining build configuration...");
+            }
+            DeployRemoteEvent::BuildConfigDetermined { config } => {
+                eprintln!(
+                    "Build configuration determined (preset: {})",
+                    config.preset_name
+                );
+            }
+            DeployRemoteEvent::InitiatingBuild { .. } => {
+                eprintln!("Requesting remote build...");
+            }
+            DeployRemoteEvent::StreamingAutobuildLogs { build_id } => {
+                eprintln!("Streaming build logs (build id: {build_id})");
+            }
+            DeployRemoteEvent::AutobuildLog { log } => {
+                let kind = log.kind;
+                let datetime = format_autobuild_datetime(&log.datetime);
+                let message = log.message;
+
+                if let Some(msg) = message {
+                    eprintln!("{}  {}", datetime.dimmed(), msg);
+                } else if matches!(kind, AutoBuildDeployAppLogKind::Complete) {
+                    eprintln!("Streaming build logs complete");
+                }
+            }
+            DeployRemoteEvent::Finished => {
+                eprintln!("Remote build finished successfully.\n");
+            }
+            _ => {
+                eprintln!("Unknown event: {event:?}");
+            }
+        }
+    }
 }
 
 pub async fn deploy_app(
@@ -625,11 +1094,11 @@ pub async fn deploy_app(
 
     // TODO: respect allow_create flag
 
-    let version = wasmer_api::query::publish_deploy_app(
+    let version = wasmer_backend_api::query::publish_deploy_app(
         client,
-        wasmer_api::types::PublishDeployAppVars {
+        wasmer_backend_api::types::PublishDeployAppVars {
             config: raw_config,
-            name: app.name.clone().into(),
+            name: app.name.clone().context("Expected an app name")?.into(),
             owner: opts.owner.map(|o| o.into()),
             make_default: Some(opts.make_default),
         },
@@ -666,20 +1135,28 @@ pub async fn wait_app(
         .inner()
         .to_string();
 
-    let app = wasmer_api::query::get_app_by_id(client, app_id.clone())
+    let app = wasmer_backend_api::query::get_app_by_id(client, app_id.clone())
         .await
         .context("could not fetch app from backend")?;
 
     if !quiet {
         eprintln!(
-            "App {} ({}) was successfully deployed 🚀",
-            app.name.bold(),
-            app.owner.global_name.bold()
+            "{}",
+            format!(
+                "{} App {} ({}) deployed successfully.",
+                "✔".green(),
+                app.name,
+                app.owner.global_name,
+            )
+            .bold()
         );
-        eprintln!("{}", app.url.blue().bold().underline());
         eprintln!();
-        eprintln!("→ Unique URL: {}", version.url);
-        eprintln!("→ Dashboard:  {}", app.admin_url);
+        eprintln!("Live:    {}", app.url.blue().bold().underline());
+        eprintln!("Manage:  {}", app.admin_url);
+
+        if let Some(banner) = build_perish_banner(&app) {
+            eprintln!("\n{}", banner.yellow().bold());
+        }
     }
 
     match wait {
@@ -763,7 +1240,7 @@ pub async fn wait_app(
 
                         tracing::debug!(
                             current=%header,
-                            expected=%app.active_version.id.inner(),
+                            expected=%version.id.inner(),
                             "app is not at the right version yet",
                         );
                     }
@@ -789,6 +1266,83 @@ pub async fn wait_app(
     Ok((app, version))
 }
 
+fn build_perish_banner(app: &DeployApp) -> Option<String> {
+    let perish_reason = app.perish_reason?;
+    let will_perish_at = app.will_perish_at.as_ref()?;
+    let time_left = format_time_left(will_perish_at)?;
+    let mut banner = format!("⚠️ Your site will be live for {time_left}.");
+
+    if let Some(link) = perish_reason_link(perish_reason, app.id.inner()) {
+        banner.push('\n');
+        banner.push_str(&link);
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.add_row(vec![banner]);
+
+    Some(table.to_string())
+}
+
+fn format_time_left(will_perish_at: &wasmer_backend_api::types::DateTime) -> Option<String> {
+    let will_perish_at = OffsetDateTime::try_from(will_perish_at.clone()).ok()?;
+    let now = OffsetDateTime::now_utc();
+    let remaining = will_perish_at - now;
+    let remaining = if remaining.is_negative() {
+        TimeDuration::ZERO
+    } else {
+        remaining
+    };
+
+    Some(format_duration_words(remaining))
+}
+
+fn format_autobuild_datetime(datetime: &wasmer_backend_api::types::DateTime) -> String {
+    let format = format_description::parse(
+        "[month repr:short] [day padding:none] [hour]:[minute]:[second].[subsecond digits:3]",
+    );
+    let Ok(format) = format else {
+        return datetime.0.clone();
+    };
+
+    OffsetDateTime::try_from(datetime.clone())
+        .ok()
+        .and_then(|value| value.format(&format).ok())
+        .unwrap_or_else(|| datetime.0.clone())
+}
+
+fn format_duration_words(duration: TimeDuration) -> String {
+    if duration >= TimeDuration::DAY {
+        let days = duration.whole_days();
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if duration >= TimeDuration::HOUR {
+        let hours = duration.whole_hours();
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else if duration >= TimeDuration::MINUTE {
+        let minutes = duration.whole_minutes();
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        let seconds = duration.whole_seconds();
+        format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+    }
+}
+
+fn perish_reason_link(
+    perish_reason: DeployDeployAppPerishReasonChoices,
+    app_id: &str,
+) -> Option<String> {
+    match perish_reason {
+        DeployDeployAppPerishReasonChoices::AppUnclaimed => Some(format!(
+            "Claim it to keep it online: https://wasmer.io/apps/claim/{app_id}"
+        )),
+        DeployDeployAppPerishReasonChoices::UserPendingVerification => {
+            Some("Verify now to keep it online: https://wasmer.io/verify".to_string())
+        }
+        DeployDeployAppPerishReasonChoices::UserRequested => None,
+    }
+}
+
 pub fn app_config_from_api(version: &DeployAppVersion) -> Result<AppConfigV1, anyhow::Error> {
     let app_id = version
         .app
@@ -804,4 +1358,45 @@ pub fn app_config_from_api(version: &DeployAppVersion) -> Result<AppConfigV1, an
 
     cfg.app_id = Some(app_id);
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_duration_words;
+    use time::Duration as TimeDuration;
+
+    #[test]
+    fn format_duration_words_seconds() {
+        assert_eq!(format_duration_words(TimeDuration::ZERO), "0 seconds");
+        assert_eq!(format_duration_words(TimeDuration::seconds(1)), "1 second");
+        assert_eq!(
+            format_duration_words(TimeDuration::seconds(59)),
+            "59 seconds"
+        );
+    }
+
+    #[test]
+    fn format_duration_words_minutes() {
+        assert_eq!(format_duration_words(TimeDuration::seconds(60)), "1 minute");
+        assert_eq!(format_duration_words(TimeDuration::seconds(61)), "1 minute");
+        assert_eq!(format_duration_words(TimeDuration::minutes(2)), "2 minutes");
+    }
+
+    #[test]
+    fn format_duration_words_hours() {
+        assert_eq!(format_duration_words(TimeDuration::minutes(60)), "1 hour");
+        assert_eq!(format_duration_words(TimeDuration::minutes(119)), "1 hour");
+        assert_eq!(format_duration_words(TimeDuration::hours(5)), "5 hours");
+    }
+
+    #[test]
+    fn format_duration_words_days() {
+        assert_eq!(format_duration_words(TimeDuration::hours(24)), "1 day");
+        assert_eq!(format_duration_words(TimeDuration::hours(47)), "1 day");
+        assert_eq!(format_duration_words(TimeDuration::days(3)), "3 days");
+        assert_eq!(
+            format_duration_words(TimeDuration::days(4) - TimeDuration::SECOND),
+            "3 days"
+        );
+    }
 }

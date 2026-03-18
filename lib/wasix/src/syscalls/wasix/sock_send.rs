@@ -25,33 +25,30 @@ pub fn sock_send<M: MemorySize>(
     si_flags: SiFlags,
     ret_data_len: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
     let fd_entry = wasi_try_ok!(env.state.fs.get_fd(fd));
+    let enable_journal = env.enable_journal;
     let guard = fd_entry.inode.read();
-    let use_write = matches!(guard.deref(), Kind::Pipe { .. });
+    // We need this hack because we use a pipe to back socket pairs
+    let use_write = matches!(guard.deref(), Kind::DuplexPipe { .. });
     drop(guard);
 
     let bytes_written = if use_write {
-        let offset = {
-            let state = env.state.clone();
-            let inodes = state.inodes.clone();
-
-            let fd_entry = wasi_try_ok!(state.fs.get_fd(fd));
-            fd_entry.offset.load(Ordering::Acquire) as usize
-        };
+        let offset = { fd_entry.inner.offset.load(Ordering::Acquire) as usize };
 
         wasi_try_ok!(fd_write_internal::<M>(
-            &ctx,
+            &mut ctx,
             fd,
+            fd_entry,
             FdWriteSource::Iovs {
                 iovs: si_data,
                 iovs_len: si_data_len
             },
             offset as u64,
             true,
-            env.enable_journal,
+            enable_journal
         )?)
     } else {
         wasi_try_ok!(sock_send_internal::<M>(
@@ -70,7 +67,7 @@ pub fn sock_send<M: MemorySize>(
         JournalEffector::save_sock_send(&ctx, fd, bytes_written, si_data, si_data_len, si_flags)
             .map_err(|err| {
                 tracing::error!("failed to save sock_send event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             })?;
     }
 
@@ -95,12 +92,14 @@ pub(crate) fn sock_send_internal<M: MemorySize>(
     let memory = unsafe { env.memory_view(&ctx) };
     let runtime = env.runtime.clone();
 
+    let nonblocking_flag = (si_flags & __WASI_SOCK_SEND_INPUT_DONT_WAIT) != 0;
+
     let bytes_written = wasi_try_ok_ok!(__sock_asyncify(
         env,
         sock,
         Rights::SOCK_SEND,
         |socket, fd| async move {
-            let nonblocking = fd.flags.contains(Fdflags::NONBLOCK);
+            let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
             let timeout = socket
                 .opt_time(TimeType::WriteTimeout)
                 .ok()

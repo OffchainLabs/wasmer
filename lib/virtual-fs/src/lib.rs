@@ -1,10 +1,11 @@
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(test)]
 #[macro_use]
 extern crate pretty_assertions;
 
 use futures::future::BoxFuture;
+use shared_buffer::OwnedBuffer;
 use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;
@@ -82,7 +83,7 @@ pub use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub trait ClonableVirtualFile: VirtualFile + Clone {}
 
-pub use ops::{copy_reference, copy_reference_ext, create_dir_all};
+pub use ops::{copy_reference, copy_reference_ext, create_dir_all, walk};
 
 pub trait FileSystem: fmt::Debug + Send + Sync + 'static + Upcastable {
     fn readlink(&self, path: &Path) -> Result<PathBuf>;
@@ -97,10 +98,10 @@ pub trait FileSystem: fmt::Debug + Send + Sync + 'static + Upcastable {
     fn symlink_metadata(&self, path: &Path) -> Result<Metadata>;
     fn remove_file(&self, path: &Path) -> Result<()>;
 
-    fn new_open_options(&self) -> OpenOptions;
+    fn new_open_options(&self) -> OpenOptions<'_>;
 
     fn mount(&self, name: String, path: &Path, fs: Box<dyn FileSystem + Send + Sync>)
-        -> Result<()>;
+    -> Result<()>;
 }
 
 impl dyn FileSystem + 'static {
@@ -152,7 +153,7 @@ where
         (**self).remove_file(path)
     }
 
-    fn new_open_options(&self) -> OpenOptions {
+    fn new_open_options(&self) -> OpenOptions<'_> {
         (**self).new_open_options()
     }
 
@@ -236,7 +237,7 @@ impl OpenOptionsConfig {
     }
 }
 
-impl<'a> fmt::Debug for OpenOptions<'a> {
+impl fmt::Debug for OpenOptions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.conf.fmt(f)
     }
@@ -393,9 +394,32 @@ pub trait VirtualFile:
     ) -> BoxFuture<'_, std::io::Result<()>> {
         Box::pin(async move {
             let bytes_written = tokio::io::copy(&mut src, self).await?;
-            tracing::trace!(bytes_written, "Copying file into host filesystem",);
+            tracing::trace!(bytes_written, "Copying file into host filesystem");
             Ok(())
         })
+    }
+
+    /// This method will copy a file from a source to this destination where
+    /// the default is to do a straight byte copy however file system implementors
+    /// may optimize this to cheaply clone and store the OwnedBuffer directly
+    fn copy_from_owned_buffer(&mut self, src: &OwnedBuffer) -> BoxFuture<'_, std::io::Result<()>> {
+        let src = src.clone();
+        Box::pin(async move {
+            let mut bytes = src.as_slice();
+            let bytes_written = tokio::io::copy(&mut bytes, self).await?;
+            tracing::trace!(bytes_written, "Copying file into host filesystem");
+            Ok(())
+        })
+    }
+
+    /// Get the full contents of this file as an [`OwnedBuffer`].
+    ///
+    /// **NOTE**: Only implement this if the file is already available in-memory
+    /// and can be cloned cheaply!
+    ///
+    /// Allows consumers to do zero-copy cloning of the underlying data.
+    fn as_owned_buffer(&self) -> Option<OwnedBuffer> {
+        None
     }
 
     /// Polls the file for when there is data to be read

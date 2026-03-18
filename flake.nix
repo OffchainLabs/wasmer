@@ -2,18 +2,24 @@
   description = "Wasmer Webassembly runtime";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.11";
-    flakeutils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    flakeutils = {
+      url = "github:numtide/flake-utils";
+    };
   };
 
-  outputs = { self, nixpkgs, flakeutils }:
+  outputs = { self, nixpkgs, flakeutils, rust-overlay }:
     flakeutils.lib.eachDefaultSystem (system:
       let
         NAME = "wasmer";
 
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [ (import rust-overlay) ];
         };
+
+        rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in
       rec {
         packages.${NAME} = import ./scripts/nix/pkg.nix pkgs;
@@ -35,12 +41,22 @@
             openssl
 
             # LLVM and related dependencies
-            llvmPackages_15.libllvm
-            llvmPackages_15.llvm
+            llvmPackages_21.libllvm
+            llvmPackages_21.llvm
+            llvmPackages_21.llvm.dev
+            llvmPackages_21.libclang.dev
             libxml2
             libffi
+            cmake
+            ninja
+            webkitgtk_4_1
+
 
             # Rust tooling
+            (rust-toolchain.override {
+              targets = [ "wasm32-unknown-unknown" ];
+              extensions = [ "clippy" "rustfmt" "rust-analyzer" "rust-src" ];
+            })
 
             # Snapshot testing
             # https://github.com/mitsuhiko/insta
@@ -67,11 +83,33 @@
             wasm-tools
           ];
 
-          env.LLVM_SYS_150_PREFIX = pkgs.llvmPackages_15.llvm.dev;
-          env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-            pkgs.stdenv.cc.cc
-            pkgs.openssl.out
-          ];
+          shellHook = ''
+            export LLVM_SYS_211_PREFIX="${pkgs.llvmPackages_21.llvm.dev}"
+            export LIBCLANG_PATH="${pkgs.llvmPackages_21.libclang.lib}/lib"
+            export PKG_CONFIG_PATH="${pkgs.webkitgtk_4_1.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+            export LIBRARY_PATH="${pkgs.llvmPackages_21.compiler-rt-libc}/lib/linux:$LIBRARY_PATH"
+            export LD_LIBRARY_PATH="${pkgs.llvmPackages_21.compiler-rt-libc}/lib/linux:$LD_LIBRARY_PATH"
+            if [ -z "$V8_INCLUDE_DIR" ] || [ -z "$V8_LIB_DIR" ]; then
+              for candidate in /nix/store/*-ubi-v8-prebuilt-11.9.2; do
+                if [ -d "$candidate/include" ] && [ -d "$candidate/lib" ]; then
+                  export V8_INCLUDE_DIR="$candidate/include"
+                  export V8_LIB_DIR="$candidate/lib"
+                  break
+                fi
+              done
+            fi
+            export BINDGEN_EXTRA_CLANG_ARGS="$(
+                  < ${pkgs.llvmPackages_21.stdenv.cc}/nix-support/libc-crt1-cflags
+                ) $(
+                  < ${pkgs.llvmPackages_21.stdenv.cc}/nix-support/libc-cflags
+                ) $(
+                  < ${pkgs.llvmPackages_21.stdenv.cc}/nix-support/cc-cflags
+                ) $(
+                  < ${pkgs.llvmPackages_21.stdenv.cc}/nix-support/libcxx-cxxflags
+                ) \
+                -isystem ${pkgs.glibc.dev}/include \
+                -idirafter ${pkgs.llvmPackages_21.clang}/lib/clang/${pkgs.lib.getVersion pkgs.llvmPackages_21.clang}/include"
+            '';
         };
       }
     );

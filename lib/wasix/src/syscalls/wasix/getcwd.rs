@@ -5,7 +5,7 @@ use crate::syscalls::*;
 /// Returns the current working directory
 /// If the path exceeds the size of the buffer then this function
 /// will return ERANGE
-#[instrument(level = "debug", skip_all, fields(path = field::Empty, max_path_len = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(path = field::Empty, max_path_len = field::Empty), ret)]
 pub fn getcwd<M: MemorySize>(
     ctx: FunctionEnvMut<'_, WasiEnv>,
     path: WasmPtr<u8, M>,
@@ -14,7 +14,7 @@ pub fn getcwd<M: MemorySize>(
     let env = ctx.data();
     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let (_, cur_dir) = wasi_try!(state.fs.get_current_dir(inodes, crate::VIRTUAL_ROOT_FD,));
+    let (_, cur_dir) = wasi_try!(state.fs.get_current_dir(inodes, crate::VIRTUAL_ROOT_FD));
     Span::current().record("path", cur_dir.as_str());
 
     let max_path_len = wasi_try_mem!(path_len.read(&memory));

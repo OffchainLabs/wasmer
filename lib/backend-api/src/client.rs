@@ -2,13 +2,18 @@
 use std::time::Duration;
 
 use crate::GraphQLApiFailure;
-use anyhow::{bail, Context as _};
-use cynic::{http::CynicReqwestError, GraphQlResponse, Operation};
+use anyhow::{Context as _, bail};
+use cynic::{GraphQlResponse, Operation, http::CynicReqwestError};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use reqwest::Proxy;
 use url::Url;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub struct Proxy;
 
 /// API client for the Wasmer API.
 ///
-/// Use the queries in [`crate::queries`] to interact with the API.
+/// Use the queries in [`crate::query`] to interact with the API.
 #[derive(Clone, Debug)]
 pub struct WasmerClient {
     auth_token: Option<String>,
@@ -41,7 +46,7 @@ impl WasmerClient {
         }
         user_agent
             .parse()
-            .with_context(|| format!("invalid user agent: '{}'", user_agent))
+            .with_context(|| format!("invalid user agent: '{user_agent}'"))
     }
 
     pub fn new_with_client(
@@ -58,9 +63,8 @@ impl WasmerClient {
                 "" => false,
                 other => {
                     bail!(
-                        "invalid value for {} - expected 0/false|1/true: '{}'",
-                        Self::ENV_VAR_LOG_VARIABLES,
-                        other
+                        "invalid value for {} - expected 0/false|1/true: '{other}'",
+                        Self::ENV_VAR_LOG_VARIABLES
                     );
                 }
             }
@@ -75,40 +79,36 @@ impl WasmerClient {
         })
     }
 
+    pub fn new(graphql_endpoint: Url, user_agent: &str) -> Result<Self, anyhow::Error> {
+        Self::new_with_proxy(graphql_endpoint, user_agent, None)
+    }
+
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(unused))]
     pub fn new_with_proxy(
         graphql_endpoint: Url,
         user_agent: &str,
-        proxy: reqwest::Proxy,
+        proxy: Option<Proxy>,
     ) -> Result<Self, anyhow::Error> {
         let builder = {
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            let mut builder = reqwest::ClientBuilder::new();
+            let builder = reqwest::ClientBuilder::new();
 
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             let builder = reqwest::ClientBuilder::new()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(90));
 
-            builder.proxy(proxy)
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            if let Some(proxy) = proxy {
+                builder.proxy(proxy)
+            } else {
+                builder
+            }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            builder
         };
 
         let client = builder.build().context("failed to create reqwest client")?;
-
-        Self::new_with_client(client, graphql_endpoint, user_agent)
-    }
-
-    pub fn new(graphql_endpoint: Url, user_agent: &str) -> Result<Self, anyhow::Error> {
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let client = reqwest::Client::builder()
-            .build()
-            .context("could not construct http client")?;
-
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(90))
-            .build()
-            .context("could not construct http client")?;
 
         Self::new_with_client(client, graphql_endpoint, user_agent)
     }
@@ -200,16 +200,16 @@ impl WasmerClient {
             }
         };
 
-        if let Some(errors) = &res.errors {
-            if !errors.is_empty() {
-                tracing::warn!(
-                    ?errors,
-                    data=?res.data,
-                    %query,
-                    endpoint=%self.graphql_endpoint,
-                    "GraphQL query succeeded, but returned errors",
-                );
-            }
+        if let Some(errors) = &res.errors
+            && !errors.is_empty()
+        {
+            tracing::warn!(
+                ?errors,
+                data=?res.data,
+                %query,
+                endpoint=%self.graphql_endpoint,
+                "GraphQL query succeeded, but returned errors",
+            );
         }
 
         Ok(res)
@@ -247,11 +247,11 @@ impl WasmerClient {
     {
         let res = self.run_graphql_raw(operation).await?;
 
-        if let Some(errs) = res.errors {
-            if !errs.is_empty() {
-                let errs = GraphQLApiFailure { errors: errs };
-                return Err(errs).context("GraphQL query failed");
-            }
+        if let Some(errs) = res.errors
+            && !errs.is_empty()
+        {
+            let errs = GraphQLApiFailure { errors: errs };
+            return Err(errs).context("GraphQL query failed");
         }
 
         if let Some(data) = res.data {

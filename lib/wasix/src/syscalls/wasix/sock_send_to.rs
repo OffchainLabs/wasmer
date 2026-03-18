@@ -27,6 +27,8 @@ pub fn sock_send_to<M: MemorySize>(
     addr: WasmPtr<__wasi_addr_port_t, M>,
     ret_data_len: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let iovs_arr = wasi_try_mem_ok!(si_data.slice(&memory, si_data_len));
@@ -36,10 +38,10 @@ pub fn sock_send_to<M: MemorySize>(
         wasi_try_ok!(read_ip_port(&memory, addr))
     };
     let addr = SocketAddr::new(addr_ip, addr_port);
-    Span::current().record("addr", &format!("{:?}", addr));
+    Span::current().record("addr", format!("{addr:?}"));
 
     let bytes_written = wasi_try_ok!(sock_send_to_internal(
-        &ctx,
+        &mut ctx,
         sock,
         FdWriteSource::Iovs {
             iovs: si_data,
@@ -62,7 +64,7 @@ pub fn sock_send_to<M: MemorySize>(
         )
         .map_err(|err| {
             tracing::error!("failed to save sock_send_to event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -78,14 +80,28 @@ pub fn sock_send_to<M: MemorySize>(
 }
 
 pub(crate) fn sock_send_to_internal<M: MemorySize>(
-    ctx: &FunctionEnvMut<'_, WasiEnv>,
+    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     si_data: FdWriteSource<'_, M>,
-    _si_flags: SiFlags,
+    si_flags: SiFlags,
     addr: SocketAddr,
 ) -> Result<Result<usize, Errno>, WasiError> {
     let env = ctx.data();
+    let net = env.net().clone();
+    let tasks = ctx.data().tasks().clone();
+
+    // Auto-bind UDP
+    wasi_try_ok_ok!(__sock_upgrade(
+        ctx,
+        sock,
+        Rights::SOCK_SEND_TO,
+        move |mut socket, flags| async move { socket.auto_bind_udp(tasks.deref(), net.deref()).await }
+    ));
+
+    let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+
+    let nonblocking_flag = (si_flags & __WASI_SOCK_SEND_INPUT_DONT_WAIT) != 0;
 
     let bytes_written = {
         wasi_try_ok_ok!(__sock_asyncify(
@@ -93,7 +109,7 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
             sock,
             Rights::SOCK_SEND_TO,
             |socket, fd| async move {
-                let nonblocking = fd.flags.contains(Fdflags::NONBLOCK);
+                let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
                 let timeout = socket
                     .opt_time(TimeType::WriteTimeout)
                     .ok()

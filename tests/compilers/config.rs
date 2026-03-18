@@ -1,6 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use wasmer::sys::Features;
-use wasmer::{CompilerConfig, ModuleMiddleware, Store};
+use wasmer::{
+    Store,
+    sys::{CompilerConfig, ModuleMiddleware},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Compiler {
@@ -66,12 +70,25 @@ impl Config {
         &self,
         #[allow(unused_variables)] canonicalize_nans: bool,
     ) -> Box<dyn CompilerConfig> {
+        let debug_dir = std::env::var("WASMER_COMPILER_DEBUG_DIR")
+            .ok()
+            .map(PathBuf::from);
+
         match &self.compiler {
             #[cfg(feature = "cranelift")]
             Compiler::Cranelift => {
+                use wasmer_compiler_cranelift::CraneliftCallbacks;
+
                 let mut compiler = wasmer_compiler_cranelift::Cranelift::new();
                 compiler.canonicalize_nans(canonicalize_nans);
                 compiler.enable_verifier();
+                if let Some(mut debug_dir) = debug_dir {
+                    debug_dir.push("cranelift");
+                    compiler.callbacks(Some(
+                        CraneliftCallbacks::new(debug_dir)
+                            .expect("cannot crate debug directory: {debug_dir}"),
+                    ));
+                }
                 self.add_middlewares(&mut compiler);
                 Box::new(compiler)
             }
@@ -80,6 +97,14 @@ impl Config {
                 let mut compiler = wasmer_compiler_llvm::LLVM::new();
                 compiler.canonicalize_nans(canonicalize_nans);
                 compiler.enable_verifier();
+                if let Some(mut debug_dir) = debug_dir {
+                    use wasmer_compiler_llvm::LLVMCallbacks;
+                    debug_dir.push("llvm");
+                    compiler.callbacks(Some(
+                        LLVMCallbacks::new(debug_dir)
+                            .expect("cannot crate debug directory: {debug_dir}"),
+                    ));
+                }
                 self.add_middlewares(&mut compiler);
                 Box::new(compiler)
             }
@@ -88,15 +113,20 @@ impl Config {
                 let mut compiler = wasmer_compiler_singlepass::Singlepass::new();
                 compiler.canonicalize_nans(canonicalize_nans);
                 compiler.enable_verifier();
+                if let Some(mut debug_dir) = debug_dir {
+                    use wasmer_compiler_singlepass::SinglepassCallbacks;
+                    debug_dir.push("singlepass");
+                    compiler.callbacks(Some(
+                        SinglepassCallbacks::new(debug_dir)
+                            .expect("cannot crate debug directory: {debug_dir}"),
+                    ));
+                }
                 self.add_middlewares(&mut compiler);
                 Box::new(compiler)
             }
             #[allow(unreachable_patterns)]
             compiler => {
-                panic!(
-                    "The {:?} Compiler is not enabled. Enable it via the features",
-                    compiler
-                )
+                panic!("The {compiler:?} Compiler is not enabled. Enable it via the features")
             }
         }
     }

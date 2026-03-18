@@ -1,4 +1,4 @@
-use virtual_mio::InlineWaker;
+use virtual_mio::block_on;
 
 use super::*;
 
@@ -25,13 +25,18 @@ impl JournalEffector {
         // any signals
         if env.replaying_journal {
             let state = env.state.clone();
-            InlineWaker::block_on(state.fs.close_all());
+            block_on(state.fs.close_all());
         } else {
             env.blocking_on_exit(exit_code);
         }
 
         // Reset the memory back to a zero size
-        let memory = ctx.data_mut().inner().memory().clone();
+        let memory = ctx
+            .data()
+            .inner()
+            .main_module_instance_handles()
+            .memory()
+            .clone();
         memory.reset(ctx)?;
         Ok(())
     }

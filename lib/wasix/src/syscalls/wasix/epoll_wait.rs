@@ -1,14 +1,12 @@
-use serde::{Deserialize, Serialize};
-use wasmer_wasix_types::wasi::{
-    EpollCtl, EpollData, EpollEvent, EpollType, SubscriptionClock, Userdata,
-};
+use wasmer_wasix_types::wasi::{EpollData, EpollEvent, EpollType, SubscriptionClock, Userdata};
 
 use super::*;
 use crate::{
-    fs::{EpollFd, InodeValFilePollGuard, InodeValFilePollGuardJoin, POLL_GUARD_MAX_RET},
+    WasiInodes,
+    fs::{InodeValFilePollGuard, InodeValFilePollGuardJoin},
+    os::epoll::{EpollFd, drain_ready_events},
     state::PollEventSet,
     syscalls::*,
-    WasiInodes,
 };
 
 const TIMEOUT_FOREVER: u64 = u64::MAX;
@@ -16,15 +14,19 @@ const TIMEOUT_FOREVER: u64 = u64::MAX;
 /// ### `epoll_wait()`
 /// Wait for an I/O event on an epoll file descriptor
 #[instrument(level = "trace", skip_all, fields(timeout_ms = field::Empty, fd_guards = field::Empty, seen = field::Empty), ret)]
-pub fn epoll_wait<'a, M: MemorySize + 'static>(
-    mut ctx: FunctionEnvMut<'a, WasiEnv>,
+pub fn epoll_wait<M: MemorySize + 'static>(
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     epfd: WasiFd,
     events: WasmPtr<EpollEvent<M>, M>,
     maxevents: i32,
     timeout: Timestamp,
     ret_nevents: WasmPtr<M::Offset, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
+    if maxevents <= 0 {
+        return Ok(Errno::Inval);
+    }
+    let maxevents = maxevents as usize;
 
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
@@ -35,16 +37,11 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
         tracing::trace!(maxevents, epfd, timeout, "waiting on wakers");
     }
 
-    let (rx, tx, subscriptions) = {
+    let epoll_state = {
         let fd_entry = wasi_try_ok!(ctx.data().state.fs.get_fd(epfd));
         let mut inode_guard = fd_entry.inode.read();
         match inode_guard.deref() {
-            Kind::Epoll {
-                rx,
-                tx,
-                subscriptions,
-                ..
-            } => (rx.clone(), tx.clone(), subscriptions.clone()),
+            Kind::Epoll { state } => state.clone(),
             _ => return Ok(Errno::Inval),
         }
     };
@@ -53,70 +50,15 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
     // epoll events until something of interest needs to be returned to the
     // caller or a timeout happens
     let work = {
-        let state = ctx.data().state.clone();
         async move {
-            let mut ret: Vec<(EpollFd, EpollType)> = Vec::new();
-
             // Loop until some events of interest are returned
             loop {
-                // We wait for our turn then read the next event from the
-                let mut rx = rx.lock().await;
-
-                // We first extract all the interest that has been registered
-                // and cycle through it
-                let mut removed = Vec::new();
-                let interest: Vec<_> = rx
-                    .borrow_and_update()
-                    .interest
-                    .clone()
-                    .into_iter()
-                    .collect();
-                {
-                    let mut guard = subscriptions.lock().unwrap();
-                    for (fd, readiness) in interest {
-                        removed.push((fd, readiness));
-
-                        // Get the data for this fd
-                        let (fd, joins) = match guard.get_mut(&fd) {
-                            Some(a) => a,
-                            None => {
-                                tracing::debug!(fd, readiness=?readiness, "orphaned interest");
-                                continue;
-                            }
-                        };
-
-                        // We have to renew any joins that have now been spent
-                        for join in joins {
-                            if join.is_spent() {
-                                join.renew();
-                            }
-                        }
-
-                        // Record the event
-                        ret.push((fd.clone(), readiness));
-                        if ret.len() + POLL_GUARD_MAX_RET >= (maxevents as usize) {
-                            break;
-                        }
-                    }
-                }
-
-                // Remove anything that was signaled
-                if !removed.is_empty() {
-                    // Now update the notification system
-                    tx.send_modify(|i| {
-                        for (fd, readiness) in removed {
-                            i.interest.remove(&(fd, readiness));
-                        }
-                    });
-                }
-
-                // If we have results then return them
+                let ret = drain_ready_events(&epoll_state, maxevents);
                 if !ret.is_empty() {
                     return Ok(ret);
                 }
 
-                // Otherwise we wait to be triggered again
-                rx.changed().await.ok();
+                epoll_state.wait().await;
             }
         }
     };
@@ -144,7 +86,7 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
     // which will interpret the error codes
     let process_events = {
         let events_out = events;
-        move |ctx: &FunctionEnvMut<'a, WasiEnv>,
+        move |ctx: &FunctionEnvMut<'_, WasiEnv>,
               events: Result<Vec<(EpollFd, EpollType)>, Errno>| {
             let env = ctx.data();
             let memory = unsafe { env.memory_view(ctx) };
@@ -159,14 +101,14 @@ pub fn epoll_wait<'a, M: MemorySize + 'static>(
                         wasi_try!(maxevents.try_into().map_err(|_| Errno::Overflow))
                     ));
                     for (event, readiness) in evts {
-                        tracing::trace!(fd = event.fd, readiness = ?readiness, "triggered");
+                        tracing::trace!(fd = event.fd(), readiness = ?readiness, "triggered");
                         wasi_try_mem!(event_array.index(nevents as u64).write(EpollEvent {
                             events: readiness,
                             data: EpollData {
-                                ptr: wasi_try!(event.ptr.try_into().map_err(|_| Errno::Overflow)),
-                                fd: event.fd,
-                                data1: event.data1,
-                                data2: event.data2
+                                ptr: wasi_try!(event.ptr().try_into().map_err(|_| Errno::Overflow)),
+                                fd: event.fd(),
+                                data1: event.data1(),
+                                data2: event.data2(),
                             }
                         }));
                         nevents += 1;

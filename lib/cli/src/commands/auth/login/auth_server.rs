@@ -1,6 +1,6 @@
 use super::AuthorizationState;
 use http_body_util::BodyExt;
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, body::Incoming};
 use reqwest::{Body, Method};
 use tokio::net::TcpListener;
 
@@ -27,7 +27,7 @@ pub(super) async fn setup_listener() -> Result<(TcpListener, String), anyhow::Er
     let addr = listener.local_addr()?;
     let port = addr.port();
 
-    let server_url = format!("http://localhost:{}", port);
+    let server_url = format!("http://localhost:{port}");
 
     Ok((listener, server_url))
 }

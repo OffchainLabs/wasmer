@@ -10,15 +10,17 @@ use crate::syscalls::*;
 /// * `futex` - Memory location that holds a futex that others may be waiting on
 #[instrument(level = "trace", skip_all, fields(futex_idx = field::Empty, woken = field::Empty), ret)]
 pub fn futex_wake<M: MemorySize>(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     futex_ptr: WasmPtr<u32, M>,
     ret_woken: WasmPtr<Bool, M>,
-) -> Errno {
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let state = env.state.deref();
 
-    let pointer: u64 = wasi_try!(futex_ptr.offset().try_into().map_err(|_| Errno::Overflow));
+    let pointer: u64 = futex_ptr.offset().into();
     Span::current().record("futex_idx", pointer);
 
     let mut woken = false;
@@ -26,10 +28,10 @@ pub fn futex_wake<M: MemorySize>(
         let mut guard = state.futexs.lock().unwrap();
         if let Some(futex) = guard.futexes.get_mut(&pointer) {
             let first = futex.wakers.keys().copied().next();
-            if let Some(id) = first {
-                if let Some(Some(w)) = futex.wakers.remove(&id) {
-                    w.wake();
-                }
+            if let Some(id) = first
+                && let Some(Some(w)) = futex.wakers.remove(&id)
+            {
+                w.wake();
             }
             if futex.wakers.is_empty() {
                 guard.futexes.remove(&pointer);
@@ -47,7 +49,7 @@ pub fn futex_wake<M: MemorySize>(
         false => Bool::False,
         true => Bool::True,
     };
-    wasi_try_mem!(ret_woken.write(&memory, woken));
+    wasi_try_mem_ok!(ret_woken.write(&memory, woken));
 
-    Errno::Success
+    Ok(Errno::Success)
 }

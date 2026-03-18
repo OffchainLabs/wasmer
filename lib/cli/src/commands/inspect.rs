@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
+use crate::backend::RuntimeOptions;
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use clap::Parser;
 use wasmer::*;
-
-use crate::store::StoreOptions;
+use wasmer_types::target::Target;
 
 #[derive(Debug, Parser)]
 /// The options for the `wasmer validate` subcommand
@@ -15,7 +15,7 @@ pub struct Inspect {
     path: PathBuf,
 
     #[clap(flatten)]
-    store: StoreOptions,
+    rt: RuntimeOptions,
 }
 
 impl Inspect {
@@ -26,12 +26,30 @@ impl Inspect {
     }
 
     fn inner_execute(&self) -> Result<()> {
-        let (store, _compiler_type) = self.store.get_store()?;
-
-        let module_contents = std::fs::read(&self.path)?;
+        let mut module_contents = std::fs::read(&self.path)?;
         let iswasm = is_wasm(&module_contents);
+
+        if !iswasm {
+            if self.path.extension().and_then(|e| e.to_str()) == Some("wat") {
+                module_contents = wat2wasm(&module_contents)
+                    .map_err(|e| anyhow::anyhow!("Cannot convert WAT to WASM: {e}"))?
+                    .to_vec();
+            } else {
+                anyhow::bail!("The input file is not a valid WebAssembly binary or WAT file");
+            }
+        }
+
+        let engine = self
+            .rt
+            .get_engine_for_module(&module_contents, &Target::default())?;
+
         let module_len = module_contents.len();
-        let module = Module::new(&store, module_contents)?;
+        let module = Module::new(&engine, module_contents)?;
+        println!(
+            "Backend used to parse the module: {}",
+            engine.deterministic_id()
+        );
+
         println!("Type: {}", if !iswasm { "wat" } else { "wasm" });
         println!("Size: {}", ByteSize(module_len as _));
         println!("Imports:");
@@ -51,6 +69,10 @@ impl Inspect {
         for f in module.imports().globals() {
             println!("    \"{}\".\"{}\": {}", f.module(), f.name(), f.ty());
         }
+        println!("  Tags:");
+        for f in module.imports().tags() {
+            println!("    \"{}\".\"{}\": {}", f.module(), f.name(), f.ty());
+        }
         println!("Exports:");
         println!("  Functions:");
         for f in module.exports().functions() {
@@ -66,6 +88,10 @@ impl Inspect {
         }
         println!("  Globals:");
         for f in module.exports().globals() {
+            println!("    \"{}\": {}", f.name(), f.ty());
+        }
+        println!("  Tags:");
+        for f in module.exports().tags() {
             println!("    \"{}\": {}", f.name(), f.ty());
         }
         Ok(())

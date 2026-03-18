@@ -1,16 +1,41 @@
-use std::path::Path;
+use std::{fs::OpenOptions, io::Write, path::Path};
 
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
 use wasmer_integration_tests_cli::get_wasmer_path;
-use wasmer_registry::WasmerConfig;
 
 fn setup_wasmer_dir() -> TempDir {
     let temp = TempDir::new().unwrap();
 
-    let config_path = WasmerConfig::get_file_location(temp.path());
-    WasmerConfig::default().save(&config_path).unwrap();
+    // The config path and the config contents themselves are manually crafted so that we don't
+    // depend on the cli crate.
+    //
+    // Eventually, this part of the config shall live on a freestanding crate - perhaps added to
+    // `wasmer-config`.
+    let config_path = temp.path().join("wasmer.toml");
+
+    let contents = r#"
+telemetry_enabled = true
+update_notifications_enabled = true
+
+[registry]
+active_registry = "https://registry.wasmer.io/graphql"
+
+[[registry.tokens]]
+registry = "https://registry.wasmer.io/graphql"
+
+[proxy]
+        "#;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&config_path)
+        .unwrap();
+
+    file.write_all(contents.as_bytes()).unwrap();
 
     temp
 }
@@ -128,14 +153,14 @@ fn c_flags() {
         .output()
         .unwrap();
 
-    let pkg_config = vec![
+    let pkg_config = [
         format!("prefix={}", wasmer_dir.display()),
         format!("exec_prefix={}", wasmer_dir.join("bin").display()),
         format!("includedir={}", wasmer_dir.join("include").display()),
         format!("libdir={}", wasmer_dir.join("lib").display()),
-        format!(""),
-        format!("Name: wasmer"),
-        format!("Description: The Wasmer library for running WebAssembly"),
+        String::new(),
+        "Name: wasmer".to_string(),
+        "Description: The Wasmer library for running WebAssembly".to_string(),
         format!("Version: {}", env!("CARGO_PKG_VERSION")),
         format!("Cflags: -I{}", wasmer_dir.join("include").display()),
         format!("Libs: -L{} -lwasmer", wasmer_dir.join("lib").display()),

@@ -1,14 +1,12 @@
 use super::WasmerConfig;
 use anyhow::{Context, Error};
-use lazy_static::lazy_static;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use url::Url;
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 
-lazy_static! {
-    pub static ref DEFAULT_WASMER_CLI_USER_AGENT: String =
-        format!("WasmerCLI-v{}", env!("CARGO_PKG_VERSION"));
-}
+pub static DEFAULT_WASMER_CLI_USER_AGENT: LazyLock<String> =
+    LazyLock::new(|| format!("WasmerCLI-v{}", env!("CARGO_PKG_VERSION")));
 
 /// Command-line flags for determining the local "Wasmer Environment".
 ///
@@ -24,8 +22,7 @@ pub struct WasmerEnv {
     #[clap(long, env = "WASMER_CACHE_DIR", default_value = super::DEFAULT_WASMER_CACHE_DIR.as_os_str())]
     pub(crate) cache_dir: PathBuf,
 
-    /// The registry to fetch packages from (inferred from the environment by
-    /// default)
+    /// Change the current registry
     #[clap(long, env = "WASMER_REGISTRY")]
     pub(crate) registry: Option<UserRegistry>,
 
@@ -36,6 +33,9 @@ pub struct WasmerEnv {
 }
 
 impl WasmerEnv {
+    const APP_DOMAIN_PROD: &'static str = "wasmer.app";
+    const APP_DOMAIN_DEV: &'static str = "wasmer.dev";
+
     pub fn new(
         wasmer_dir: PathBuf,
         cache_dir: PathBuf,
@@ -91,6 +91,17 @@ impl WasmerEnv {
             })
     }
 
+    /// Returns the proxy specified in wasmer config if present
+    pub fn proxy(&self) -> Result<Option<reqwest::Proxy>, Error> {
+        self.config()?
+            .proxy
+            .url
+            .as_ref()
+            .map(reqwest::Proxy::all)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// The directory all Wasmer artifacts are stored in.
     pub fn dir(&self) -> &Path {
         &self.wasmer_dir
@@ -125,25 +136,30 @@ impl WasmerEnv {
             .get_login_token_for_registry(registry_endpoint.as_str())
     }
 
-    pub fn client_unauthennticated(&self) -> Result<WasmerClient, anyhow::Error> {
-        let registry_url = self.registry_endpoint()?;
-        let client = wasmer_api::WasmerClient::new(registry_url, &DEFAULT_WASMER_CLI_USER_AGENT)?;
+    pub fn app_domain(&self) -> Result<String, Error> {
+        let registry_url = self.registry_public_url()?;
+        let domain = registry_url
+            .host_str()
+            .context("url has no host")?
+            .trim_end_matches('.');
 
-        let client = if let Some(token) = self.token() {
-            client.with_auth_token(token)
+        if domain.ends_with("wasmer.io") {
+            Ok(Self::APP_DOMAIN_PROD.to_string())
+        } else if domain.ends_with("wasmer.wtf") {
+            Ok(Self::APP_DOMAIN_DEV.to_string())
         } else {
-            client
-        };
-
-        Ok(client)
+            anyhow::bail!(
+                "could not determine app domain for backend url '{domain}': unknown backend"
+            );
+        }
     }
 
-    pub fn client_unauthennticated_with_proxy(
-        &self,
-        proxy: reqwest::Proxy,
-    ) -> Result<WasmerClient, anyhow::Error> {
+    pub fn client_unauthennticated(&self) -> Result<WasmerClient, anyhow::Error> {
         let registry_url = self.registry_endpoint()?;
-        let client = wasmer_api::WasmerClient::new_with_proxy(
+
+        let proxy = self.proxy()?;
+
+        let client = wasmer_backend_api::WasmerClient::new_with_proxy(
             registry_url,
             &DEFAULT_WASMER_CLI_USER_AGENT,
             proxy,
@@ -161,7 +177,9 @@ impl WasmerEnv {
     pub fn client(&self) -> Result<WasmerClient, anyhow::Error> {
         let client = self.client_unauthennticated()?;
         if client.auth_token().is_none() {
-            anyhow::bail!("no token provided - run 'wasmer login', specify --token=XXX, or set the WASMER_TOKEN env var");
+            anyhow::bail!(
+                "no token provided - run 'wasmer login', specify --token=XXX, or set the WASMER_TOKEN env var"
+            );
         }
 
         Ok(client)
@@ -252,6 +270,33 @@ mod tests {
         );
         assert_eq!(env.token().unwrap(), "prod-token");
         assert_eq!(env.cache_dir(), temp.path().join("cache"));
+    }
+
+    #[test]
+    fn env_app_domain() {
+        // Prod
+        {
+            let env = WasmerEnv {
+                wasmer_dir: PathBuf::from("/tmp"),
+                registry: Some(UserRegistry::from("https://registry.wasmer.io/graphql")),
+                cache_dir: PathBuf::from("/tmp/cache"),
+                token: None,
+            };
+
+            assert_eq!(env.app_domain().unwrap(), "wasmer.app");
+        }
+
+        // Dev
+        {
+            let env = WasmerEnv {
+                wasmer_dir: PathBuf::from("/tmp"),
+                registry: Some(UserRegistry::from("https://registry.wasmer.wtf/graphql")),
+                cache_dir: PathBuf::from("/tmp/cache"),
+                token: None,
+            };
+
+            assert_eq!(env.app_domain().unwrap(), "wasmer.dev");
+        }
     }
 
     #[test]

@@ -5,7 +5,6 @@ use std::{
     time::Instant,
 };
 
-use derivative::Derivative;
 use hyper_util::rt::TokioExecutor;
 use wasmer_journal::{DynJournal, RecombinedJournal};
 
@@ -26,8 +25,7 @@ struct State {
 
 /// This factory will store and reuse instances between invocations thus
 /// allowing for the instances to be stateful.
-#[derive(Derivative, Clone, Default)]
-#[derivative(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct DProxyInstanceFactory {
     state: Arc<Mutex<State>>,
 }
@@ -60,17 +58,14 @@ impl DProxyInstanceFactory {
         // DProxy is able to resume execution of the stateful workload using memory
         // snapshots hence the journals it stores are complete journals
         let journals = runtime
-            .journals()
-            .clone()
-            .into_iter()
+            .writable_journals()
             .map(|journal| {
-                let tx = journal.clone();
                 let rx = journal.as_restarted()?;
-                let combined = RecombinedJournal::new(tx, rx);
+                let combined = RecombinedJournal::new(journal, rx);
                 anyhow::Result::Ok(Arc::new(combined) as Arc<DynJournal>)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut runtime = OverriddenRuntime::new(runtime).with_journals(journals);
+        let mut runtime = OverriddenRuntime::new(runtime).with_writable_journals(journals);
 
         // We attach a composite networking to the runtime which includes a loopback
         // networking implementation connected to a socket manager
@@ -107,7 +102,7 @@ impl DProxyInstanceFactory {
             .task_dedicated(Box::new(move || {
                 #[cfg(feature = "sys")]
                 let _guard = handle.enter();
-                if let Err(err) = runner.run_command(&command_name, &pkg, runtime) {
+                if let Err(err) = Runner::run_command(&mut runner, &command_name, &pkg, runtime) {
                     tracing::error!("Instance Exited: {}", err);
                 } else {
                     tracing::info!("Instance Exited: Nominal");

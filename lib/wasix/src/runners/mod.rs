@@ -4,8 +4,6 @@ mod runner;
 pub mod dcgi;
 #[cfg(feature = "webc_runner_rt_dproxy")]
 pub mod dproxy;
-#[cfg(feature = "webc_runner_rt_emscripten")]
-pub mod emscripten;
 pub mod wasi;
 mod wasi_common;
 #[cfg(feature = "webc_runner_rt_wcgi")]
@@ -13,7 +11,7 @@ pub mod wcgi;
 
 #[cfg(any(feature = "webc_runner_rt_wcgi", feature = "webc_runner_rt_dproxy"))]
 mod body {
-    use http_body_util::{combinators::BoxBody, BodyExt, Full};
+    use http_body_util::{BodyExt, Full, combinators::BoxBody};
 
     pub type Body = BoxBody<bytes::Bytes, anyhow::Error>;
 
@@ -38,7 +36,7 @@ pub use self::body::*;
 pub use self::{
     runner::Runner,
     wasi_common::{
-        MappedCommand, MappedDirectory, MountedDirectory, MAPPED_CURRENT_DIR_DEFAULT_PATH,
+        MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedCommand, MappedDirectory, MountedDirectory,
     },
 };
 
@@ -59,7 +57,7 @@ mod response_tracing {
             _latency: std::time::Duration,
             span: &tracing::Span,
         ) {
-            span.record("status_code", &tracing::field::display(response.status()));
+            span.record("status_code", tracing::field::display(response.status()));
             tracing::info!("response generated")
         }
     }

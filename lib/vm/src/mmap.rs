@@ -9,11 +9,6 @@ use std::io;
 use std::ptr;
 use std::slice;
 
-/// Round `size` up to the nearest multiple of `page_size`.
-fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
-    (size + (page_size - 1)) & !(page_size - 1)
-}
-
 /// A simple struct consisting of a page-aligned pointer to page-aligned
 /// and initially-zeroed memory and a length.
 #[derive(Debug)]
@@ -25,6 +20,7 @@ pub struct Mmap {
     ptr: usize,
     total_size: usize,
     accessible_size: usize,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     sync_on_drop: bool,
 }
 
@@ -56,7 +52,7 @@ impl Mmap {
     /// Create a new `Mmap` pointing to at least `size` bytes of page-aligned accessible memory.
     pub fn with_at_least(size: usize) -> Result<Self, String> {
         let page_size = region::page::size();
-        let rounded_size = round_up_to_page_size(size, page_size);
+        let rounded_size = size.next_multiple_of(page_size);
         Self::accessible_reserved(rounded_size, rounded_size, None, MmapType::Private)
     }
 
@@ -98,7 +94,7 @@ impl Mmap {
 
             let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
             if len < mapping_size {
-                std::fs::write(&backing_file_accessible, format!("{}", len).as_bytes()).ok();
+                std::fs::write(&backing_file_accessible, format!("{len}").as_bytes()).ok();
 
                 file.set_len(mapping_size as u64)
                     .map_err(|e| e.to_string())?;
@@ -193,7 +189,7 @@ impl Mmap {
         _memory_type: MmapType,
     ) -> Result<Self, String> {
         use windows_sys::Win32::System::Memory::{
-            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
         };
 
         let page_size = region::page::size();
@@ -274,7 +270,7 @@ impl Mmap {
     #[cfg(target_os = "windows")]
     pub fn make_accessible(&mut self, start: usize, len: usize) -> Result<(), String> {
         use std::ffi::c_void;
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
         let page_size = region::page::size();
         assert_eq!(start & (page_size - 1), 0);
         assert_eq!(len & (page_size - 1), 0);
@@ -395,9 +391,9 @@ impl Drop for Mmap {
 
     #[cfg(target_os = "windows")]
     fn drop(&mut self) {
-        if self.len() != 0 {
+        if !self.is_empty() {
             use std::ffi::c_void;
-            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             let r = unsafe { VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE) };
             assert_ne!(r, 0);
         }
@@ -407,17 +403,4 @@ impl Drop for Mmap {
 fn _assert() {
     fn _assert_send_sync<T: Send + Sync>() {}
     _assert_send_sync::<Mmap>();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_round_up_to_page_size() {
-        assert_eq!(round_up_to_page_size(0, 4096), 0);
-        assert_eq!(round_up_to_page_size(1, 4096), 4096);
-        assert_eq!(round_up_to_page_size(4096, 4096), 4096);
-        assert_eq!(round_up_to_page_size(4097, 4096), 8192);
-    }
 }

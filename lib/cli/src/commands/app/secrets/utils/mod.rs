@@ -1,14 +1,14 @@
 pub(crate) mod render;
-
+use anyhow::Context;
 use colored::Colorize;
 use std::{
     env::current_dir,
     path::{Path, PathBuf},
     str::FromStr,
 };
-use wasmer_api::{types::Secret as BackendSecret, WasmerClient};
+use wasmer_backend_api::{WasmerClient, types::Secret as BackendSecret};
 
-use crate::commands::app::util::{get_app_config_from_dir, prompt_app_ident, AppIdent};
+use crate::commands::app::util::{AppIdent, get_app_config_from_dir, prompt_app_ident};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Secret {
@@ -30,20 +30,20 @@ pub(super) async fn get_secret_by_name(
     app_id: &str,
     secret_name: &str,
 ) -> anyhow::Result<Option<BackendSecret>> {
-    wasmer_api::query::get_app_secret_by_name(client, app_id, secret_name).await
+    wasmer_backend_api::query::get_app_secret_by_name(client, app_id, secret_name).await
 }
 pub(crate) async fn get_secrets(
     client: &WasmerClient,
     app_id: &str,
-) -> anyhow::Result<Vec<wasmer_api::types::Secret>> {
-    wasmer_api::query::get_all_app_secrets(client, app_id).await
+) -> anyhow::Result<Vec<wasmer_backend_api::types::Secret>> {
+    wasmer_backend_api::query::get_all_app_secrets(client, app_id).await
 }
 
 pub(crate) async fn get_secret_value(
     client: &WasmerClient,
-    secret: &wasmer_api::types::Secret,
+    secret: &wasmer_backend_api::types::Secret,
 ) -> anyhow::Result<String> {
-    wasmer_api::query::get_app_secret_value_by_id(client, secret.id.clone().into_inner())
+    wasmer_backend_api::query::get_app_secret_value_by_id(client, secret.id.clone().into_inner())
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -68,7 +68,7 @@ pub(crate) async fn reveal_secrets(
     client: &WasmerClient,
     app_id: &str,
 ) -> anyhow::Result<Vec<Secret>> {
-    let secrets = wasmer_api::query::get_all_app_secrets(client, app_id).await?;
+    let secrets = wasmer_backend_api::query::get_all_app_secrets(client, app_id).await?;
     let mut ret = vec![];
     for secret in secrets {
         let name = secret.name.clone();
@@ -112,9 +112,15 @@ pub(super) async fn get_app_id(
         let (app, _) = r;
 
         let app_name = if let Some(owner) = &app.owner {
-            format!("{owner}/{}", app.name)
+            format!(
+                "{owner}/{}",
+                &app.name.clone().context("App name has to be specified")?
+            )
         } else {
-            app.name.to_string()
+            app.name
+                .clone()
+                .context("App name has to be specified")?
+                .to_string()
         };
 
         let id = if let Some(id) = &app.app_id {
@@ -124,10 +130,12 @@ pub(super) async fn get_app_id(
                 Some(app.id.into_inner())
             } else {
                 if !quiet {
-                    eprintln!("{}: the app found in {} does not exist.\n{}: maybe it was not deployed yet?", 
-                            "Warning".bold().yellow(), 
-                            format!("'{}'", path.display()).dimmed(), 
-                            "Hint".bold());
+                    eprintln!(
+                        "{}: the app found in {} does not exist.\n{}: maybe it was not deployed yet?",
+                        "Warning".bold().yellow(),
+                        format!("'{}'", path.display()).dimmed(),
+                        "Hint".bold()
+                    );
                 }
                 None
             }
@@ -140,10 +148,13 @@ pub(super) async fn get_app_id(
                 if let Some(owner) = &app.owner {
                     eprintln!(
                         "Managing secrets related to app {} ({owner}).",
-                        app.name.bold()
+                        app.name.context("App name has to be specified")?.bold()
                     );
                 } else {
-                    eprintln!("Managing secrets related to app {}.", app.name.bold());
+                    eprintln!(
+                        "Managing secrets related to app {}.",
+                        app.name.context("App name has to be specified")?.bold()
+                    );
                 }
             }
             return Ok(id);

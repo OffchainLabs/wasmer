@@ -5,14 +5,15 @@
 #[macro_use]
 extern crate compiler_test_derive;
 
+mod artifact;
 mod config;
 mod deterministic;
 mod imports;
 mod issues;
 mod metering;
 mod middlewares;
-// mod multi_value_imports;
-mod artifact;
+mod multi_value_imports;
+mod progress;
 mod serialize;
 mod traps;
 mod typed_functions;

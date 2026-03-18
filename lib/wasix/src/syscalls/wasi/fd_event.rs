@@ -3,13 +3,15 @@ use crate::{fs::NotificationInner, syscalls::*};
 
 /// ### `fd_event()`
 /// Creates a file handle for event notifications
-#[instrument(level = "debug", skip_all, fields(%initial_val, ret_fd = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%initial_val, ret_fd = field::Empty), ret)]
 pub fn fd_event<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     initial_val: u64,
     flags: EventFdFlags,
     ret_fd: WasmPtr<WasiFd, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let fd = wasi_try_ok!(fd_event_internal(&mut ctx, initial_val, flags, None)?);
 
     let env = ctx.data();
@@ -21,7 +23,7 @@ pub fn fd_event<M: MemorySize>(
     if env.enable_journal {
         JournalEffector::save_fd_event(&mut ctx, initial_val, flags, fd).map_err(|err| {
             tracing::error!("failed to save fd_event event - {}", err);
-            WasiError::Exit(ExitCode::Errno(Errno::Fault))
+            WasiError::Exit(ExitCode::from(Errno::Fault))
         })?;
     }
 
@@ -53,12 +55,25 @@ pub fn fd_event_internal(
     let fd = wasi_try_ok_ok!(if let Some(fd) = with_fd {
         state
             .fs
-            .with_fd(rights, rights, Fdflags::empty(), 0, inode, fd)
+            .with_fd(
+                rights,
+                rights,
+                Fdflags::empty(),
+                Fdflagsext::empty(),
+                0,
+                inode,
+                fd,
+            )
             .map(|_| fd)
     } else {
-        state
-            .fs
-            .create_fd(rights, rights, Fdflags::empty(), 0, inode)
+        state.fs.create_fd(
+            rights,
+            rights,
+            Fdflags::empty(),
+            Fdflagsext::empty(),
+            0,
+            inode,
+        )
     });
 
     Ok(Ok(fd))

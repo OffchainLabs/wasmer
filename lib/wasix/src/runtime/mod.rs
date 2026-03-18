@@ -3,40 +3,148 @@ pub mod package_loader;
 pub mod resolver;
 pub mod task_manager;
 
-pub use self::task_manager::{SpawnMemoryType, VirtualTaskManager};
-use self::{module_cache::CacheError, task_manager::InlineWaker};
-use wasmer_types::ModuleHash;
+use self::module_cache::CacheError;
+pub use self::task_manager::{SpawnType, VirtualTaskManager};
+use module_cache::HashedModuleData;
+use wasmer_types::{CompilationProgressCallback, ModuleHash};
 
 use std::{
+    borrow::Cow,
     fmt,
     ops::Deref,
     sync::{Arc, Mutex},
 };
 
-use derivative::Derivative;
 use futures::future::BoxFuture;
+use virtual_mio::block_on;
 use virtual_net::{DynVirtualNetworking, VirtualNetworking};
-use wasmer::{Module, RuntimeError};
+use wasmer::{Engine, Module, RuntimeError};
 use wasmer_wasix_types::wasi::ExitCode;
 
 #[cfg(feature = "journal")]
-use crate::journal::DynJournal;
+use crate::journal::{DynJournal, DynReadableJournal};
 use crate::{
+    SpawnError, WasiTtyState,
+    bin_factory::BinaryPackageCommand,
     http::{DynHttpClient, HttpClient},
     os::TtyBridge,
     runtime::{
-        module_cache::{ModuleCache, ThreadLocalCache},
+        module_cache::{
+            ModuleCache, ThreadLocalCache,
+            progress::{ModuleLoadProgress, ModuleLoadProgressReporter},
+        },
         package_loader::{PackageLoader, UnsupportedPackageLoader},
         resolver::{BackendSource, MultiSource, Source},
     },
-    SpawnError, WasiTtyState,
 };
+
+pub type MakeImportCallback = dyn Fn(&wasmer::Module, &mut wasmer::StoreMut) -> anyhow::Result<wasmer::Imports>
+    + Send
+    + Sync
+    + 'static;
+pub type ConfigureInstanceCallback = dyn Fn(
+        &wasmer::Module,
+        &mut wasmer::StoreMut,
+        &wasmer::Instance,
+        Option<&wasmer::Memory>,
+    ) -> anyhow::Result<()>
+    + Send
+    + Sync
+    + 'static;
+
+#[derive(Clone)]
+pub struct ImportCallback(pub Arc<MakeImportCallback>);
+
+impl fmt::Debug for ImportCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ImportCallback(..)")
+    }
+}
+
+#[derive(Clone)]
+pub struct InstanceCallback(pub Arc<ConfigureInstanceCallback>);
+
+impl fmt::Debug for InstanceCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InstanceCallback(..)")
+    }
+}
 
 #[derive(Clone)]
 pub enum TaintReason {
     UnknownWasiVersion,
     NonZeroExitCode(ExitCode),
     RuntimeError(RuntimeError),
+    DlSymbolResolutionFailed(String),
+}
+
+/// The input to load a module.
+///
+/// Exists because the semantics for resolving modules can vary between
+/// different sources.
+///
+/// All variants are wrapped in `Cow` to allow for zero-copy usage when possible.
+#[allow(clippy::large_enum_variant)]
+pub enum ModuleInput<'a> {
+    /// Raw bytes.
+    Bytes(Cow<'a, [u8]>),
+    /// Pre-hashed module data.
+    Hashed(Cow<'a, HashedModuleData>),
+    /// A binary package command.
+    Command(Cow<'a, BinaryPackageCommand>),
+}
+
+impl<'a> ModuleInput<'a> {
+    /// Convert to an owned version of the module input.
+    pub fn to_owned(&'a self) -> ModuleInput<'static> {
+        // The manual code below is needed due to compiler issues with the lifetime.
+        match self {
+            Self::Bytes(Cow::Borrowed(b)) => {
+                let v: Vec<u8> = (*b).to_owned();
+                let c: Cow<'static, [u8]> = Cow::from(v);
+                ModuleInput::Bytes(c)
+            }
+            Self::Bytes(Cow::Owned(b)) => ModuleInput::Bytes(Cow::Owned((*b).clone())),
+            Self::Hashed(Cow::Borrowed(h)) => ModuleInput::Hashed(Cow::Owned((*h).clone())),
+            Self::Hashed(Cow::Owned(h)) => ModuleInput::Hashed(Cow::Owned(h.clone())),
+            Self::Command(Cow::Borrowed(c)) => ModuleInput::Command(Cow::Owned((*c).clone())),
+            Self::Command(Cow::Owned(c)) => ModuleInput::Command(Cow::Owned(c.clone())),
+        }
+    }
+
+    /// Get the module hash.
+    ///
+    /// NOTE: may be expensive, depending on the variant.
+    pub fn hash(&self) -> ModuleHash {
+        match self {
+            Self::Bytes(b) => {
+                // Hash on the fly
+                ModuleHash::new(b)
+            }
+            Self::Hashed(hashed) => *hashed.hash(),
+            Self::Command(cmd) => *cmd.hash(),
+        }
+    }
+
+    /// Get the raw WebAssembly bytes.
+    pub fn wasm(&self) -> &[u8] {
+        match self {
+            Self::Bytes(b) => b,
+            Self::Hashed(hashed) => hashed.wasm().as_ref(),
+            Self::Command(cmd) => cmd.atom_ref().as_ref(),
+        }
+    }
+
+    /// Convert to a `HashedModuleData`.
+    ///
+    /// May involve cloning and hashing.
+    pub fn to_hashed(&self) -> HashedModuleData {
+        match self {
+            Self::Bytes(b) => HashedModuleData::new(b.as_ref()),
+            Self::Hashed(hashed) => hashed.as_ref().clone(),
+            Self::Command(cmd) => HashedModuleData::from_command(cmd),
+        }
+    }
 }
 
 /// Runtime components used when running WebAssembly programs.
@@ -73,8 +181,8 @@ where
     fn source(&self) -> Arc<dyn Source + Send + Sync>;
 
     /// Get a [`wasmer::Engine`] for module compilation.
-    fn engine(&self) -> wasmer::Engine {
-        wasmer::Engine::default()
+    fn engine(&self) -> Engine {
+        Engine::default()
     }
 
     /// Create a new [`wasmer::Store`].
@@ -88,6 +196,30 @@ where
         }
     }
 
+    /// Create additional imports for a new WASIX instance in the provided store.
+    ///
+    /// This callback may be invoked multiple times (e.g. process bootstrap,
+    /// thread spawn), so implementations should create imports that are valid
+    /// for the given store each time.
+    fn additional_imports(
+        &self,
+        _module: &wasmer::Module,
+        _store: &mut wasmer::StoreMut,
+    ) -> anyhow::Result<wasmer::Imports> {
+        Ok(wasmer::Imports::new())
+    }
+
+    /// Configure an instantiated instance before initialization/startup.
+    fn configure_new_instance(
+        &self,
+        _module: &wasmer::Module,
+        _store: &mut wasmer::StoreMut,
+        _instance: &wasmer::Instance,
+        _imported_memory: Option<&wasmer::Memory>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get a custom HTTP client
     fn http_client(&self) -> Option<&DynHttpClient> {
         None
@@ -98,33 +230,118 @@ where
         None
     }
 
-    /// Load a a Webassembly module, trying to use a pre-compiled version if possible.
-    fn load_module<'a>(&'a self, wasm: &'a [u8]) -> BoxFuture<'a, Result<Module, SpawnError>> {
-        let engine = self.engine();
+    /// The primary way to load a module given a module input.
+    ///
+    /// The engine to use can be optionally provided, otherwise the most appropriate engine
+    /// should be selected.
+    ///
+    /// An optional progress reporter callback can be provided to report progress during module loading.
+    fn resolve_module<'a>(
+        &'a self,
+        input: ModuleInput<'a>,
+        engine: Option<&Engine>,
+        on_progress: Option<ModuleLoadProgressReporter>,
+    ) -> BoxFuture<'a, Result<Module, SpawnError>> {
+        let data = input.to_hashed();
+
+        let engine = if let Some(e) = engine {
+            e.clone()
+        } else {
+            match &input {
+                ModuleInput::Bytes(_) => self.engine(),
+                ModuleInput::Hashed(_) => self.engine(),
+                ModuleInput::Command(cmd) => self.engine(),
+            }
+        };
+
         let module_cache = self.module_cache();
-        let hash = ModuleHash::xxhash(wasm);
 
-        let task = async move { load_module(&engine, &module_cache, wasm, hash).await };
-
+        let task = async move { load_module(&engine, &module_cache, input, on_progress).await };
         Box::pin(task)
     }
 
-    /// Load a a Webassembly module, trying to use a pre-compiled version if possible.
+    /// Sync variant of [`Self::resolve_module`].
+    fn resolve_module_sync(
+        &self,
+        input: ModuleInput<'_>,
+        engine: Option<&Engine>,
+        on_progress: Option<ModuleLoadProgressReporter>,
+    ) -> Result<Module, SpawnError> {
+        block_on(self.resolve_module(input, engine, on_progress))
+    }
+
+    /// Load the module for a command.
     ///
-    /// Non-async version of [`Self::load_module`].
+    /// Will load the module from the cache if possible, otherwise will compile.
+    ///
+    /// NOTE: This always be preferred over [`Self::load_module`] to avoid
+    /// re-hashing the module!
+    #[deprecated(since = "0.601.0", note = "Use `resolve_module` instead")]
+    fn load_command_module(
+        &self,
+        cmd: &BinaryPackageCommand,
+    ) -> BoxFuture<'_, Result<Module, SpawnError>> {
+        self.resolve_module(ModuleInput::Command(Cow::Owned(cmd.clone())), None, None)
+    }
+
+    /// Sync version of [`Self::load_command_module`].
+    #[deprecated(since = "0.601.0", note = "Use `resolve_module_sync` instead")]
+    fn load_command_module_sync(&self, cmd: &BinaryPackageCommand) -> Result<Module, SpawnError> {
+        block_on(self.resolve_module(ModuleInput::Command(Cow::Borrowed(cmd)), None, None))
+    }
+
+    /// Load a WebAssembly module from raw bytes.
+    ///
+    /// Will load the module from the cache if possible, otherwise will compile.
+    #[deprecated(since = "0.601.0", note = "Use `resolve_module` instead")]
+    fn load_module<'a>(&'a self, wasm: &'a [u8]) -> BoxFuture<'a, Result<Module, SpawnError>> {
+        self.resolve_module(ModuleInput::Bytes(Cow::Borrowed(wasm)), None, None)
+    }
+
+    /// Synchronous version of [`Self::load_module`].
+    #[deprecated(
+        since = "0.601.0",
+        note = "Use `load_command_module` or `load_hashed_module` instead - this method can have high overhead"
+    )]
     fn load_module_sync(&self, wasm: &[u8]) -> Result<Module, SpawnError> {
-        InlineWaker::block_on(self.load_module(wasm))
+        block_on(self.resolve_module(ModuleInput::Bytes(Cow::Borrowed(wasm)), None, None))
+    }
+
+    /// Load a WebAssembly module from pre-hashed data.
+    ///
+    /// Will load the module from the cache if possible, otherwise will compile.
+    fn load_hashed_module(
+        &self,
+        module: HashedModuleData,
+        engine: Option<&Engine>,
+    ) -> BoxFuture<'_, Result<Module, SpawnError>> {
+        self.resolve_module(ModuleInput::Hashed(Cow::Owned(module)), engine, None)
+    }
+
+    /// Synchronous version of [`Self::load_hashed_module`].
+    fn load_hashed_module_sync(
+        &self,
+        wasm: HashedModuleData,
+        engine: Option<&Engine>,
+    ) -> Result<Module, SpawnError> {
+        block_on(self.resolve_module(ModuleInput::Hashed(Cow::Owned(wasm)), engine, None))
     }
 
     /// Callback thats invokes whenever the instance is tainted, tainting can occur
     /// for multiple reasons however the most common is a panic within the process
     fn on_taint(&self, _reason: TaintReason) {}
 
-    /// The list of journals which will be used to restore the state of the
+    /// The list of all read-only journals which will be used to restore the state of the
     /// runtime at a particular point in time
     #[cfg(feature = "journal")]
-    fn journals(&self) -> &'_ Vec<Arc<DynJournal>> {
-        &EMPTY_JOURNAL_LIST
+    fn read_only_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynReadableJournal>> + 'a> {
+        Box::new(std::iter::empty())
+    }
+
+    /// The list of writable journals which will be appended to
+    #[cfg(feature = "journal")]
+    fn writable_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynJournal>> + 'a> {
+        Box::new(std::iter::empty())
     }
 
     /// The snapshot capturer takes and restores snapshots of the WASM process at specific
@@ -137,21 +354,26 @@ where
 
 pub type DynRuntime = dyn Runtime + Send + Sync;
 
-#[cfg(feature = "journal")]
-static EMPTY_JOURNAL_LIST: Vec<Arc<DynJournal>> = Vec::new();
-
 /// Load a a Webassembly module, trying to use a pre-compiled version if possible.
 ///
 // This function exists to provide a reusable baseline implementation for
 // implementing [`Runtime::load_module`], so custom logic can be added on top.
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn load_module(
-    engine: &wasmer::Engine,
+    engine: &Engine,
     module_cache: &(dyn ModuleCache + Send + Sync),
-    wasm: &[u8],
-    wasm_hash: ModuleHash,
+    input: ModuleInput<'_>,
+    on_progress: Option<ModuleLoadProgressReporter>,
 ) -> Result<Module, crate::SpawnError> {
-    let result = module_cache.load(wasm_hash, engine).await;
+    let wasm_hash = input.hash();
+
+    let result = if let Some(on_progress) = &on_progress {
+        module_cache
+            .load_with_progress(wasm_hash, engine, on_progress.clone())
+            .await
+    } else {
+        module_cache.load(wasm_hash, engine).await
+    };
 
     match result {
         Ok(module) => return Ok(module),
@@ -165,11 +387,34 @@ pub async fn load_module(
         }
     }
 
-    let module = Module::new(&engine, wasm).map_err(|err| crate::SpawnError::CompileError {
+    let res = if let Some(progress) = on_progress {
+        #[allow(unused_variables)]
+        let p = CompilationProgressCallback::new(move |p| {
+            progress.notify(ModuleLoadProgress::CompilingModule(p))
+        });
+        #[cfg(feature = "sys-default")]
+        {
+            if engine.is_sys() {
+                use wasmer::sys::NativeEngineExt;
+                engine.new_module_with_progress(input.wasm(), p)
+            } else {
+                Module::new(&engine, input.wasm())
+            }
+        }
+        #[cfg(not(feature = "sys-default"))]
+        {
+            Module::new(&engine, input.wasm())
+        }
+    } else {
+        Module::new(&engine, input.wasm())
+    };
+
+    let module = res.map_err(|err| crate::SpawnError::CompileError {
         module_hash: wasm_hash,
         error: err,
     })?;
 
+    // TODO: pass a [`HashedModule`] struct that is safe by construction.
     if let Err(e) = module_cache.save(wasm_hash, engine, &module).await {
         tracing::warn!(
             %wasm_hash,
@@ -205,21 +450,22 @@ impl TtyBridge for DefaultTty {
     }
 }
 
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Debug, Clone)]
 pub struct PluggableRuntime {
     pub rt: Arc<dyn VirtualTaskManager>,
     pub networking: DynVirtualNetworking,
     pub http_client: Option<DynHttpClient>,
     pub package_loader: Arc<dyn PackageLoader + Send + Sync>,
     pub source: Arc<dyn Source + Send + Sync>,
-    pub engine: Option<wasmer::Engine>,
+    pub engine: Engine,
     pub module_cache: Arc<dyn ModuleCache + Send + Sync>,
-    #[derivative(Debug = "ignore")]
     pub tty: Option<Arc<dyn TtyBridge + Send + Sync>>,
     #[cfg(feature = "journal")]
-    #[derivative(Debug = "ignore")]
-    pub journals: Vec<Arc<DynJournal>>,
+    pub read_only_journals: Vec<Arc<DynReadableJournal>>,
+    #[cfg(feature = "journal")]
+    pub writable_journals: Vec<Arc<DynJournal>>,
+    pub additional_imports: Vec<ImportCallback>,
+    pub instance_callbacks: Vec<InstanceCallback>,
 }
 
 impl PluggableRuntime {
@@ -237,7 +483,7 @@ impl PluggableRuntime {
 
         let loader = UnsupportedPackageLoader;
 
-        let mut source = MultiSource::new();
+        let mut source = MultiSource::default();
         if let Some(client) = &http_client {
             source.add_source(BackendSource::new(
                 BackendSource::WASMER_PROD_ENDPOINT.parse().unwrap(),
@@ -249,13 +495,17 @@ impl PluggableRuntime {
             rt,
             networking,
             http_client,
-            engine: None,
+            engine: Default::default(),
             tty: None,
             source: Arc::new(source),
             package_loader: Arc::new(loader),
             module_cache: Arc::new(module_cache::in_memory()),
             #[cfg(feature = "journal")]
-            journals: Vec::new(),
+            read_only_journals: Vec::new(),
+            #[cfg(feature = "journal")]
+            writable_journals: Vec::new(),
+            additional_imports: Vec::new(),
+            instance_callbacks: Vec::new(),
         }
     }
 
@@ -267,7 +517,7 @@ impl PluggableRuntime {
         self
     }
 
-    pub fn set_engine(&mut self, engine: Option<wasmer::Engine>) -> &mut Self {
+    pub fn set_engine(&mut self, engine: Engine) -> &mut Self {
         self.engine = engine;
         self
     }
@@ -285,14 +535,14 @@ impl PluggableRuntime {
         self
     }
 
-    pub fn set_source(&mut self, source: impl Source + Send + Sync + 'static) -> &mut Self {
+    pub fn set_source(&mut self, source: impl Source + Send + 'static) -> &mut Self {
         self.source = Arc::new(source);
         self
     }
 
     pub fn set_package_loader(
         &mut self,
-        package_loader: impl PackageLoader + Send + Sync + 'static,
+        package_loader: impl PackageLoader + 'static,
     ) -> &mut Self {
         self.package_loader = Arc::new(package_loader);
         self
@@ -307,8 +557,43 @@ impl PluggableRuntime {
     }
 
     #[cfg(feature = "journal")]
-    pub fn add_journal(&mut self, journal: Arc<DynJournal>) -> &mut Self {
-        self.journals.push(journal);
+    pub fn add_read_only_journal(&mut self, journal: Arc<DynReadableJournal>) -> &mut Self {
+        self.read_only_journals.push(journal);
+        self
+    }
+
+    #[cfg(feature = "journal")]
+    pub fn add_writable_journal(&mut self, journal: Arc<DynJournal>) -> &mut Self {
+        self.writable_journals.push(journal);
+        self
+    }
+
+    pub fn with_additional_imports(
+        &mut self,
+        imports: impl Fn(&wasmer::Module, &mut wasmer::StoreMut) -> anyhow::Result<wasmer::Imports>
+        + Send
+        + Sync
+        + 'static,
+    ) -> &mut Self {
+        self.additional_imports
+            .push(ImportCallback(Arc::new(imports)));
+        self
+    }
+
+    pub fn with_instance_setup(
+        &mut self,
+        callback: impl Fn(
+            &wasmer::Module,
+            &mut wasmer::StoreMut,
+            &wasmer::Instance,
+            Option<&wasmer::Memory>,
+        ) -> anyhow::Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> &mut Self {
+        self.instance_callbacks
+            .push(InstanceCallback(Arc::new(callback)));
         self
     }
 }
@@ -330,19 +615,12 @@ impl Runtime for PluggableRuntime {
         Arc::clone(&self.source)
     }
 
-    fn engine(&self) -> wasmer::Engine {
-        if let Some(engine) = self.engine.clone() {
-            engine
-        } else {
-            wasmer::Engine::default()
-        }
+    fn engine(&self) -> Engine {
+        self.engine.clone()
     }
 
     fn new_store(&self) -> wasmer::Store {
-        self.engine
-            .clone()
-            .map(wasmer::Store::new)
-            .unwrap_or_default()
+        wasmer::Store::new(self.engine.clone())
     }
 
     fn task_manager(&self) -> &Arc<dyn VirtualTaskManager> {
@@ -357,21 +635,50 @@ impl Runtime for PluggableRuntime {
         self.module_cache.clone()
     }
 
+    fn additional_imports(
+        &self,
+        module: &wasmer::Module,
+        store: &mut wasmer::StoreMut,
+    ) -> anyhow::Result<wasmer::Imports> {
+        let mut imports = wasmer::Imports::new();
+        for cb in &self.additional_imports {
+            imports.extend(&(*(cb.0))(module, store)?);
+        }
+        Ok(imports)
+    }
+
+    fn configure_new_instance(
+        &self,
+        module: &wasmer::Module,
+        store: &mut wasmer::StoreMut,
+        instance: &wasmer::Instance,
+        imported_memory: Option<&wasmer::Memory>,
+    ) -> anyhow::Result<()> {
+        for cb in &self.instance_callbacks {
+            (*(cb.0))(module, store, instance, imported_memory)?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "journal")]
-    fn journals(&self) -> &'_ Vec<Arc<DynJournal>> {
-        &self.journals
+    fn read_only_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynReadableJournal>> + 'a> {
+        Box::new(self.read_only_journals.iter().cloned())
+    }
+
+    #[cfg(feature = "journal")]
+    fn writable_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynJournal>> + 'a> {
+        Box::new(self.writable_journals.iter().cloned())
     }
 
     #[cfg(feature = "journal")]
     fn active_journal(&self) -> Option<&DynJournal> {
-        self.journals.iter().last().map(|a| a.as_ref())
+        self.writable_journals.iter().last().map(|a| a.as_ref())
     }
 }
 
 /// Runtime that allows for certain things to be overridden
 /// such as the active journals
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone, Debug)]
 pub struct OverriddenRuntime {
     inner: Arc<DynRuntime>,
     task_manager: Option<Arc<dyn VirtualTaskManager>>,
@@ -379,13 +686,15 @@ pub struct OverriddenRuntime {
     http_client: Option<DynHttpClient>,
     package_loader: Option<Arc<dyn PackageLoader + Send + Sync>>,
     source: Option<Arc<dyn Source + Send + Sync>>,
-    engine: Option<wasmer::Engine>,
+    engine: Option<Engine>,
     module_cache: Option<Arc<dyn ModuleCache + Send + Sync>>,
-    #[derivative(Debug = "ignore")]
     tty: Option<Arc<dyn TtyBridge + Send + Sync>>,
+    additional_imports: Vec<ImportCallback>,
+    instance_callbacks: Vec<InstanceCallback>,
     #[cfg(feature = "journal")]
-    #[derivative(Debug = "ignore")]
-    journals: Option<Vec<Arc<DynJournal>>>,
+    pub read_only_journals: Option<Vec<Arc<DynReadableJournal>>>,
+    #[cfg(feature = "journal")]
+    pub writable_journals: Option<Vec<Arc<DynJournal>>>,
 }
 
 impl OverriddenRuntime {
@@ -400,8 +709,12 @@ impl OverriddenRuntime {
             engine: None,
             module_cache: None,
             tty: None,
+            additional_imports: Vec::new(),
+            instance_callbacks: Vec::new(),
             #[cfg(feature = "journal")]
-            journals: None,
+            read_only_journals: None,
+            #[cfg(feature = "journal")]
+            writable_journals: None,
         }
     }
 
@@ -433,7 +746,7 @@ impl OverriddenRuntime {
         self
     }
 
-    pub fn with_engine(mut self, engine: wasmer::Engine) -> Self {
+    pub fn with_engine(mut self, engine: Engine) -> Self {
         self.engine.replace(engine);
         self
     }
@@ -443,15 +756,49 @@ impl OverriddenRuntime {
         self
     }
 
-    #[cfg(feature = "journal")]
     pub fn with_tty(mut self, tty: Arc<dyn TtyBridge + Send + Sync>) -> Self {
         self.tty.replace(tty);
         self
     }
 
+    pub fn with_additional_imports(
+        mut self,
+        imports: impl Fn(&wasmer::Module, &mut wasmer::StoreMut) -> anyhow::Result<wasmer::Imports>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.additional_imports
+            .push(ImportCallback(Arc::new(imports)));
+        self
+    }
+
+    pub fn with_instance_setup(
+        mut self,
+        callback: impl Fn(
+            &wasmer::Module,
+            &mut wasmer::StoreMut,
+            &wasmer::Instance,
+            Option<&wasmer::Memory>,
+        ) -> anyhow::Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.instance_callbacks
+            .push(InstanceCallback(Arc::new(callback)));
+        self
+    }
+
     #[cfg(feature = "journal")]
-    pub fn with_journals(mut self, journals: Vec<Arc<DynJournal>>) -> Self {
-        self.journals.replace(journals);
+    pub fn with_read_only_journals(mut self, journals: Vec<Arc<DynReadableJournal>>) -> Self {
+        self.read_only_journals.replace(journals);
+        self
+    }
+
+    #[cfg(feature = "journal")]
+    pub fn with_writable_journals(mut self, journals: Vec<Arc<DynJournal>>) -> Self {
+        self.writable_journals.replace(journals);
         self
     }
 }
@@ -497,7 +844,7 @@ impl Runtime for OverriddenRuntime {
         }
     }
 
-    fn engine(&self) -> wasmer::Engine {
+    fn engine(&self) -> Engine {
         if let Some(engine) = self.engine.clone() {
             engine
         } else {
@@ -511,6 +858,33 @@ impl Runtime for OverriddenRuntime {
         } else {
             self.inner.new_store()
         }
+    }
+
+    fn additional_imports(
+        &self,
+        module: &wasmer::Module,
+        store: &mut wasmer::StoreMut,
+    ) -> anyhow::Result<wasmer::Imports> {
+        let mut imports = self.inner.additional_imports(module, store)?;
+        for cb in &self.additional_imports {
+            imports.extend(&(*(cb.0))(module, store)?);
+        }
+        Ok(imports)
+    }
+
+    fn configure_new_instance(
+        &self,
+        module: &wasmer::Module,
+        store: &mut wasmer::StoreMut,
+        instance: &wasmer::Instance,
+        imported_memory: Option<&wasmer::Memory>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .configure_new_instance(module, store, instance, imported_memory)?;
+        for cb in &self.instance_callbacks {
+            (*(cb.0))(module, store, instance, imported_memory)?;
+        }
+        Ok(())
     }
 
     fn http_client(&self) -> Option<&DynHttpClient> {
@@ -530,41 +904,29 @@ impl Runtime for OverriddenRuntime {
     }
 
     #[cfg(feature = "journal")]
-    fn journals(&self) -> &'_ Vec<Arc<DynJournal>> {
-        if let Some(journals) = self.journals.as_ref() {
-            journals
+    fn read_only_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynReadableJournal>> + 'a> {
+        if let Some(journals) = self.read_only_journals.as_ref() {
+            Box::new(journals.iter().cloned())
         } else {
-            self.inner.journals()
+            self.inner.read_only_journals()
+        }
+    }
+
+    #[cfg(feature = "journal")]
+    fn writable_journals<'a>(&'a self) -> Box<dyn Iterator<Item = Arc<DynJournal>> + 'a> {
+        if let Some(journals) = self.writable_journals.as_ref() {
+            Box::new(journals.iter().cloned())
+        } else {
+            self.inner.writable_journals()
         }
     }
 
     #[cfg(feature = "journal")]
     fn active_journal(&self) -> Option<&'_ DynJournal> {
-        if let Some(journals) = self.journals.as_ref() {
+        if let Some(journals) = self.writable_journals.as_ref() {
             journals.iter().last().map(|a| a.as_ref())
         } else {
             self.inner.active_journal()
-        }
-    }
-
-    fn load_module<'a>(&'a self, wasm: &'a [u8]) -> BoxFuture<'a, Result<Module, SpawnError>> {
-        if self.engine.is_some() || self.module_cache.is_some() {
-            let engine = self.engine();
-            let module_cache = self.module_cache();
-            let hash = ModuleHash::xxhash(wasm);
-
-            let task = async move { load_module(&engine, &module_cache, wasm, hash).await };
-            Box::pin(task)
-        } else {
-            self.inner.load_module(wasm)
-        }
-    }
-
-    fn load_module_sync(&self, wasm: &[u8]) -> Result<Module, SpawnError> {
-        if self.engine.is_some() || self.module_cache.is_some() {
-            InlineWaker::block_on(self.load_module(wasm))
-        } else {
-            self.inner.load_module_sync(wasm)
         }
     }
 }

@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    capture_store_snapshot,
+    WasiThreadHandle, WasiVForkAsyncify, capture_store_snapshot,
     os::task::OwnedTaskStatus,
     runtime::task_manager::{TaskWasm, TaskWasmRunProperties},
+    state::context_switching::ContextSwitchingEnvironment,
     syscalls::*,
-    WasiThreadHandle,
 };
 use serde::{Deserialize, Serialize};
 use wasmer::Memory;
@@ -19,13 +19,28 @@ pub(crate) struct ForkResult {
 /// Forks the current process into a new subprocess. If the function
 /// returns a zero then its the new subprocess. If it returns a positive
 /// number then its the current process and the $pid represents the child.
-#[instrument(level = "debug", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
+#[instrument(level = "trace", skip_all, fields(pid = ctx.data().process.pid().raw()), ret)]
 pub fn proc_fork<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     mut copy_memory: Bool,
     pid_ptr: WasmPtr<Pid, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
+    wasi_try_ok!(ctx.data().ensure_static_module().map_err(|_| {
+        warn!("process forking not supported for dynamically linked modules");
+        Errno::Notsup
+    }));
+
+    if let Some(context_switching_environment) = ctx.data().context_switching_environment.as_ref()
+        && context_switching_environment.active_context_id()
+            != context_switching_environment.main_context_id()
+    {
+        warn!(
+            "process forking is only supported from the main context when using WASIX context-switching features"
+        );
+        return Ok(Errno::Notsup);
+    }
 
     // If we were just restored then we need to return the value instead
     if let Some(result) = unsafe { handle_rewind::<M, ForkResult>(&mut ctx) } {
@@ -34,8 +49,7 @@ pub fn proc_fork<M: MemorySize>(
         } else {
             trace!(
                 "handle_rewind - i am parent (child={}, ret={})",
-                result.pid,
-                result.ret
+                result.pid, result.ret
             );
         }
         let memory = unsafe { ctx.data().memory_view(&ctx) };
@@ -43,6 +57,11 @@ pub fn proc_fork<M: MemorySize>(
         return Ok(result.ret);
     }
     trace!(%copy_memory, "capturing");
+
+    if let Some(vfork) = ctx.data().vfork.as_ref() {
+        warn!("process forking not supported in an active vfork");
+        return Ok(Errno::Notsup);
+    }
 
     // Fork the environment which will copy all the open file handlers
     // and associate a new context but otherwise shares things like the
@@ -94,20 +113,23 @@ pub fn proc_fork<M: MemorySize>(
             // if it had actually forked
             child_env.swap_inner(ctx.data_mut());
             std::mem::swap(ctx.data_mut(), &mut child_env);
-            ctx.data_mut().vfork.replace(WasiVFork {
-                rewind_stack: rewind_stack.clone(),
-                memory_stack: memory_stack.clone(),
-                store_data: store_data.clone(),
+            let previous_vfork = ctx.data_mut().vfork.replace(WasiVFork {
+                asyncify: Some(WasiVForkAsyncify {
+                    rewind_stack: rewind_stack.clone(),
+                    store_data: store_data.clone(),
+                    is_64bit: M::is_64bit(),
+                }),
                 env: Box::new(child_env),
                 handle: child_handle,
             });
+            assert!(previous_vfork.is_none()); // Already checked above
 
             // Carry on as if the fork had taken place (which basically means
             // it prevents to be the new process with the old one suspended)
             // Rewind the stack and carry on
             match rewind::<M, _>(
                 ctx,
-                memory_stack.freeze(),
+                Some(memory_stack.freeze()),
                 rewind_stack.freeze(),
                 store_data,
                 ForkResult {
@@ -151,9 +173,11 @@ pub fn proc_fork<M: MemorySize>(
         let child_memory_stack = memory_stack.clone();
         let child_rewind_stack = rewind_stack.clone();
 
-        let module = unsafe { ctx.data().inner() }.module_clone();
-        let memory = unsafe { ctx.data().inner() }.memory_clone();
-        let spawn_type = SpawnMemoryType::CopyMemory(memory, ctx.as_store_ref());
+        let env_inner = ctx.data().inner();
+        let instance_handles = env_inner.static_module_instance_handles().unwrap();
+        let module = instance_handles.module_clone();
+        let memory = instance_handles.memory_clone();
+        let spawn_type = SpawnType::CopyMemory(memory, ctx.as_store_ref());
 
         // Spawn a new process with this current execution environment
         let signaler = Box::new(child_env.process.clone());
@@ -174,7 +198,7 @@ pub fn proc_fork<M: MemorySize>(
                     let (data, mut store) = ctx.data_and_store_mut();
                     match rewind::<M, _>(
                         ctx,
-                        child_memory_stack,
+                        Some(child_memory_stack),
                         child_rewind_stack,
                         store_data.clone(),
                         ForkResult {
@@ -199,8 +223,8 @@ pub fn proc_fork<M: MemorySize>(
 
             tasks_outer
                 .task_wasm(
-                    TaskWasm::new(Box::new(run), child_env, module, false)
-                        .with_globals(&snapshot)
+                    TaskWasm::new(Box::new(run), child_env, module, false, false)
+                        .with_globals(snapshot)
                         .with_memory(spawn_type),
                 )
                 .map_err(|err| {
@@ -216,7 +240,7 @@ pub fn proc_fork<M: MemorySize>(
         // Rewind the stack and carry on
         match rewind::<M, _>(
             ctx,
-            memory_stack,
+            Some(memory_stack),
             rewind_stack,
             store_data,
             ForkResult {
@@ -260,17 +284,29 @@ fn run<M: MemorySize>(
     }
 
     let mut ret: ExitCode = Errno::Success.into();
-    let err = if ctx.data(&store).thread.is_main() {
+    let (mut store, err) = if ctx.data(&store).thread.is_main() {
         trace!(%pid, %tid, "re-invoking main");
-        let start = unsafe { ctx.data(&store).inner() }.start.clone().unwrap();
-        start.call(&mut store)
+        let start = ctx
+            .data(&store)
+            .inner()
+            .static_module_instance_handles()
+            .unwrap()
+            .start
+            .clone()
+            .unwrap();
+        ContextSwitchingEnvironment::run_main_context(&ctx, store, start.into(), vec![])
     } else {
         trace!(%pid, %tid, "re-invoking thread_spawn");
-        let start = unsafe { ctx.data(&store).inner() }
+        let start = ctx
+            .data(&store)
+            .inner()
+            .static_module_instance_handles()
+            .unwrap()
             .thread_spawn
             .clone()
             .unwrap();
-        start.call(&mut store, 0, 0)
+        let params = vec![0i32.into(), 0i32.into()];
+        ContextSwitchingEnvironment::run_main_context(&ctx, store, start.into(), params)
     };
     if let Err(err) = err {
         match err.downcast::<WasiError>() {

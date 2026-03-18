@@ -1,15 +1,22 @@
 [package]
 name = "macro-wasmer-universal-test"
-version = "4.3.7"
-edition = "2021"
-license = "MIT"
 description = "Universal test macro for wasmer-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-proc-quote = "0.4.0"
-proc-macro2 = "1.0.43"     
-syn = { version = "1.0.99", features = ["full"] }
-quote = "1.0.21"
+proc-macro2.workspace = true
+syn = { workspace = true, default-features = false, features = [
+    "full",
+    "parsing",
+    "printing",
+    "visit-mut",
+    "clone-impls",
+    "extra-traits",
+    "proc-macro",
+] }
+quote.workspace = true

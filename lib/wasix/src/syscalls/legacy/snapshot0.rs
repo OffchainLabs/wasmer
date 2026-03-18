@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use tracing::{field, instrument, trace_span};
 use wasmer::{AsStoreMut, AsStoreRef, FunctionEnvMut, Memory, WasmPtr};
 use wasmer_wasix_types::wasi::{
@@ -7,30 +9,25 @@ use wasmer_wasix_types::wasi::{
 };
 
 use crate::{
-    mem_error_to_wasi,
+    Memory32, MemorySize, WasiEnv, WasiError, mem_error_to_wasi,
     os::task::thread::WasiThread,
     state::{PollEventBuilder, PollEventSet},
     syscalls::types,
     syscalls::{self, handle_rewind},
-    Memory32, MemorySize, WasiEnv, WasiError,
 };
 
 /// Wrapper around `syscalls::fd_filestat_get` for old Snapshot0
-#[instrument(level = "debug", skip_all, ret)]
+#[instrument(level = "trace", skip_all, ret)]
 pub fn fd_filestat_get(
     mut ctx: FunctionEnvMut<WasiEnv>,
     fd: Fd,
     buf: WasmPtr<Snapshot0Filestat, Memory32>,
 ) -> Errno {
-    let env = ctx.data();
-    let memory = unsafe { env.memory_view(&ctx) };
-    let result = syscalls::fd_filestat_get_old::<Memory32>(ctx.as_mut(), fd, buf);
-
-    result
+    syscalls::fd_filestat_get_old::<Memory32>(ctx.as_mut(), fd, buf)
 }
 
 /// Wrapper around `syscalls::path_filestat_get` for old Snapshot0
-#[instrument(level = "debug", skip_all, ret)]
+#[instrument(level = "trace", skip_all, ret)]
 pub fn path_filestat_get(
     mut ctx: FunctionEnvMut<WasiEnv>,
     fd: Fd,
@@ -39,18 +36,12 @@ pub fn path_filestat_get(
     path_len: u32,
     buf: WasmPtr<Snapshot0Filestat, Memory32>,
 ) -> Errno {
-    let env = ctx.data();
-    let memory = unsafe { env.memory_view(&ctx) };
-
-    let result =
-        syscalls::path_filestat_get_old::<Memory32>(ctx.as_mut(), fd, flags, path, path_len, buf);
-
-    result
+    syscalls::path_filestat_get_old::<Memory32>(ctx.as_mut(), fd, flags, path, path_len, buf)
 }
 
 /// Wrapper around `syscalls::fd_seek` with extra logic to remap the values
 /// of `Whence`
-#[instrument(level = "debug", skip_all, ret)]
+#[instrument(level = "trace", skip_all, ret)]
 pub fn fd_seek(
     ctx: FunctionEnvMut<WasiEnv>,
     fd: Fd,
@@ -62,7 +53,7 @@ pub fn fd_seek(
         Snapshot0Whence::Cur => Whence::Cur,
         Snapshot0Whence::End => Whence::End,
         Snapshot0Whence::Set => Whence::Set,
-        Snapshot0Whence::Unknown => return Ok(Errno::Inval),
+        _ => return Ok(Errno::Inval),
     };
     syscalls::fd_seek::<Memory32>(ctx, fd, offset, new_whence, newoffset)
 }
@@ -77,10 +68,11 @@ pub fn poll_oneoff<M: MemorySize>(
     nsubscriptions: u32,
     nevents: WasmPtr<u32, Memory32>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+    WasiEnv::do_pending_operations(&mut ctx)?;
 
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
+
     let mut subscriptions = Vec::new();
     let in_origs = wasi_try_mem_ok!(in_.slice(&memory, nsubscriptions));
     let in_origs = wasi_try_mem_ok!(in_origs.read_to_vec());
@@ -112,7 +104,7 @@ pub fn poll_oneoff<M: MemorySize>(
                         nbytes: 0,
                         flags: Eventrwflags::empty(),
                     },
-                    Eventtype::Unknown => return Errno::Inval,
+                    _ => return Errno::Inval,
                 },
             };
             wasi_try_mem!(event_array.index(events_seen as u64).write(event));

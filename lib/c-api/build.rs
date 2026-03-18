@@ -50,9 +50,6 @@ const WASI_FEATURE_AS_C_DEFINE: &str = "WASMER_WASI_ENABLED";
 const MIDDLEWARES_FEATURE_AS_C_DEFINE: &str = "WASMER_MIDDLEWARES_ENABLED";
 
 #[allow(unused)]
-const EMSCRIPTEN_FEATURE_AS_C_DEFINE: &str = "WASMER_EMSCRIPTEN_ENABLED";
-
-#[allow(unused)]
 const JSC_FEATURE_AS_C_DEFINE: &str = "WASMER_JSC_BACKEND";
 
 macro_rules! map_feature_as_c_define {
@@ -74,6 +71,9 @@ macro_rules! map_feature_as_c_define {
 }
 
 fn main() {
+    // TODO: perhaps the "yes" value is not needed here?
+    println!(r#"cargo::rustc-check-cfg=cfg(__cbindgen_hack__, values("yes"))"#);
+
     if !running_self() {
         return;
     }
@@ -141,8 +141,7 @@ fn build_wasm_c_api_headers(crate_dir: &str, out_dir: &str) {
 #if !defined(WASMER_H_PRELUDE)
 
 #define WASMER_H_PRELUDE
-{pre_header}"#,
-        pre_header = PRE_HEADER
+{PRE_HEADER}"#,
     );
 
     map_feature_as_c_define!("jsc", JSC_FEATURE_AS_C_DEFINE, pre_header);
@@ -150,7 +149,6 @@ fn build_wasm_c_api_headers(crate_dir: &str, out_dir: &str) {
     map_feature_as_c_define!("compiler", COMPILER_FEATURE_AS_C_DEFINE, pre_header);
     map_feature_as_c_define!("wasi", WASI_FEATURE_AS_C_DEFINE, pre_header);
     map_feature_as_c_define!("middlewares", MIDDLEWARES_FEATURE_AS_C_DEFINE, pre_header);
-    map_feature_as_c_define!("emscripten", EMSCRIPTEN_FEATURE_AS_C_DEFINE, pre_header);
 
     add_wasmer_version(&mut pre_header);
 
@@ -227,7 +225,6 @@ fn new_builder(language: Language, crate_dir: &str, include_guard: &str, header:
         .with_define("feature", "universal", UNIVERSAL_FEATURE_AS_C_DEFINE)
         .with_define("feature", "compiler", COMPILER_FEATURE_AS_C_DEFINE)
         .with_define("feature", "wasi", WASI_FEATURE_AS_C_DEFINE)
-        .with_define("feature", "emscripten", EMSCRIPTEN_FEATURE_AS_C_DEFINE)
 }
 
 fn build_inline_c_env_vars() {
@@ -250,10 +247,7 @@ fn build_inline_c_env_vars() {
     );
 
     if let Ok(compiler_engine) = env::var("TEST") {
-        println!(
-            "cargo:rustc-env=INLINE_C_RS_TEST={test}",
-            test = compiler_engine
-        );
+        println!("cargo:rustc-env=INLINE_C_RS_TEST={compiler_engine}");
     }
 
     println!(
@@ -299,6 +293,7 @@ fn build_cdylib_link_arg() {
         }
 
         ("macos", _) | ("ios", _) => {
+            #[allow(clippy::uninlined_format_args)]
             lines.push(format!(
                 "-Wl,-install_name,@rpath/libwasmer.dylib,-current_version,{x}.{y}.{z},-compatibility_version,{x}",
                 x = version_major,
@@ -323,7 +318,7 @@ fn build_cdylib_link_arg() {
     }
 
     for line in lines {
-        println!("cargo:rustc-cdylib-link-arg={}", line);
+        println!("cargo:rustc-cdylib-link-arg={line}");
     }
 }
 
@@ -335,13 +330,15 @@ fn shared_object_dir() -> PathBuf {
     assert_eq!(shared_object_dir.file_name(), Some(OsStr::new("out")));
     shared_object_dir.pop();
 
-    assert!(shared_object_dir
-        .file_name()
-        .as_ref()
-        .unwrap()
-        .to_string_lossy()
-        .to_string()
-        .starts_with("wasmer-c-api"));
+    assert!(
+        shared_object_dir
+            .file_name()
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+            .starts_with("wasmer-c-api")
+    );
     shared_object_dir.pop();
 
     assert_eq!(shared_object_dir.file_name(), Some(OsStr::new("build")));

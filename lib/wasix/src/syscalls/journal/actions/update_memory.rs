@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
+impl<'a> JournalSyscallPlayer<'a, '_> {
     #[allow(clippy::result_large_err)]
     pub(crate) unsafe fn action_update_compressed_memory(
         &mut self,
@@ -24,8 +24,10 @@ impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
             });
         } else {
             tracing::trace!("Replay journal - UpdateMemory");
-            JournalEffector::apply_compressed_memory(&mut self.ctx, region, &compressed_data)
-                .map_err(anyhow_err_to_runtime_err)?;
+            unsafe {
+                JournalEffector::apply_compressed_memory(&mut self.ctx, region, &compressed_data)
+            }
+            .map_err(anyhow_err_to_runtime_err)?;
         }
         Ok(())
     }

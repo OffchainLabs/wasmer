@@ -1,18 +1,18 @@
 use crate::{
     commands::{
+        AsyncCliCommand,
         package::{
             common::{wait::*, *},
             push::PackagePush,
             tag::PackageTag,
         },
-        AsyncCliCommand,
     },
     config::WasmerEnv,
 };
 use colored::Colorize;
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 use wasmer_config::package::{Manifest, PackageIdent};
 
 /// Publish (push and tag) a package to the registry.

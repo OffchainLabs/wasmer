@@ -6,7 +6,7 @@ use crate::config::WasmerEnv;
 use super::AsyncCliCommand;
 
 #[derive(Debug, Parser)]
-/// The options for the `wasmer whoami` subcommand
+/// Print the current user and where is logged into
 pub struct Whoami {
     #[clap(flatten)]
     env: WasmerEnv,
@@ -20,7 +20,7 @@ impl AsyncCliCommand for Whoami {
     async fn run_async(self) -> Result<Self::Output, anyhow::Error> {
         let client = self.env.client_unauthennticated()?;
         let host_str = self.env.registry_public_url()?.host_str().unwrap().bold();
-        let user = wasmer_api::query::current_user(&client)
+        let user = wasmer_backend_api::query::current_user(&client)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Not logged in registry {host_str}"))?;
         println!(
