@@ -247,30 +247,6 @@ impl UnwindRegistry {
         }
     }
 
-    // pub(crate) fn register_compact_unwind(
-    //     &mut self,
-    //     compact_unwind: Option<&[u8]>,
-    //     eh_personality_addr_in_got: Option<usize>,
-    // ) -> Result<(), String> {
-    //     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    //     unsafe {
-    //         if let Some(slice) = compact_unwind {
-    //             self.compact_unwind_mgr.read_compact_unwind_section(
-    //                 slice.as_ptr() as _,
-    //                 slice.len(),
-    //                 eh_personality_addr_in_got,
-    //             )?;
-    //         }
-    //     }
-
-    //     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    //     {
-    //         _ = compact_unwind;
-    //         _ = eh_personality_addr_in_got;
-    //     }
-    //     Ok(())
-    // }
-
     /// Publishes all registered functions (coming from .eh_frame sections).
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn publish_eh_frame(&mut self, eh_frame: Option<&[u8]>) -> Result<(), String> {

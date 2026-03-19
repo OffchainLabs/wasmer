@@ -455,9 +455,6 @@ impl Artifact {
         // Make all code compiled thus far executable.
         engine_inner.publish_compiled_code();
 
-        // TODO: do we need this?
-        // engine_inner.publish_eh_frame(eh_frame)?;
-
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(compact_unwind) = compact_unwind {
             engine_inner.publish_compact_unwind(
