@@ -120,6 +120,26 @@ impl Store {
         self.inner.store.engine_mut()
     }
 
+    #[cfg(feature = "sys")]
+    #[inline]
+    /// Cleaning current store context, see StoreContext::force_clean
+    /// for details
+    pub fn force_clean(&mut self) {
+        unsafe {
+            StoreContext::force_clean(self.id());
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    #[inline]
+    /// Re-create current store context, see StoreContext::force_create
+    /// for details
+    pub fn force_create(&mut self) {
+        unsafe {
+            StoreContext::force_create(self.as_store_mut().inner as *mut _);
+        }
+    }
+
     /// Checks whether two stores are identical. A store is considered
     /// equal to another store if both have the same engine.
     pub fn same(a: &Self, b: &Self) -> bool {

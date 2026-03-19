@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use object::{
-    FileFlags, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind, SymbolFlags,
+    RelocationEncoding, RelocationFlags, RelocationKind, SectionKind, SymbolFlags,
     SymbolKind, SymbolScope, elf, macho,
     write::{
         Object, Relocation, StandardSection, StandardSegment, Symbol as ObjSymbol, SymbolId,
@@ -67,15 +67,15 @@ pub fn get_object_for_target(triple: &Triple) -> Result<Object<'static>, ObjectE
         Endianness::Big => object::Endianness::Big,
     };
 
-    let mut object = Object::new(obj_binary_format, obj_architecture, obj_endianness);
+    let object = Object::new(obj_binary_format, obj_architecture, obj_endianness);
 
-    if let Architecture::Riscv64(_) = triple.architecture {
-        object.flags = FileFlags::Elf {
-            e_flags: elf::EF_RISCV_FLOAT_ABI_DOUBLE,
-            os_abi: 2,
-            abi_version: 0,
-        };
-    }
+    // if let Architecture::Riscv64(_) = triple.architecture {
+    //     object.flags = FileFlags::Elf {
+    //         e_flags: elf::EF_RISCV_FLOAT_ABI_DOUBLE,
+    //         os_abi: 2,
+    //         abi_version: 0,
+    //     };
+    // }
 
     Ok(object)
 }

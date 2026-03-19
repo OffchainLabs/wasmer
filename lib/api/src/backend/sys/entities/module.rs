@@ -219,6 +219,17 @@ impl Module {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Extracts all local function locations for external usage
+    /// 3 parameters are: local function index, starting address, function length
+    pub fn local_function_infos(&self) -> Vec<(u32, usize, usize)> {
+        self.artifact
+            .finished_function_extents()
+            .into_iter()
+            .map(|(index, extent)| (index.as_u32(), extent.ptr.0 as usize, extent.length))
+            .collect()
+    }
+
     pub(crate) fn name(&self) -> Option<&str> {
         self.info().name.as_deref()
     }

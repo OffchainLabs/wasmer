@@ -149,6 +149,42 @@ impl StoreContext {
         })
     }
 
+    /// # Safety
+    ///
+    /// Only use this in cases where you know some other code is in process
+    /// of StorePtrWrapper (and can trigger a drop). One example is using
+    /// wasmer function in coroutines which can yield.
+    pub(crate) unsafe fn force_clean(id: StoreId) {
+        if !Self::is_active(id) {
+            return;
+        }
+        STORE_CONTEXT_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            let top = stack.pop().expect("An entry must exist!");
+            assert_eq!(top.id, id);
+        });
+    }
+
+    /// # Safety
+    ///
+    /// Only use this in cases where you know some other code is in process
+    /// of StorePtrWrapper (and can trigger a drop). One example is using
+    /// wasmer function in coroutines which can yield.
+    pub(crate) unsafe fn force_create(store_ptr: *mut StoreInner) {
+        let store_id = unsafe { store_ptr.as_ref().unwrap().objects.id() };
+        if Self::is_active(store_id) {
+            return;
+        }
+        STORE_CONTEXT_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            stack.push(Self {
+                id: store_id,
+                borrow_count: 1,
+                entry: UnsafeCell::new(StoreContextEntry::Sync(store_ptr)),
+            });
+        });
+    }
+
     /// Returns true if there are no active store context entries.
     pub(crate) fn is_empty() -> bool {
         STORE_CONTEXT_STACK.with(|cell| {
@@ -346,6 +382,7 @@ impl Drop for StorePtrWrapper {
         let id = self.as_mut().objects_mut().id();
         STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
+            let ids: Vec<_> = stack.iter().map(|s| (s.id, s.borrow_count)).collect();
             let top = stack
                 .last_mut()
                 .expect("No store context installed on this thread");

@@ -213,9 +213,9 @@ fn apply_relocation(
         RelocationKind::Aarch64AdrPrelPgHi21 => unsafe {
             let (reloc_address, delta) = r.for_address(body, target_func_address as u64);
 
-            let delta = delta as isize;
+            let delta = delta as i64;
             assert!(
-                ((-1 << 32)..(1 << 32)).contains(&delta),
+                ((-1i64 << 32)..(1i64 << 32)).contains(&delta),
                 "can't generate page-relative relocation with ±4GB `adrp` instruction"
             );
 

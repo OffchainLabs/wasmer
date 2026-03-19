@@ -5,7 +5,7 @@ use crate::{InternalStoreHandle, VMContext, VMExceptionObj};
 mod dwarf;
 
 cfg_if::cfg_if! {
-    if #[cfg(any(target_env = "msvc", target_family = "wasm"))] {
+    if #[cfg(any(target_env = "msvc", target_family = "wasm", target_os = "zkvm"))] {
         /// The implementation of Wasmer's personality function.
         ///
         /// # Safety

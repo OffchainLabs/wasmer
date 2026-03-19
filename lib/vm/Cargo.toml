@@ -63,6 +63,7 @@ default = []
 enable-serde = ["serde", "indexmap/serde", "wasmer-types/enable-serde"]
 artifact-size = ["dep:loupe", "wasmer-types/artifact-size"]
 sanitizer = ["corosensei/sanitizer"]
+force-baremetal = []
 
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]

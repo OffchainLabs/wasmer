@@ -135,6 +135,142 @@ impl UnwindRegistry {
         Ok(())
     }
 
+    /// Publishes all registered functions.
+    pub fn publish(&mut self, eh_frame: Option<&[u8]>) -> Result<(), String> {
+        if self.published {
+            return Err("unwind registry has already been published".to_string());
+        }
+
+        if let Some(eh_frame) = eh_frame {
+            unsafe {
+                self.register_frames(eh_frame);
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.compact_unwind_mgr
+                .finalize()
+                .map_err(|v| v.to_string())?;
+            self.compact_unwind_mgr.register();
+        }
+
+        self.published = true;
+
+        Ok(())
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn register_frames(&mut self, eh_frame: &[u8]) {
+        // Register atexit handler that will tell us if exit has been called.
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            let result = libc::atexit(atexit_handler);
+            assert_eq!(result, 0, "libc::atexit must succeed");
+        });
+
+        assert!(
+            !EXIT_CALLED.load(Ordering::SeqCst),
+            "Cannot register unwind information during the process exit"
+        );
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            // Special call for macOS on aarch64 to register the `.eh_frame` section.
+            // TODO: I am not 100% sure if it's correct to never deregister the `.eh_frame` section. It was this way before
+            // I started working on this, so I kept it that way.
+            unsafe {
+                compact_unwind::__unw_add_dynamic_eh_frame_section(eh_frame.as_ptr() as usize);
+            }
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            // Validate that the `.eh_frame` is well-formed before registering it.
+            // See https://refspecs.linuxfoundation.org/LSB_3.0.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html for more details.
+            // We put the frame records into a vector before registering them, because
+            // calling `__register_frame` with invalid data can cause segfaults.
+
+            // Pointers to the registrations that will be registered with `__register_frame`.
+            // For libgcc based systems, these are CIEs.
+            // For libunwind based systems, these are FDEs.
+            let mut records_to_register = Vec::new();
+
+            let mut current = 0;
+            let mut last_len = 0;
+            let using_libunwind = using_libunwind();
+            while current <= (eh_frame.len() - size_of::<u32>()) {
+                // If a CFI or a FDE starts with 0u32 it is a terminator.
+                let len = u32::from_ne_bytes(eh_frame[current..(current + 4)].try_into().unwrap());
+                if len == 0 {
+                    current += size_of::<u32>();
+                    last_len = 0;
+                    continue;
+                }
+                // The first record after a terminator is always a CIE.
+                let is_cie = last_len == 0;
+                last_len = len;
+                let record = eh_frame.as_ptr() as usize + current;
+                current = current + len as usize + 4;
+
+                if using_libunwind {
+                    // For libunwind based systems, `__register_frame` takes a pointer to an FDE.
+                    if !is_cie {
+                        // Every record that's not a CIE is an FDE.
+                        records_to_register.push(record);
+                    }
+                } else {
+                    // For libgcc based systems, `__register_frame` takes a pointer to a CIE.
+                    if is_cie {
+                        records_to_register.push(record);
+                    }
+                }
+            }
+
+            assert_eq!(
+                last_len, 0,
+                "The last record in the `.eh_frame` must be a terminator (but it actually has length {last_len})"
+            );
+            assert_eq!(
+                current,
+                eh_frame.len(),
+                "The `.eh_frame` must be finished after the last record",
+            );
+
+            for record in records_to_register {
+                // Register the CFI with libgcc
+                unsafe {
+                    __register_frame(record as *const u8);
+                }
+                self.registrations.push(record);
+            }
+        }
+    }
+
+    // pub(crate) fn register_compact_unwind(
+    //     &mut self,
+    //     compact_unwind: Option<&[u8]>,
+    //     eh_personality_addr_in_got: Option<usize>,
+    // ) -> Result<(), String> {
+    //     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    //     unsafe {
+    //         if let Some(slice) = compact_unwind {
+    //             self.compact_unwind_mgr.read_compact_unwind_section(
+    //                 slice.as_ptr() as _,
+    //                 slice.len(),
+    //                 eh_personality_addr_in_got,
+    //             )?;
+    //         }
+    //     }
+
+    //     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    //     {
+    //         _ = compact_unwind;
+    //         _ = eh_personality_addr_in_got;
+    //     }
+    //     Ok(())
+    // }
+
     /// Publishes all registered functions (coming from .eh_frame sections).
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn publish_eh_frame(&mut self, eh_frame: Option<&[u8]>) -> Result<(), String> {

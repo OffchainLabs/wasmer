@@ -51,6 +51,7 @@ impl ModuleHash {
         Self(hash)
     }
 
+    #[cfg(not(target_os = "zkvm"))]
     /// Generate a random [`ModuleHash`]. For when you don't care about caches.
     pub fn random() -> Self {
         let mut bytes = [0_u8; _];
