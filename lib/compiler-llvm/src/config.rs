@@ -290,14 +290,6 @@ impl LLVM {
                     machine_code: true,
                 })
             }
-            Architecture::Riscv32(_) => InkwellTarget::initialize_riscv(&InitializationConfig {
-                asm_parser: true,
-                asm_printer: true,
-                base: true,
-                disassembler: true,
-                info: true,
-                machine_code: true,
-            }),
             Architecture::LoongArch64 => {
                 InkwellTarget::initialize_loongarch(&InitializationConfig {
                     asm_parser: true,

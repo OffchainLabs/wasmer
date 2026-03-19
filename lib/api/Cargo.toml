@@ -61,7 +61,7 @@ wasmer-derive = { path = "../derive", version = "=7.1.0-rc.2" }
 wasmer-types = { path = "../types", version = "=7.1.0-rc.2" }
 target-lexicon = { workspace = true, default-features = false }
 # - Optional dependencies for `sys`.
-wasmer-compiler-singlepass = { path = "../compiler-singlepass", version = "=7.1.0-rc.2", optional = true }
+wasmer-compiler-singlepass = { path = "../compiler-singlepass", version = "=7.1.0-rc.2", optional = true, default-features = false, features = ["std", "unwind"] }
 wasmer-compiler-cranelift = { path = "../compiler-cranelift", version = "=7.1.0-rc.2", optional = true }
 wasmer-compiler-llvm = { path = "../compiler-llvm", version = "=7.1.0-rc.2", optional = true }
 corosensei = { workspace = true, optional = true }
@@ -145,6 +145,7 @@ compiler = [
 	"wasmer-compiler/compiler",
 ]
 singlepass = ["compiler", "wasmer-compiler-singlepass"]
+singlepass_rayon = ["wasmer-compiler-singlepass?/rayon"]
 cranelift = ["compiler", "wasmer-compiler-cranelift"]
 llvm = ["compiler", "wasmer-compiler-llvm"]
 
