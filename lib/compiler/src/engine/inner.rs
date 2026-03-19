@@ -499,23 +499,20 @@ impl EngineInner {
         self.code_memory.last_mut().unwrap().publish();
     }
 
-    #[cfg(not(any(
-        target_arch = "wasm32",
-        all(target_os = "macos", target_arch = "aarch64")
-    )))]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     /// Register DWARF-type exception handling information associated with the code.
     pub(crate) fn publish_eh_frame(&mut self, eh_frame: Option<&[u8]>) -> Result<(), CompileError> {
         self.code_memory
             .last_mut()
             .unwrap()
             .unwind_registry_mut()
-            .publish(eh_frame)
+            .publish_eh_frame(eh_frame)
             .map_err(|e| {
                 CompileError::Resource(format!("Error while publishing the unwind code: {e}"))
             })?;
         Ok(())
     }
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     /// Register macos-specific exception handling information associated with the code.
     pub(crate) fn publish_compact_unwind(
