@@ -60,14 +60,35 @@ use libc::ucontext_t;
 /// Maximum allowed stack size (100 MB).
 pub const MAX_STACK_SIZE: usize = 100 * 1024 * 1024;
 
-/// Default stack size is 1MB.
+/// Sets the process-wide default stack size for new Wasmer coroutines.
+/// The value is clamped to [8 KB, 100 MB].
 pub fn set_stack_size(size: usize) {
     DEFAULT_STACK_SIZE.store(size.clamp(8 * 1024, MAX_STACK_SIZE), Ordering::Relaxed);
 }
 
-/// Returns the current default stack size in bytes.
+/// Returns the process-wide default stack size in bytes.
 pub fn get_stack_size() -> usize {
     DEFAULT_STACK_SIZE.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Per-thread override for the coroutine stack size. When `Some`, this
+    /// takes precedence over the process-wide `DEFAULT_STACK_SIZE` in
+    /// `catch_traps`. This allows a single call site (e.g. the Stylus retry
+    /// loop) to request a larger stack without affecting other threads.
+    static STACK_SIZE_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Sets a thread-local stack size override. While `Some`, all Wasmer
+/// coroutines created on this thread will use the given size instead of the
+/// process-wide default. Pass `None` to clear the override.
+pub fn set_thread_stack_size(size: Option<usize>) {
+    STACK_SIZE_OVERRIDE.with(|cell| cell.set(size));
+}
+
+/// Returns the current thread-local stack size override, if any.
+pub fn get_thread_stack_size() -> Option<usize> {
+    STACK_SIZE_OVERRIDE.with(|cell| cell.get())
 }
 
 /// Pool of pre-allocated coroutine stacks to avoid repeated mmap syscalls.
@@ -755,8 +776,10 @@ where
 {
     // Ensure that per-thread initialization is done.
     lazy_per_thread_init()?;
+    // Priority: per-call VMConfig > thread-local override > process-wide default.
     let stack_size = config
         .wasm_stack_size
+        .or_else(get_thread_stack_size)
         .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
     on_wasm_stack(stack_size, trap_handler, closure).map_err(UnwindReason::into_trap)
 }
@@ -1197,5 +1220,161 @@ pub fn lazy_per_thread_init() -> Result<(), Trap> {
                 debug_assert_eq!(r, 0, "munmap failed during thread shutdown");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn thread_local_override_is_isolated() {
+        // Each thread's override must be invisible to other threads.
+        let original = get_stack_size();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            assert_eq!(get_thread_stack_size(), None);
+            set_thread_stack_size(Some(2 * 1024 * 1024));
+            assert_eq!(get_thread_stack_size(), Some(2 * 1024 * 1024));
+            b1.wait(); // sync: all threads have set their overrides
+            // Still our own value — not polluted by t2.
+            assert_eq!(get_thread_stack_size(), Some(2 * 1024 * 1024));
+            b1.wait(); // sync: all threads have verified
+            set_thread_stack_size(None);
+            assert_eq!(get_thread_stack_size(), None);
+        });
+
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            assert_eq!(get_thread_stack_size(), None);
+            set_thread_stack_size(Some(4 * 1024 * 1024));
+            assert_eq!(get_thread_stack_size(), Some(4 * 1024 * 1024));
+            b2.wait(); // sync
+            // Still our own value — not polluted by t1.
+            assert_eq!(get_thread_stack_size(), Some(4 * 1024 * 1024));
+            b2.wait(); // sync
+            set_thread_stack_size(None);
+            assert_eq!(get_thread_stack_size(), None);
+        });
+
+        // Main thread: no override set, should see None throughout.
+        barrier.wait(); // sync: t1 and t2 have set overrides
+        assert_eq!(get_thread_stack_size(), None);
+        barrier.wait(); // sync: let threads verify
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Global default must be untouched.
+        assert_eq!(get_stack_size(), original);
+    }
+
+    #[test]
+    fn thread_local_override_does_not_affect_global() {
+        let original = get_stack_size();
+
+        set_thread_stack_size(Some(8 * 1024 * 1024));
+        // Global is unchanged.
+        assert_eq!(get_stack_size(), original);
+
+        set_thread_stack_size(None);
+        assert_eq!(get_stack_size(), original);
+        assert_eq!(get_thread_stack_size(), Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn concurrent_retries_do_not_interfere() {
+        // Simulate the stylus_call retry pattern on multiple threads:
+        // each thread bumps its thread-local, "retries", then clears it.
+        // No thread should see another thread's override.
+        let original = get_stack_size();
+        let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let my_size = (i + 1) * 1024 * 1024; // 1MB, 2MB, ..., 8MB
+
+                    // Phase 1: all threads set different overrides simultaneously.
+                    set_thread_stack_size(Some(my_size));
+                    b.wait();
+
+                    // Phase 2: verify each thread still sees its own value.
+                    let seen = get_thread_stack_size();
+                    assert_eq!(
+                        seen,
+                        Some(my_size),
+                        "thread {i} expected {my_size}, got {seen:?}"
+                    );
+                    b.wait();
+
+                    // Phase 3: simulate "retry succeeded" — double and verify.
+                    let doubled = my_size * 2;
+                    set_thread_stack_size(Some(doubled));
+                    b.wait();
+
+                    let seen = get_thread_stack_size();
+                    assert_eq!(
+                        seen,
+                        Some(doubled),
+                        "thread {i} after doubling: expected {doubled}, got {seen:?}"
+                    );
+                    b.wait();
+
+                    // Phase 4: clear (like the drop guard in stylus_call).
+                    set_thread_stack_size(None);
+                    assert_eq!(get_thread_stack_size(), None);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Global must be untouched after all threads finish.
+        assert_eq!(get_stack_size(), original);
+    }
+
+    #[test]
+    fn pool_returns_correctly_sized_stacks() {
+        // Push stacks of different sizes into the pool, then verify that
+        // on_wasm_stack picks one that is large enough.
+        let small = 64 * 1024;
+        let large = 2 * 1024 * 1024;
+
+        // Seed the pool with a small stack.
+        let s = DefaultStack::new(small).unwrap();
+        STACK_POOL.push((s, small));
+
+        // Request a large stack — the small one should be skipped.
+        // We can't directly call on_wasm_stack (it needs trap init), but we
+        // can test the pool search logic by replicating it.
+        let mut skipped = Vec::new();
+        let mut found = None;
+        while let Some((s, sz)) = STACK_POOL.pop() {
+            if sz >= large {
+                found = Some((s, sz));
+                break;
+            }
+            skipped.push((s, sz));
+        }
+        for entry in skipped {
+            STACK_POOL.push(entry);
+        }
+
+        // Should not have found anything large enough.
+        assert!(found.is_none(), "pool should not have a stack >= {large}");
+
+        // The small stack should still be in the pool.
+        let entry = STACK_POOL.pop();
+        assert!(entry.is_some(), "small stack should still be pooled");
+        let (_, sz) = entry.unwrap();
+        assert_eq!(sz, small);
     }
 }

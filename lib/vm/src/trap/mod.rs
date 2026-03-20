@@ -10,8 +10,9 @@ mod traphandlers;
 
 pub use trap::Trap;
 pub use traphandlers::{
-    MAX_STACK_SIZE, TrapHandlerFn, VMConfig, catch_traps, get_stack_size, on_host_stack,
-    raise_lib_trap, raise_user_trap, set_stack_size, wasmer_call_trampoline,
+    MAX_STACK_SIZE, TrapHandlerFn, VMConfig, catch_traps, get_stack_size, get_thread_stack_size,
+    on_host_stack, raise_lib_trap, raise_user_trap, set_stack_size, set_thread_stack_size,
+    wasmer_call_trampoline,
 };
 pub use traphandlers::{init_traps, resume_panic};
 pub use wasmer_types::TrapCode;
