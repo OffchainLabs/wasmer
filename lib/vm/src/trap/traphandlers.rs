@@ -82,8 +82,11 @@ thread_local! {
 /// Sets a thread-local stack size override. While `Some`, all Wasmer
 /// coroutines created on this thread will use the given size instead of the
 /// process-wide default. Pass `None` to clear the override.
+/// The value is clamped to [8 KB, MAX_STACK_SIZE] just like `set_stack_size`.
 pub fn set_thread_stack_size(size: Option<usize>) {
-    STACK_SIZE_OVERRIDE.with(|cell| cell.set(size));
+    STACK_SIZE_OVERRIDE.with(|cell| {
+        cell.set(size.map(|s| s.clamp(8 * 1024, MAX_STACK_SIZE)))
+    });
 }
 
 /// Returns the current thread-local stack size override, if any.
@@ -760,6 +763,15 @@ pub unsafe fn wasmer_call_trampoline(
     }
 }
 
+/// Resolves the effective stack size from the three-tier priority chain:
+/// per-call VMConfig > thread-local override > process-wide default.
+fn resolve_stack_size(config: &VMConfig) -> usize {
+    config
+        .wasm_stack_size
+        .or_else(get_thread_stack_size)
+        .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed))
+}
+
 /// Catches any wasm traps that happen within the execution of `closure`,
 /// returning them as a `Result`.
 ///
@@ -776,11 +788,7 @@ where
 {
     // Ensure that per-thread initialization is done.
     lazy_per_thread_init()?;
-    // Priority: per-call VMConfig > thread-local override > process-wide default.
-    let stack_size = config
-        .wasm_stack_size
-        .or_else(get_thread_stack_size)
-        .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
+    let stack_size = resolve_stack_size(config);
     on_wasm_stack(stack_size, trap_handler, closure).map_err(UnwindReason::into_trap)
 }
 
@@ -1024,10 +1032,14 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
         for entry in skipped {
             STACK_POOL.push(entry);
         }
-        found.unwrap_or_else(|| {
-            let s = DefaultStack::new(stack_size).unwrap();
-            (s, stack_size)
-        })
+        match found {
+            Some(entry) => entry,
+            None => {
+                let s = DefaultStack::new(stack_size)
+                    .map_err(|_| UnwindReason::LibTrap(Trap::oom()))?;
+                (s, stack_size)
+            }
+        }
     };
     let mut stack = scopeguard::guard(stack, |entry| STACK_POOL.push(entry));
 
@@ -1279,10 +1291,11 @@ mod tests {
         set_thread_stack_size(Some(8 * 1024 * 1024));
         // Global is unchanged.
         assert_eq!(get_stack_size(), original);
+        assert_eq!(get_thread_stack_size(), Some(8 * 1024 * 1024));
 
         set_thread_stack_size(None);
         assert_eq!(get_stack_size(), original);
-        assert_eq!(get_thread_stack_size(), Some(8 * 1024 * 1024));
+        assert_eq!(get_thread_stack_size(), None);
     }
 
     #[test]
@@ -1376,5 +1389,32 @@ mod tests {
         assert!(entry.is_some(), "small stack should still be pooled");
         let (_, sz) = entry.unwrap();
         assert_eq!(sz, small);
+    }
+
+    #[test]
+    fn resolve_stack_size_priority_chain() {
+        let global_default = get_stack_size();
+
+        // Case 1: no VMConfig override, no thread-local → uses global default.
+        set_thread_stack_size(None);
+        let config = VMConfig { wasm_stack_size: None };
+        assert_eq!(resolve_stack_size(&config), global_default);
+
+        // Case 2: thread-local set, VMConfig None → thread-local wins.
+        set_thread_stack_size(Some(4 * 1024 * 1024));
+        let config = VMConfig { wasm_stack_size: None };
+        assert_eq!(resolve_stack_size(&config), 4 * 1024 * 1024);
+
+        // Case 3: both thread-local and VMConfig set → VMConfig wins.
+        let config = VMConfig { wasm_stack_size: Some(2 * 1024 * 1024) };
+        assert_eq!(resolve_stack_size(&config), 2 * 1024 * 1024);
+
+        // Case 4: VMConfig set, no thread-local → VMConfig wins.
+        set_thread_stack_size(None);
+        let config = VMConfig { wasm_stack_size: Some(6 * 1024 * 1024) };
+        assert_eq!(resolve_stack_size(&config), 6 * 1024 * 1024);
+
+        // Cleanup.
+        set_thread_stack_size(None);
     }
 }
