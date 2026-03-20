@@ -84,9 +84,7 @@ thread_local! {
 /// process-wide default. Pass `None` to clear the override.
 /// The value is clamped to [8 KB, MAX_STACK_SIZE] just like `set_stack_size`.
 pub fn set_thread_stack_size(size: Option<usize>) {
-    STACK_SIZE_OVERRIDE.with(|cell| {
-        cell.set(size.map(|s| s.clamp(8 * 1024, MAX_STACK_SIZE)))
-    });
+    STACK_SIZE_OVERRIDE.with(|cell| cell.set(size.map(|s| s.clamp(8 * 1024, MAX_STACK_SIZE))));
 }
 
 /// Returns the current thread-local stack size override, if any.
@@ -1397,21 +1395,29 @@ mod tests {
 
         // Case 1: no VMConfig override, no thread-local → uses global default.
         set_thread_stack_size(None);
-        let config = VMConfig { wasm_stack_size: None };
+        let config = VMConfig {
+            wasm_stack_size: None,
+        };
         assert_eq!(resolve_stack_size(&config), global_default);
 
         // Case 2: thread-local set, VMConfig None → thread-local wins.
         set_thread_stack_size(Some(4 * 1024 * 1024));
-        let config = VMConfig { wasm_stack_size: None };
+        let config = VMConfig {
+            wasm_stack_size: None,
+        };
         assert_eq!(resolve_stack_size(&config), 4 * 1024 * 1024);
 
         // Case 3: both thread-local and VMConfig set → VMConfig wins.
-        let config = VMConfig { wasm_stack_size: Some(2 * 1024 * 1024) };
+        let config = VMConfig {
+            wasm_stack_size: Some(2 * 1024 * 1024),
+        };
         assert_eq!(resolve_stack_size(&config), 2 * 1024 * 1024);
 
         // Case 4: VMConfig set, no thread-local → VMConfig wins.
         set_thread_stack_size(None);
-        let config = VMConfig { wasm_stack_size: Some(6 * 1024 * 1024) };
+        let config = VMConfig {
+            wasm_stack_size: Some(6 * 1024 * 1024),
+        };
         assert_eq!(resolve_stack_size(&config), 6 * 1024 * 1024);
 
         // Cleanup.
