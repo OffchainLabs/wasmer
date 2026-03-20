@@ -57,9 +57,31 @@ struct ucontext_t {
 #[cfg(all(unix, not(all(target_arch = "aarch64", target_os = "macos"))))]
 use libc::ucontext_t;
 
+/// Maximum allowed stack size (100 MB).
+pub const MAX_STACK_SIZE: usize = 100 * 1024 * 1024;
+
 /// Default stack size is 1MB.
+/// Drains the stack pool so that subsequent calls allocate stacks with the new size.
 pub fn set_stack_size(size: usize) {
-    DEFAULT_STACK_SIZE.store(size.clamp(8 * 1024, 100 * 1024 * 1024), Ordering::Relaxed);
+    let clamped = size.clamp(8 * 1024, MAX_STACK_SIZE);
+    let old = DEFAULT_STACK_SIZE.swap(clamped, Ordering::Relaxed);
+    if old != clamped {
+        drain_stack_pool();
+    }
+}
+
+/// Returns the current default stack size in bytes.
+pub fn get_stack_size() -> usize {
+    DEFAULT_STACK_SIZE.load(Ordering::Relaxed)
+}
+
+/// Pool of pre-allocated coroutine stacks to avoid repeated mmap syscalls.
+static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<DefaultStack>> =
+    LazyLock::new(crossbeam_queue::SegQueue::new);
+
+/// Drains all cached stacks so that new stacks are allocated with the current size.
+fn drain_stack_pool() {
+    while STACK_POOL.pop().is_some() {}
 }
 
 cfg_if::cfg_if! {
@@ -971,13 +993,6 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     trap_handler: Option<*const TrapHandlerFn<'static>>,
     f: F,
 ) -> Result<T, UnwindReason> {
-    // Allocating a new stack is pretty expensive since it involves several
-    // system calls. We therefore keep a cache of pre-allocated stacks which
-    // allows them to be reused multiple times.
-    // FIXME(Amanieu): We should refactor this to avoid the lock.
-    static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<DefaultStack>> =
-        LazyLock::new(crossbeam_queue::SegQueue::new);
-
     let stack = STACK_POOL
         .pop()
         .unwrap_or_else(|| DefaultStack::new(stack_size).unwrap());
