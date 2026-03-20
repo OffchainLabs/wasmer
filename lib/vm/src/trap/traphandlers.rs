@@ -61,13 +61,8 @@ use libc::ucontext_t;
 pub const MAX_STACK_SIZE: usize = 100 * 1024 * 1024;
 
 /// Default stack size is 1MB.
-/// Drains the stack pool so that subsequent calls allocate stacks with the new size.
 pub fn set_stack_size(size: usize) {
-    let clamped = size.clamp(8 * 1024, MAX_STACK_SIZE);
-    let old = DEFAULT_STACK_SIZE.swap(clamped, Ordering::Relaxed);
-    if old != clamped {
-        drain_stack_pool();
-    }
+    DEFAULT_STACK_SIZE.store(size.clamp(8 * 1024, MAX_STACK_SIZE), Ordering::Relaxed);
 }
 
 /// Returns the current default stack size in bytes.
@@ -76,13 +71,10 @@ pub fn get_stack_size() -> usize {
 }
 
 /// Pool of pre-allocated coroutine stacks to avoid repeated mmap syscalls.
-static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<DefaultStack>> =
+/// Each entry is tagged with the size it was allocated at so that callers
+/// requesting a larger stack can skip undersized entries instead of reusing them.
+static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<(DefaultStack, usize)>> =
     LazyLock::new(crossbeam_queue::SegQueue::new);
-
-/// Drains all cached stacks so that new stacks are allocated with the current size.
-fn drain_stack_pool() {
-    while STACK_POOL.pop().is_some() {}
-}
 
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
@@ -993,13 +985,31 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     trap_handler: Option<*const TrapHandlerFn<'static>>,
     f: F,
 ) -> Result<T, UnwindReason> {
-    let stack = STACK_POOL
-        .pop()
-        .unwrap_or_else(|| DefaultStack::new(stack_size).unwrap());
-    let mut stack = scopeguard::guard(stack, |stack| STACK_POOL.push(stack));
+    // Try to reuse a pooled stack that is large enough. Undersized stacks are
+    // collected and returned to the pool after the search so we don't re-pop
+    // the same entry in a loop.
+    let stack = {
+        let mut found = None;
+        let mut skipped = Vec::new();
+        while let Some((s, sz)) = STACK_POOL.pop() {
+            if sz >= stack_size {
+                found = Some((s, sz));
+                break;
+            }
+            skipped.push((s, sz));
+        }
+        for entry in skipped {
+            STACK_POOL.push(entry);
+        }
+        found.unwrap_or_else(|| {
+            let s = DefaultStack::new(stack_size).unwrap();
+            (s, stack_size)
+        })
+    };
+    let mut stack = scopeguard::guard(stack, |entry| STACK_POOL.push(entry));
 
     // Create a coroutine with a new stack to run the function on.
-    let coro = ScopedCoroutine::with_stack(&mut *stack, move |yielder, ()| {
+    let coro = ScopedCoroutine::with_stack(&mut stack.0, move |yielder, ()| {
         // Save the yielder to TLS so that it can be used later.
         YIELDER.with(|cell| cell.set(Some(yielder.into())));
 
