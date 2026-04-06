@@ -69,6 +69,10 @@ pub enum TrapCode {
 
     /// An atomic memory access was attempted with an unaligned pointer.
     UnalignedAtomic = 10,
+
+    /// A memory.fill instruction was given a value that exceeds 8 bits.
+    /// Assigned 0x1000 to avoid conflicts with upstream wasmer additions.
+    MemoryFillValueOverflow = 0x1000,
 }
 
 impl TrapCode {
@@ -86,6 +90,7 @@ impl TrapCode {
             Self::BadConversionToInteger => "invalid conversion to integer",
             Self::UnreachableCodeReached => "unreachable",
             Self::UnalignedAtomic => "unaligned atomic access",
+            Self::MemoryFillValueOverflow => "memory.fill value exceeds 8 bits",
         }
     }
 }
@@ -104,6 +109,7 @@ impl Display for TrapCode {
             Self::BadConversionToInteger => "bad_toint",
             Self::UnreachableCodeReached => "unreachable",
             Self::UnalignedAtomic => "unalign_atom",
+            Self::MemoryFillValueOverflow => "memfill_val_ovf",
         };
         f.write_str(identifier)
     }
@@ -125,6 +131,7 @@ impl FromStr for TrapCode {
             "bad_toint" => Ok(Self::BadConversionToInteger),
             "unreachable" => Ok(Self::UnreachableCodeReached),
             "unalign_atom" => Ok(Self::UnalignedAtomic),
+            "memfill_val_ovf" => Ok(Self::MemoryFillValueOverflow),
             _ => Err(()),
         }
     }
@@ -148,7 +155,7 @@ mod tests {
     use super::*;
 
     // Everything but user-defined codes.
-    const CODES: [TrapCode; 11] = [
+    const CODES: [TrapCode; 12] = [
         TrapCode::StackOverflow,
         TrapCode::HeapAccessOutOfBounds,
         TrapCode::HeapMisaligned,
@@ -160,6 +167,7 @@ mod tests {
         TrapCode::BadConversionToInteger,
         TrapCode::UnreachableCodeReached,
         TrapCode::UnalignedAtomic,
+        TrapCode::MemoryFillValueOverflow,
     ];
 
     #[test]

@@ -360,6 +360,10 @@ pub(crate) unsafe fn memory_fill(
     val: u32,
     len: u32,
 ) -> Result<(), Trap> {
+    if val > 0xFF {
+        return Err(Trap::lib(TrapCode::MemoryFillValueOverflow));
+    }
+
     if dst
         .checked_add(len)
         .map_or(true, |m| usize::try_from(m).unwrap() > mem.current_length)
