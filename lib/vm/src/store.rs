@@ -46,6 +46,7 @@ pub struct StoreObjects {
     instances: Vec<VMInstance>,
     extern_objs: Vec<VMExternObj>,
     function_environments: Vec<VMFunctionEnvironment>,
+    stylus_version: u16,
 }
 
 impl StoreObjects {
@@ -57,6 +58,16 @@ impl StoreObjects {
     /// Sets the ID of this store
     pub fn set_id(&mut self, id: StoreId) {
         self.id = id;
+    }
+
+    /// Returns the Stylus version associated with this store.
+    pub fn stylus_version(&self) -> u16 {
+        self.stylus_version
+    }
+
+    /// Sets the Stylus version for this store.
+    pub fn set_stylus_version(&mut self, version: u16) {
+        self.stylus_version = version;
     }
 
     /// Returns a pair of mutable references from two handles.
