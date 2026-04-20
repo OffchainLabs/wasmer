@@ -3,6 +3,7 @@ use crate::{Trap, VMContext, VMFunctionBody};
 use std::any::Any;
 use std::error::Error;
 use std::mem;
+use bytesize::ByteSize;
 
 /// Dummy trap handler type for baremetal mode
 pub type TrapHandlerFn<'a> = ();
@@ -13,10 +14,23 @@ pub struct VMConfig {
     pub wasm_stack_size: Option<usize>,
 }
 
-/// Baremetal does not support setting stack size, the function is kept
-/// here to preserve APIs
+
+/// Baremetal does not support setting stack size, the const is kept here to preserve APIs
+pub const MAX_STACK_SIZE: usize = 0;
+
+/// Baremetal does not support setting stack size, the function is kept here to preserve APIs
 pub fn set_stack_size(_size: usize) {
     panic!("Setting stack size is not supported in baremetal feature!");
+}
+
+/// Baremetal does not support getting stack size, the function is kept here to preserve APIs
+pub fn get_stack_size() -> usize {
+    panic!("Getting stack size is not supported in baremetal feature!");
+}
+
+/// Baremetal does not support draining stack pool, the function is kept here to preserve APIs
+pub fn drain_stack_pool() {
+    panic!("Draining stack pool is not supported in baremetal feature!");
 }
 
 /// In baremetal mode, init_traps does nothing
