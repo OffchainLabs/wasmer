@@ -3,7 +3,6 @@ use crate::{Trap, VMContext, VMFunctionBody};
 use std::any::Any;
 use std::error::Error;
 use std::mem;
-use bytesize::ByteSize;
 
 /// Dummy trap handler type for baremetal mode
 pub type TrapHandlerFn<'a> = ();
