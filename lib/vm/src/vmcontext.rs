@@ -359,7 +359,12 @@ pub(crate) unsafe fn memory_fill(
     dst: u32,
     val: u32,
     len: u32,
+    stylus_version: u16,
 ) -> Result<(), Trap> {
+    if stylus_version < 3 && val > 0xFF {
+        return Err(Trap::lib(TrapCode::MemoryFillValueOverflow));
+    }
+
     if dst
         .checked_add(len)
         .map_or(true, |m| usize::try_from(m).unwrap() > mem.current_length)
