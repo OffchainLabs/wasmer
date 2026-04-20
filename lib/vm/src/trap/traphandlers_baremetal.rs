@@ -13,7 +13,6 @@ pub struct VMConfig {
     pub wasm_stack_size: Option<usize>,
 }
 
-
 /// Baremetal does not support setting stack size, the const is kept here to preserve APIs
 pub const MAX_STACK_SIZE: usize = 0;
 
