@@ -73,6 +73,7 @@ impl StoreObjects {
         exceptions: Vec<VMExceptionObj>,
         tags: Vec<VMTag>,
         function_environments: Vec<VMFunctionEnvironment>,
+        stylus_version: u16,
     ) -> Self {
         Self {
             id,
@@ -85,6 +86,7 @@ impl StoreObjects {
             function_environments,
             exceptions,
             tags,
+            stylus_version,
         }
     }
 

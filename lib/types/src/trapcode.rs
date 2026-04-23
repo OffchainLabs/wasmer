@@ -72,8 +72,8 @@ pub enum TrapCode {
     YieldOutsideAsyncContext = 13,
 
     /// A memory.fill instruction was given a value that exceeds 8 bits.
-    /// Assigned 0x1000 to avoid conflicts with upstream wasmer additions.
-    MemoryFillValueOverflow = 0x1000,
+    /// Assigned 255 to avoid conflicts with upstream wasmer additions.
+    MemoryFillValueOverflow = 255,
 }
 
 impl TrapCode {
