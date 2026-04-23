@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
+impl<'a> JournalSyscallPlayer<'a, '_> {
     #[allow(clippy::result_large_err)]
     pub(crate) unsafe fn action_snapshot(
         &mut self,
@@ -13,11 +13,11 @@ impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
         // in a clean state)
         let mut clear_ethereal = false;
         if self.journal_module_hash.is_some()
-            && Some(self.cur_module_hash) != self.journal_module_hash
+            && Some(&self.cur_module_hash) != self.journal_module_hash.as_ref()
         {
             tracing::error!(
                 "The WASM module hash does not match the journal module hash (journal_hash={:x?} vs module_hash{:x?}) - forcing a restart",
-                self.journal_module_hash.unwrap(),
+                self.journal_module_hash.as_ref().unwrap(),
                 self.cur_module_hash
             );
             self.clear_ethereal(differ_ethereal);
@@ -30,7 +30,7 @@ impl<'a, 'c> JournalSyscallPlayer<'a, 'c> {
         if let Some(ethereal_events) = differ_ethereal {
             for next in ethereal_events.drain(..) {
                 tracing::trace!("Replay(ether) snapshot event - {next:?}");
-                if let Err(err) = self.play_event(next, None) {
+                if let Err(err) = unsafe { self.play_event(next, None) } {
                     tracing::warn!("failed to replay event - {}", err);
                     return Err(err);
                 }

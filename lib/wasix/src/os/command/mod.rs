@@ -2,14 +2,75 @@ pub mod builtins;
 
 use std::{collections::HashMap, sync::Arc};
 
-use wasmer::{FunctionEnvMut, Store};
+use virtual_mio::block_on;
+use wasmer::FunctionEnvMut;
 use wasmer_wasix_types::wasi::Errno;
 
-use crate::{
-    runtime::task_manager::InlineWaker, syscalls::stderr_write, Runtime, SpawnError, WasiEnv,
-};
+use crate::{Runtime, SpawnError, WasiEnv, syscalls::stderr_write};
 
 use super::task::{OwnedTaskStatus, TaskJoinHandle, TaskStatus};
+
+type BuiltinCommandHandler = dyn for<'a> Fn(
+        &FunctionEnvMut<'a, WasiEnv>,
+        &str,
+        &mut Option<WasiEnv>,
+    ) -> Result<TaskJoinHandle, SpawnError>
+    + Send
+    + Sync
+    + 'static;
+
+#[derive(Clone)]
+pub struct BuiltinCommand {
+    name: String,
+    handler: Arc<BuiltinCommandHandler>,
+}
+
+impl std::fmt::Debug for BuiltinCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltinCommand")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl BuiltinCommand {
+    pub fn new<Name, Handler>(name: Name, handler: Handler) -> Self
+    where
+        Name: Into<String>,
+        Handler: for<'a> Fn(
+                &FunctionEnvMut<'a, WasiEnv>,
+                &str,
+                &mut Option<WasiEnv>,
+            ) -> Result<TaskJoinHandle, SpawnError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            name: name.into(),
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+impl VirtualCommand for BuiltinCommand {
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn exec(
+        &self,
+        parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
+        path: &str,
+        config: &mut Option<WasiEnv>,
+    ) -> Result<TaskJoinHandle, SpawnError> {
+        (self.handler)(parent_ctx, path, config)
+    }
+}
 
 /// A command available to an OS environment.
 pub trait VirtualCommand
@@ -19,7 +80,7 @@ where
     /// Returns the canonical name of the command.
     fn name(&self) -> &str;
 
-    /// Retrieve the command as as a [`std::any::Any`] reference.
+    /// Retrieve the command as a [`std::any::Any`] reference.
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Executes the command.
@@ -27,7 +88,6 @@ where
         &self,
         parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
         path: &str,
-        store: &mut Option<Store>,
         config: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError>;
 }
@@ -57,8 +117,7 @@ impl Commands {
     ///
     /// The command will be available with it's canonical name ([`VirtualCommand::name()`]) at /bin/NAME.
     pub fn register_command<C: VirtualCommand + Send + Sync + 'static>(&mut self, cmd: C) {
-        let path = format!("/bin/{}", cmd.name());
-        self.register_command_with_path(cmd, path);
+        self.register_command_shared(Arc::new(cmd));
     }
 
     /// Register a command at a custom path.
@@ -67,7 +126,30 @@ impl Commands {
         cmd: C,
         path: String,
     ) {
-        self.commands.insert(path, Arc::new(cmd));
+        self.register_command_with_path_shared(Arc::new(cmd), path);
+    }
+
+    /// Register a command behind an [`Arc`].
+    pub(crate) fn register_command_shared(
+        &mut self,
+        cmd: Arc<dyn VirtualCommand + Send + Sync + 'static>,
+    ) {
+        let path = format!("/bin/{}", cmd.name());
+        self.register_command_with_path_shared(cmd, path);
+    }
+
+    /// Register a command behind an [`Arc`] at a custom path.
+    pub(crate) fn register_command_with_path_shared(
+        &mut self,
+        cmd: Arc<dyn VirtualCommand + Send + Sync + 'static>,
+        path: String,
+    ) {
+        self.commands.insert(path, cmd);
+    }
+
+    /// Remove all registered commands.
+    pub fn clear(&mut self) {
+        self.commands.clear();
     }
 
     /// Determine if a command exists at the given path.
@@ -86,17 +168,16 @@ impl Commands {
         &self,
         parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
         path: &str,
-        store: &mut Option<Store>,
         builder: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError> {
         let path = path.to_string();
         if let Some(cmd) = self.commands.get(&path) {
-            cmd.exec(parent_ctx, path.as_str(), store, builder)
+            cmd.exec(parent_ctx, path.as_str(), builder)
         } else {
             unsafe {
-                InlineWaker::block_on(stderr_write(
+                block_on(stderr_write(
                     parent_ctx,
-                    format!("wasm command unknown - {}\r\n", path).as_bytes(),
+                    format!("wasm command unknown - {path}\r\n").as_bytes(),
                 ))
             }
             .ok();

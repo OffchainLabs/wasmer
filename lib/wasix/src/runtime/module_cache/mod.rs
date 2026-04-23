@@ -31,19 +31,24 @@
 //! caching strategies. For example, you could use the [`FallbackCache`] to
 //! chain a fast in-memory cache with a slower file-based cache as a fallback.
 
+mod hashed_module;
+
 mod fallback;
 #[cfg(feature = "sys-thread")]
 mod filesystem;
+pub mod progress;
 mod shared;
 mod thread_local;
 mod types;
 
 pub use self::{
     fallback::FallbackCache,
+    hashed_module::HashedModuleData,
     shared::SharedCache,
     thread_local::ThreadLocalCache,
-    types::{CacheError, ModuleCache, ModuleHash},
+    types::{CacheError, ModuleCache},
 };
+use wasmer_types::ModuleHash;
 
 #[cfg(feature = "sys-thread")]
 pub use self::filesystem::FileSystemCache;

@@ -1,36 +1,34 @@
+use std::fs;
+
 use super::*;
 use crate::syscalls::*;
 
 /// Returns Errno::Notemtpy if directory is not empty
-#[instrument(level = "debug", skip_all, fields(%fd, path = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%fd, path = field::Empty), ret)]
 pub fn path_remove_directory<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
     path: WasmPtr<u8, M>,
     path_len: M::Offset,
-) -> Errno {
+) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     // TODO check if fd is a dir, ensure it's within sandbox, etc.
     let env = ctx.data();
-    let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+    let (memory, mut state, _inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let base_dir = wasi_try!(state.fs.get_fd(fd));
-    let mut path_str = unsafe { get_input_str!(&memory, path, path_len) };
+    let base_dir = wasi_try_ok!(state.fs.get_fd(fd));
+    let path_str = unsafe { get_input_str_ok!(&memory, path, path_len) };
     Span::current().record("path", path_str.as_str());
 
-    // Convert relative paths into absolute paths
-    if path_str.starts_with("./") {
-        path_str = ctx.data().state.fs.relative_path_to_absolute(path_str);
-        trace!(
-            %path_str
-        );
-    }
-
-    wasi_try!(path_remove_directory_internal(&mut ctx, fd, &path_str));
+    wasi_try_ok!(path_remove_directory_internal(
+        &mut ctx, fd, base_dir, &path_str
+    ));
     let env = ctx.data();
 
     #[cfg(feature = "journal")]
     if env.enable_journal {
-        wasi_try!(
+        wasi_try_ok!(
             JournalEffector::save_path_remove_directory(&mut ctx, fd, path_str).map_err(|err| {
                 tracing::error!("failed to save remove directory event - {}", err);
                 Errno::Fault
@@ -38,68 +36,66 @@ pub fn path_remove_directory<M: MemorySize>(
         )
     }
 
-    Errno::Success
+    Ok(Errno::Success)
 }
 
 pub(crate) fn path_remove_directory_internal(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     fd: WasiFd,
+    _base_dir: Fd,
     path: &str,
 ) -> Result<(), Errno> {
     let env = ctx.data();
-    let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+    let (memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
-    let inode = state.fs.get_inode_at_path(inodes, fd, path, false)?;
-    let (parent_inode, childs_name) =
+    let (parent_inode, dir_name) =
         state
             .fs
-            .get_parent_inode_at_path(inodes, fd, std::path::Path::new(&path), false)?;
+            .get_parent_inode_at_path(inodes, fd, Path::new(path), true)?;
 
-    let host_path_to_remove = {
-        let guard = inode.read();
-        match guard.deref() {
-            Kind::Dir { entries, path, .. } => {
-                if !entries.is_empty() || state.fs_read_dir(path)?.count() != 0 {
+    let mut guard = parent_inode.write();
+    match guard.deref_mut() {
+        Kind::Dir {
+            entries: parent_entries,
+            ..
+        } => {
+            let Some(child_inode) = parent_entries.get(&dir_name) else {
+                return Err(Errno::Noent);
+            };
+
+            {
+                let Kind::Dir {
+                    entries: ref child_entries,
+                    path: ref child_path,
+                    ..
+                } = *child_inode.read()
+                else {
+                    return Err(Errno::Notdir);
+                };
+
+                if !child_entries.is_empty() {
                     return Err(Errno::Notempty);
                 }
-                path.clone()
+
+                if let Err(e) = state.fs_remove_dir(child_path) {
+                    tracing::warn!(path = ?child_path, error = ?e, "failed to remove directory");
+                    return Err(e);
+                }
             }
-            Kind::Root { .. } => return Err(Errno::Access),
-            _ => return Err(Errno::Notdir),
+
+            parent_entries.remove(&dir_name).expect(
+                "Entry should exist since we checked before and have an exclusive write lock",
+            );
+
+            Ok(())
         }
-    };
-
-    {
-        let mut guard = parent_inode.write();
-        match guard.deref_mut() {
-            Kind::Dir {
-                ref mut entries, ..
-            } => {
-                let removed_inode = entries.remove(&childs_name).ok_or(Errno::Inval)?;
-
-                // TODO: make this a debug assert in the future
-                assert!(inode.ino() == removed_inode.ino());
-            }
-            Kind::Root { .. } => return Err(Errno::Access),
-            _ => unreachable!(
-                "Internal logic error in wasi::path_remove_directory, parent is not a directory"
-            ),
+        Kind::Root { .. } => {
+            trace!("directories directly in the root node can not be removed");
+            Err(Errno::Access)
+        }
+        _ => {
+            trace!("path is not a directory");
+            Err(Errno::Notdir)
         }
     }
-
-    let env = ctx.data();
-    let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
-    if let Err(err) = state.fs_remove_dir(host_path_to_remove) {
-        // reinsert to prevent FS from being in bad state
-        let mut guard = parent_inode.write();
-        if let Kind::Dir {
-            ref mut entries, ..
-        } = guard.deref_mut()
-        {
-            entries.insert(childs_name, inode);
-        }
-        return Err(err);
-    }
-
-    Ok(())
 }

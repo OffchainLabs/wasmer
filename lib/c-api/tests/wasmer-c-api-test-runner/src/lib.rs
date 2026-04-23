@@ -115,7 +115,7 @@ pub const CAPI_BASE_TESTS_NOT_WORKING: &[&str] = &[
 fn test_ok() {
     let _drop = RemoveTestsOnDrop::default();
     let config = Config::get();
-    println!("config: {:#?}", config);
+    println!("config: {config:#?}");
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let host = target_lexicon::HOST.to_string();
@@ -143,7 +143,7 @@ fn test_ok() {
 
             let compiler = build.try_get_compiler().unwrap();
 
-            println!("compiler {:#?}", compiler);
+            println!("compiler {compiler:#?}");
 
             // run vcvars
             let vcvars_bat_path = find_vcvars64(&compiler).expect("no vcvars64.bat");
@@ -167,12 +167,12 @@ fn test_ok() {
 
             let mut command = compiler.to_command();
 
-            command.arg(&format!("{manifest_dir}/../{test}.c"));
+            command.arg(format!("{manifest_dir}/../{test}.c"));
             if !config.wasmer_dir.is_empty() {
                 command.arg("/I");
-                command.arg(&format!("{}/wasm-c-api/include/", config.root_dir));
+                command.arg(format!("{}/wasm-c-api/include/", config.root_dir));
                 command.arg("/I");
-                command.arg(&format!("{}/include/", config.wasmer_dir));
+                command.arg(format!("{}/include/", config.wasmer_dir));
                 let mut log = String::new();
                 fixup_symlinks(
                     &[
@@ -188,10 +188,10 @@ fn test_ok() {
             }
             command.arg("/link");
             if !config.wasmer_dir.is_empty() {
-                command.arg(&format!("/LIBPATH:{}/lib", config.wasmer_dir));
-                command.arg(&format!("{}/lib/wasmer.dll.lib", config.wasmer_dir));
+                command.arg(format!("/LIBPATH:{}/lib", config.wasmer_dir));
+                command.arg(format!("{}/lib/wasmer.dll.lib", config.wasmer_dir));
             }
-            command.arg(&format!("/OUT:{manifest_dir}/../{test}.exe"));
+            command.arg(format!("/OUT:{manifest_dir}/../{test}.exe"));
 
             println!("compiling {test}: {command:?}");
 
@@ -202,7 +202,7 @@ fn test_ok() {
             if !output.status.success() {
                 println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
                 println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-                println!("output: {:#?}", output);
+                println!("output: {output:#?}");
                 // print_wasmer_root_to_stdout(&config);
                 panic!("failed to compile {test}");
             }
@@ -212,7 +212,7 @@ fn test_ok() {
             }
 
             // execute
-            let mut command = std::process::Command::new(&format!("{manifest_dir}/../{test}.exe"));
+            let mut command = std::process::Command::new(format!("{manifest_dir}/../{test}.exe"));
             println!("newpath: {}", newpath.clone());
             command.env("PATH", newpath.clone());
             command.current_dir(exe_dir.clone());
@@ -224,7 +224,7 @@ fn test_ok() {
             if !output.status.success() {
                 println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
                 println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-                println!("output: {:#?}", output);
+                println!("output: {output:#?}");
                 // print_wasmer_root_to_stdout(&config);
                 panic!("failed to execute {test}");
             }
@@ -250,9 +250,9 @@ fn test_ok() {
 
             if !config.wasmer_dir.is_empty() {
                 command.arg("-I");
-                command.arg(&format!("{}/wasm-c-api/include/", config.root_dir));
+                command.arg(format!("{}/wasm-c-api/include/", config.root_dir));
                 command.arg("-I");
-                command.arg(&format!("{}/include/", config.wasmer_dir));
+                command.arg(format!("{}/include/", config.wasmer_dir));
                 let mut log = String::new();
                 fixup_symlinks(
                     &[
@@ -265,15 +265,15 @@ fn test_ok() {
                 )
                 .unwrap_or_else(|_| panic!("failed to fix symlinks: {log}"));
             }
-            command.arg(&format!("{manifest_dir}/../{test}.c"));
+            command.arg(format!("{manifest_dir}/../{test}.c"));
             if !config.wasmer_dir.is_empty() {
                 command.arg("-L");
-                command.arg(&format!("{}/lib/", config.wasmer_dir));
+                command.arg(format!("{}/lib/", config.wasmer_dir));
                 command.arg("-lwasmer");
-                command.arg(&format!("-Wl,-rpath,{}/lib/", config.wasmer_dir));
+                command.arg(format!("-Wl,-rpath,{}/lib/", config.wasmer_dir));
             }
             command.arg("-o");
-            command.arg(&format!("{manifest_dir}/../{test}"));
+            command.arg(format!("{manifest_dir}/../{test}"));
 
             // print_wasmer_root_to_stdout(&config);
 
@@ -293,7 +293,7 @@ fn test_ok() {
             }
 
             // execute
-            let mut command = std::process::Command::new(&format!("{manifest_dir}/../{test}"));
+            let mut command = std::process::Command::new(format!("{manifest_dir}/../{test}"));
             command.env("LD_PRELOAD", libwasmer_so_path.clone());
             command.current_dir(exe_dir.clone());
             println!("execute: {command:#?}");
@@ -310,52 +310,52 @@ fn test_ok() {
     }
 
     for test in CAPI_BASE_TESTS.iter() {
-        let _ = std::fs::remove_file(&format!("{manifest_dir}/{test}.obj"));
-        let _ = std::fs::remove_file(&format!("{manifest_dir}/../{test}.exe"));
-        let _ = std::fs::remove_file(&format!("{manifest_dir}/../{test}"));
+        let _ = std::fs::remove_file(format!("{manifest_dir}/{test}.obj"));
+        let _ = std::fs::remove_file(format!("{manifest_dir}/../{test}.exe"));
+        let _ = std::fs::remove_file(format!("{manifest_dir}/../{test}"));
     }
 }
 
-#[cfg(test)]
-fn print_wasmer_root_to_stdout(config: &Config) {
-    println!("print_wasmer_root_to_stdout");
+// #[cfg(test)]
+// fn print_wasmer_root_to_stdout(config: &Config) {
+//     println!("print_wasmer_root_to_stdout");
 
-    use walkdir::WalkDir;
+//     use walkdir::WalkDir;
 
-    println!(
-        "wasmer dir: {}",
-        std::path::Path::new(&config.wasmer_dir)
-            .canonicalize()
-            .unwrap()
-            .display()
-    );
+//     println!(
+//         "wasmer dir: {}",
+//         std::path::Path::new(&config.wasmer_dir)
+//             .canonicalize()
+//             .unwrap()
+//             .display()
+//     );
 
-    for entry in WalkDir::new(&config.wasmer_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let f_name = String::from(entry.path().canonicalize().unwrap().to_string_lossy());
-        println!("{f_name}");
-    }
+//     for entry in WalkDir::new(&config.wasmer_dir)
+//         .into_iter()
+//         .filter_map(Result::ok)
+//     {
+//         let f_name = String::from(entry.path().canonicalize().unwrap().to_string_lossy());
+//         println!("{f_name}");
+//     }
 
-    println!(
-        "root dir: {}",
-        std::path::Path::new(&config.root_dir)
-            .canonicalize()
-            .unwrap()
-            .display()
-    );
+//     println!(
+//         "root dir: {}",
+//         std::path::Path::new(&config.root_dir)
+//             .canonicalize()
+//             .unwrap()
+//             .display()
+//     );
 
-    for entry in WalkDir::new(&config.root_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let f_name = String::from(entry.path().canonicalize().unwrap().to_string_lossy());
-        println!("{f_name}");
-    }
+//     for entry in WalkDir::new(&config.root_dir)
+//         .into_iter()
+//         .filter_map(Result::ok)
+//     {
+//         let f_name = String::from(entry.path().canonicalize().unwrap().to_string_lossy());
+//         println!("{f_name}");
+//     }
 
-    println!("printed");
-}
+//     println!("printed");
+// }
 
 #[cfg(test)]
 fn fixup_symlinks(
@@ -411,7 +411,7 @@ fn fixup_symlinks_inner(include_paths: &[String], log: &mut String) -> Result<()
             _ => continue,
         };
         let lines_3 = file.lines().take(3).collect::<Vec<_>>();
-        log.push_str(&format!("first 3 lines of {path:?}: {:#?}\n", lines_3));
+        log.push_str(&format!("first 3 lines of {path:?}: {lines_3:#?}\n"));
 
         let parent = std::path::Path::new(&path).parent().unwrap();
         if let Ok(symlink) = std::fs::read_to_string(parent.join(&file)) {
@@ -424,7 +424,7 @@ fn fixup_symlinks_inner(include_paths: &[String], log: &mut String) -> Result<()
             .captures_iter(&file)
             .map(|c| c[1].to_string())
             .collect::<Vec<_>>();
-        log.push_str(&format!("regex captures: ({path:?}): {:#?}\n", filepaths));
+        log.push_str(&format!("regex captures: ({path:?}): {filepaths:#?}\n"));
         let joined_filepaths = filepaths
             .iter()
             .map(|s| {

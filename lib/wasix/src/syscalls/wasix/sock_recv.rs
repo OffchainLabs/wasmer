@@ -26,10 +26,13 @@ pub fn sock_recv<M: MemorySize>(
     ro_data_len: WasmPtr<M::Offset, M>,
     ro_flags: WasmPtr<RoFlags, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let fd_entry = wasi_try_ok!(env.state.fs.get_fd(sock));
     let guard = fd_entry.inode.read();
-    let use_read = matches!(guard.deref(), Kind::Pipe { .. });
+    // Some guests route socket-like wakeups through pipe-backed fds.
+    let use_read = matches!(guard.deref(), Kind::DuplexPipe { .. } | Kind::PipeRx { .. });
     drop(guard);
     if use_read {
         fd_read(ctx, sock, ri_data, ri_data_len, ro_data_len)
@@ -108,12 +111,11 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
     ro_data_len: WasmPtr<M::Offset, M>,
     ro_flags: WasmPtr<RoFlags, M>,
 ) -> WasiResult<usize> {
-    wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
-
     let mut env = ctx.data();
     let memory = unsafe { env.memory_view(ctx) };
 
     let peek = (ri_flags & __WASI_SOCK_RECV_INPUT_PEEK) != 0;
+    let nonblocking_flag = (ri_flags & __WASI_SOCK_RECV_INPUT_DONT_WAIT) != 0;
     let data = wasi_try_ok_ok!(__sock_asyncify(
         env,
         sock,
@@ -132,7 +134,7 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
                     .access()
                     .map_err(mem_error_to_wasi)?;
 
-                let nonblocking = fd.flags.contains(Fdflags::NONBLOCK);
+                let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
                 let timeout = socket
                     .opt_time(TimeType::ReadTimeout)
                     .ok()
@@ -145,6 +147,7 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
                         buf.as_mut_uninit(),
                         Some(timeout),
                         nonblocking,
+                        peek,
                     )
                     .await
                 {

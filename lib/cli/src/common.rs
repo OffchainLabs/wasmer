@@ -37,5 +37,5 @@ pub struct WasmFeatures {
 }
 
 pub(crate) fn normalize_path(s: &str) -> String {
-    wasmer_registry::utils::normalize_path(s)
+    s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
 }

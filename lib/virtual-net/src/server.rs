@@ -1,21 +1,23 @@
 use crate::meta::{FrameSerializationFormat, ResponseType};
 use crate::rx_tx::{RemoteRx, RemoteTx, RemoteTxWakers};
-use crate::{
-    meta::{MessageRequest, MessageResponse, RequestType, SocketId},
-    VirtualNetworking, VirtualRawSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
-};
 use crate::{IpCidr, IpRoute, NetworkError, StreamSecurity, VirtualIcmpSocket};
-use derivative::Derivative;
+use crate::{
+    VirtualNetworking, VirtualRawSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
+    meta::{MessageRequest, MessageResponse, RequestType, SocketId},
+};
 use futures_util::stream::FuturesOrdered;
 #[cfg(any(feature = "hyper", feature = "tokio-tungstenite"))]
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{future::BoxFuture, StreamExt};
 use futures_util::{Sink, Stream};
+use futures_util::{StreamExt, future::BoxFuture};
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::task::Waker;
 use std::time::Duration;
+
+#[cfg(feature = "hyper")]
+use hyper_util::rt::tokio::TokioIo;
 use std::{
     collections::HashMap,
     future::Future,
@@ -28,6 +30,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
 };
+use tokio_serde::SymmetricallyFramed;
 use tokio_serde::formats::SymmetricalBincode;
 #[cfg(feature = "cbor")]
 use tokio_serde::formats::SymmetricalCbor;
@@ -35,7 +38,6 @@ use tokio_serde::formats::SymmetricalCbor;
 use tokio_serde::formats::SymmetricalJson;
 #[cfg(feature = "messagepack")]
 use tokio_serde::formats::SymmetricalMessagePack;
-use tokio_serde::SymmetricallyFramed;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use virtual_mio::InterestHandler;
 
@@ -167,10 +169,10 @@ impl RemoteNetworkingServer {
     #[cfg(feature = "hyper")]
     pub fn new_from_hyper_ws_io(
         tx: SplitSink<
-            hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>,
+            hyper_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
             hyper_tungstenite::tungstenite::Message,
         >,
-        rx: SplitStream<hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>>,
+        rx: SplitStream<hyper_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>>,
         format: FrameSerializationFormat,
         inner: Arc<dyn VirtualNetworking + Send + Sync + 'static>,
     ) -> (Self, RemoteNetworkingServerDriver) {
@@ -367,10 +369,13 @@ impl Future for RemoteNetworkingServerDriver {
                     not_stalled_guard.take();
                 }
                 Poll::Pending if not_stalled_guard.is_none() => {
-                    if let Ok(guard) = self.common.stall_rx.clone().try_lock_owned() {
-                        not_stalled_guard.replace(guard);
-                    } else {
-                        return Poll::Pending;
+                    match self.common.stall_rx.clone().try_lock_owned() {
+                        Ok(guard) => {
+                            not_stalled_guard.replace(guard);
+                        }
+                        _ => {
+                            return Poll::Pending;
+                        }
                     }
                 }
                 Poll::Pending => {}
@@ -570,7 +575,7 @@ impl RemoteNetworkingServerDriver {
                             req_id,
                             res: ResponseType::Err(NetworkError::InvalidFd),
                         })
-                    })
+                    });
                 }
             };
             work(socket)
@@ -1220,6 +1225,7 @@ impl RemoteNetworkingServerDriver {
     }
 }
 
+#[derive(Debug)]
 enum RemoteAdapterSocket {
     TcpListener {
         socket: Box<dyn VirtualTcpListener + Sync + 'static>,
@@ -1453,7 +1459,7 @@ impl RemoteAdapterSocket {
                 Self::TcpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv(&mut chunk) {
+                    match this.try_recv(&mut chunk, false) {
                         Ok(0) => {}
                         Ok(amt) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1473,7 +1479,7 @@ impl RemoteAdapterSocket {
                 Self::UdpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv_from(&mut chunk) {
+                    match this.try_recv_from(&mut chunk, false) {
                         Ok((0, _)) => {}
                         Ok((amt, addr)) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1494,7 +1500,7 @@ impl RemoteAdapterSocket {
                 Self::IcmpSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv_from(&mut chunk) {
+                    match this.try_recv_from(&mut chunk, false) {
                         Ok((0, _)) => {}
                         Ok((amt, addr)) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1515,7 +1521,7 @@ impl RemoteAdapterSocket {
                 Self::RawSocket(this) => {
                     let mut chunk: [MaybeUninit<u8>; 10240] =
                         unsafe { MaybeUninit::uninit().assume_init() };
-                    match this.try_recv(&mut chunk) {
+                    match this.try_recv(&mut chunk, false) {
                         Ok(0) => {}
                         Ok(amt) => {
                             let chunk_unsafe: &mut [MaybeUninit<u8>] = &mut chunk[..amt];
@@ -1543,7 +1549,7 @@ impl RemoteAdapterSocket {
                 // Processes all the background tasks until completion
                 let mut stream = ret;
                 loop {
-                    let (next, s) = stream.into_future().await;
+                    let (next, s) = StreamExt::into_future(stream).await;
                     if next.is_none() {
                         break;
                     }
@@ -1613,14 +1619,10 @@ impl InterestHandler for RemoteAdapterHandler {
 
 type SocketMap<T> = HashMap<SocketId, T>;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 struct RemoteAdapterCommon {
-    #[derivative(Debug = "ignore")]
     tx: RemoteTx<MessageResponse>,
-    #[derivative(Debug = "ignore")]
     rx: Mutex<RemoteRx<MessageRequest>>,
-    #[derivative(Debug = "ignore")]
     sockets: Mutex<SocketMap<RemoteAdapterSocket>>,
     socket_accept: Mutex<SocketMap<SocketId>>,
     handler: RemoteAdapterHandler,

@@ -3,7 +3,6 @@
 .DS_Store
 .idea
 .gdb_history
-/.cargo/
 **/.vscode/*
 !/.vscode/settings.json
 api-docs-repo/
@@ -28,3 +27,7 @@ build-wasmer.tar.gz
 lcov.info
 link/
 link.tar.gz
+# Ignore files used by the "direnv" tool.
+.direnv
+.envrc
+/tests/tmp

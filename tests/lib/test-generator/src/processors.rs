@@ -1,5 +1,5 @@
 //! Here we define the processors usable for each test genrator
-use crate::{extract_name, Test, Testsuite};
+use crate::{Test, Testsuite, extract_name};
 use std::path::PathBuf;
 
 /// Given a Testsuite and a path, process the path in case is a wast
@@ -20,40 +20,6 @@ pub fn wast_processor(_out: &mut Testsuite, p: PathBuf) -> Option<Test> {
 
     // The implementation of `run_wast` lives in /tests/spectest.rs
     let body = format!("crate::run_wast(config, r#\"{}\"#)", p.display());
-
-    Some(Test {
-        name: testname,
-        body,
-    })
-}
-
-/// Given a Testsuite and a path, process the path in case is a Emscripten
-/// wasm file.
-pub fn emscripten_processor(_out: &mut Testsuite, p: PathBuf) -> Option<Test> {
-    let ext = p.extension()?;
-    // Only look at wast files.
-    if ext != "wasm" {
-        return None;
-    }
-
-    let outfile = {
-        let mut out_ext = p.clone();
-        out_ext.set_extension("out");
-        if out_ext.exists() {
-            out_ext
-        } else {
-            return None;
-        }
-    };
-
-    let testname = extract_name(&p);
-
-    // The implementation of `run_emscripten` lives in /tests/emtest.rs
-    let body = format!(
-        "crate::emscripten::run_emscripten(config, r#\"{}\"#, r#\"{}\"#)",
-        p.display(),
-        outfile.display()
-    );
 
     Some(Test {
         name: testname,

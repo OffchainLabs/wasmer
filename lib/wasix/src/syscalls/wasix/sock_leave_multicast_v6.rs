@@ -9,13 +9,15 @@ use crate::syscalls::*;
 /// * `fd` - Socket descriptor
 /// * `multiaddr` - Multicast group to leave
 /// * `interface` - Interface that will left
-#[instrument(level = "debug", skip_all, fields(%sock, %iface), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock, %iface), ret)]
 pub fn sock_leave_multicast_v6<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     multiaddr: WasmPtr<__wasi_addr_ip6_t, M>,
     iface: u32,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let multiaddr = wasi_try_ok!(crate::net::read_ip_v6(&memory, multiaddr));
@@ -29,7 +31,7 @@ pub fn sock_leave_multicast_v6<M: MemorySize>(
         JournalEffector::save_sock_leave_ipv6_multicast(&mut ctx, sock, multiaddr, iface).map_err(
             |err| {
                 tracing::error!("failed to save sock_leave_ipv6_multicast event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             },
         )?;
     }

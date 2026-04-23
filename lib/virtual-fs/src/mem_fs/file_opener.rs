@@ -1,14 +1,14 @@
 use super::filesystem::InodeResolution;
 use super::*;
 use crate::{FileType, FsError, Metadata, OpenOptionsConfig, Result, VirtualFile};
-use std::borrow::Cow;
+use shared_buffer::OwnedBuffer;
 use std::path::Path;
 use tracing::*;
 
 impl FileSystem {
     /// Inserts a readonly file into the file system that uses copy-on-write
     /// (this is required for zero-copy creation of the same file)
-    pub fn insert_ro_file(&self, path: &Path, contents: Cow<'static, [u8]>) -> Result<()> {
+    pub fn insert_ro_file(&self, path: &Path, contents: OwnedBuffer) -> Result<()> {
         let _ = crate::FileSystem::remove_file(self, path);
         let (inode_of_parent, maybe_inode_of_file, name_of_file) = self.insert_inode(path)?;
 
@@ -502,22 +502,25 @@ impl crate::FileOpener for FileSystem {
                 let inode_of_file = fs.storage.vacant_entry().key();
 
                 // We might be in optimized mode
-                let file = if let Some(offload) = fs.backing_offload.clone() {
-                    let file = OffloadedFile::new(fs.limiter.clone(), offload);
-                    Node::OffloadedFile(OffloadedFileNode {
-                        inode: inode_of_file,
-                        name: name_of_file,
-                        file,
-                        metadata,
-                    })
-                } else {
-                    let file = File::new(fs.limiter.clone());
-                    Node::File(FileNode {
-                        inode: inode_of_file,
-                        name: name_of_file,
-                        file,
-                        metadata,
-                    })
+                let file = match fs.backing_offload.clone() {
+                    Some(offload) => {
+                        let file = OffloadedFile::new(fs.limiter.clone(), offload);
+                        Node::OffloadedFile(OffloadedFileNode {
+                            inode: inode_of_file,
+                            name: name_of_file,
+                            file,
+                            metadata,
+                        })
+                    }
+                    _ => {
+                        let file = File::new(fs.limiter.clone());
+                        Node::File(FileNode {
+                            inode: inode_of_file,
+                            name: name_of_file,
+                            file,
+                            metadata,
+                        })
+                    }
                 };
 
                 // Creating the file in the storage.
@@ -554,7 +557,7 @@ impl crate::FileOpener for FileSystem {
 mod test_file_opener {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-    use crate::{mem_fs::*, FileSystem as FS, FsError};
+    use crate::{FileSystem as FS, FsError, mem_fs::*};
     use std::io;
 
     macro_rules! path {
@@ -568,13 +571,11 @@ mod test_file_opener {
         let fs = FileSystem::default();
 
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/foo.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/foo.txt"))
+                .is_ok(),
             "creating a new file",
         );
 
@@ -631,13 +632,11 @@ mod test_file_opener {
         assert_eq!(fs.remove_file(path!("/foo.txt")), Ok(()), "removing a file");
 
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(false)
-                    .create_new(true)
-                    .open(path!("/foo.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .write(false)
+                .create_new(true)
+                .open(path!("/foo.txt"))
+                .is_ok(),
             "creating a file without the `write` option",
         );
     }
@@ -768,13 +767,11 @@ mod test_file_opener {
         let fs = FileSystem::default();
 
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/foo.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/foo.txt"))
+                .is_ok(),
             "creating a _new_ file",
         );
 
@@ -789,10 +786,10 @@ mod test_file_opener {
         );
 
         assert!(
-            matches!(
-                fs.new_open_options().read(true).open(path!("/foo.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .read(true)
+                .open(path!("/foo.txt"))
+                .is_ok(),
             "opening a file that already exists",
         );
     }

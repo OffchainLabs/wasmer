@@ -6,21 +6,21 @@ impl JournalEffector {
     }
 
     pub fn apply_epoll_create(ctx: &mut FunctionEnvMut<'_, WasiEnv>, fd: Fd) -> anyhow::Result<()> {
-        let ret_fd = crate::syscalls::epoll_create_internal(ctx)
+        let ret_fd = crate::syscalls::epoll_create_internal(ctx, Some(fd))
             .map_err(|err| {
-                anyhow::format_err!("journal restore error: failed to create epoll - {}", err)
+                anyhow::format_err!("journal restore error: failed to create epoll - {err}")
             })?
             .map_err(|err| {
-                anyhow::format_err!("journal restore error: failed to create epoll - {}", err)
+                anyhow::format_err!("journal restore error: failed to create epoll - {err}")
             })?;
 
         let ret = crate::syscalls::fd_renumber_internal(ctx, ret_fd, fd);
-        if ret != Errno::Success {
+        if !matches!(ret, Ok(Errno::Success)) {
             bail!(
                 "journal restore error: failed renumber file descriptor after epoll create (from={}, to={}) - {}",
                 ret_fd,
                 fd,
-                ret
+                ret.unwrap_or(Errno::Unknown)
             );
         }
 

@@ -1,10 +1,10 @@
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use wai_bindgen_wasmer_impl::{export, import};
 
 #[cfg(feature = "async")]
 pub use async_trait::async_trait;
-#[cfg(feature = "tracing-lib")]
+#[cfg(feature = "tracing")]
 pub use tracing_lib as tracing;
 #[doc(hidden)]
 pub use {anyhow, bitflags, once_cell, wasmer};
@@ -82,7 +82,7 @@ pub mod rt {
     }
 
     pub fn invalid_variant(name: &str) -> RuntimeError {
-        let msg = format!("invalid discriminant for `{}`", name);
+        let msg = format!("invalid discriminant for `{name}`");
         RuntimeError::new(msg)
     }
 
@@ -96,7 +96,7 @@ pub mod rt {
         T: std::ops::Not<Output = T> + std::ops::BitAnd<Output = T> + From<u8> + PartialEq + Copy,
     {
         if bits & !all != 0u8.into() {
-            let msg = format!("invalid flags specified for `{}`", name);
+            let msg = format!("invalid flags specified for `{name}`");
             Err(RuntimeError::new(msg))
         } else {
             Ok(mk(bits))

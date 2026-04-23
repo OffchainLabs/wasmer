@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Error};
 use bytes::Bytes;
 use clap::Parser;
-use wasmer_compiler::Artifact;
-use wasmer_types::{
-    compilation::symbols::ModuleMetadataSymbolRegistry, CpuFeature, MetadataHeader, Triple,
+use wasmer_compiler::{
+    Artifact, object::ObjectMetadataBuilder, types::symbols::ModuleMetadataSymbolRegistry,
 };
-use webc::{compat::SharedBytes, Container, DetectError};
+use wasmer_package::{package::WasmerPackageError, utils::from_bytes};
+use wasmer_types::target::{CpuFeature, Triple};
+use webc::{Container, ContainerError, DetectError, compat::SharedBytes};
 
-use crate::store::CompilerOptions;
+use crate::backend::RuntimeOptions;
 
 #[derive(Debug, Parser)]
 /// The options for the `wasmer gen-c-header` subcommand
@@ -60,9 +61,11 @@ impl GenCHeader {
             None => crate::commands::PrefixMapCompilation::hash_for_bytes(&file),
         };
 
-        let atom = match Container::from_bytes(file.clone()) {
+        let atom = match from_bytes(file.clone()) {
             Ok(webc) => self.get_atom(&webc)?,
-            Err(webc::compat::ContainerError::Detect(DetectError::InvalidMagic { .. })) => {
+            Err(WasmerPackageError::ContainerError(ContainerError::Detect(
+                DetectError::InvalidMagic { .. },
+            ))) => {
                 // we've probably got a WebAssembly file
                 file.into()
             }
@@ -76,7 +79,15 @@ impl GenCHeader {
             &target_triple,
             &self.cpu_features,
         );
-        let (engine, _) = CompilerOptions::default().get_engine_for_target(target.clone())?;
+        let engine =
+            RuntimeOptions::default().get_sys_compiler_engine_for_target(target.clone())?;
+        if !engine.is_sys() {
+            anyhow::bail!(
+                "Cannot use this engine to generate c-headers! Please, use one of `cranelift`, `llvm` or `singlepass`."
+            );
+        }
+        let engine = engine.into_sys();
+
         let engine_inner = engine.inner();
         let compiler = engine_inner.compiler()?;
         let features = engine_inner.features();
@@ -91,13 +102,9 @@ impl GenCHeader {
         )
         .map_err(|e| anyhow::anyhow!("could not generate metadata: {e}"))?;
 
-        let serialized_data = metadata
-            .serialize()
-            .map_err(|e| anyhow::anyhow!("failed to serialize: {e}"))?;
-        let mut metadata_binary = vec![];
-        metadata_binary.extend(MetadataHeader::new(serialized_data.len()).into_bytes());
-        metadata_binary.extend(serialized_data);
-        let metadata_length = metadata_binary.len();
+        let metadata_builder = ObjectMetadataBuilder::new(&metadata, &target_triple)
+            .map_err(|e| anyhow::anyhow!("failed to create relocs builder: {e}"))?;
+        let metadata_length = metadata_builder.placeholder_data().len();
 
         let header_file_src = crate::c_gen::staticlib_header::generate_header_file(
             &prefix,

@@ -3,8 +3,8 @@
 use self::offloaded_file::OffloadBackingStore;
 
 use super::*;
-use crate::{DirEntry, FileSystem as _, FileType, FsError, Metadata, OpenOptions, ReadDir, Result};
-use futures::future::BoxFuture;
+use crate::{DirEntry, FileType, FsError, Metadata, OpenOptions, ReadDir, Result};
+use futures::future::{BoxFuture, Either};
 use slab::Slab;
 use std::collections::VecDeque;
 use std::convert::identity;
@@ -254,19 +254,101 @@ impl FileSystem {
 
         Ok(())
     }
+
+    pub fn create_symlink(&self, source: &Path, target: &Path) -> Result<()> {
+        let (inode_of_parent, name_of_symlink) = {
+            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+            let path = guard.canonicalize_without_inode(target)?;
+            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+            let name_of_symlink = path
+                .file_name()
+                .ok_or(FsError::InvalidInput)?
+                .to_os_string();
+            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
+                InodeResolution::Found(a) => a,
+                InodeResolution::Redirect(fs, mut redirected_path) => {
+                    redirected_path.push(&name_of_symlink);
+                    drop(guard);
+                    let fs_ref: &dyn crate::FileSystem = fs.as_ref();
+                    if let Some(mem_fs) = fs_ref.downcast_ref::<Self>() {
+                        return mem_fs.create_symlink(source, redirected_path.as_path());
+                    }
+                    return Err(FsError::Unsupported);
+                }
+            };
+            (inode_of_parent, name_of_symlink)
+        };
+
+        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+        if fs.canonicalize(target).is_ok() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let inode_of_symlink = fs.storage.vacant_entry().key();
+        let real_inode_of_symlink = fs.storage.insert(Node::Symlink(SymlinkNode {
+            inode: inode_of_symlink,
+            name: name_of_symlink,
+            target: source.to_path_buf(),
+            metadata: {
+                let time = time();
+                Metadata {
+                    ft: FileType {
+                        symlink: true,
+                        ..Default::default()
+                    },
+                    accessed: time,
+                    created: time,
+                    modified: time,
+                    len: source.as_os_str().len() as u64,
+                }
+            },
+        }));
+
+        assert_eq!(
+            inode_of_symlink, real_inode_of_symlink,
+            "new symlink inode should have been correctly calculated",
+        );
+
+        fs.add_child_to_node(inode_of_parent, inode_of_symlink)?;
+        Ok(())
+    }
 }
 
 impl crate::FileSystem for FileSystem {
-    fn read_dir(&self, path: &Path) -> Result<ReadDir> {
+    fn readlink(&self, path: &Path) -> Result<PathBuf> {
         // Read lock.
         let guard = self.inner.read().map_err(|_| FsError::Lock)?;
 
         // Canonicalize the path.
-        let (path, inode_of_directory) = guard.canonicalize(path)?;
+        let (_, inode_of_directory) = guard.canonicalize(path)?;
+        match inode_of_directory {
+            InodeResolution::Found(inode) => match guard.storage.get(inode) {
+                Some(Node::Symlink(SymlinkNode { target, .. })) => Ok(target.clone()),
+                _ => Err(FsError::InvalidInput),
+            },
+            InodeResolution::Redirect(fs, path) => fs.readlink(path.as_path()),
+        }
+    }
+
+    fn read_dir(&self, path: &Path) -> Result<ReadDir> {
+        // Read lock.
+        let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+
+        fn rebase_entries(entries: &mut ReadDir, base: &Path) {
+            for entry in &mut entries.data {
+                let name = entry.file_name();
+                entry.path = base.join(name);
+            }
+        }
+
+        // Canonicalize the path.
+        let (guest_path, inode_of_directory) = guard.canonicalize(path)?;
         let inode_of_directory = match inode_of_directory {
             InodeResolution::Found(a) => a,
-            InodeResolution::Redirect(fs, path) => {
-                return fs.read_dir(path.as_path());
+            InodeResolution::Redirect(fs, redirect_path) => {
+                let mut entries = fs.read_dir(redirect_path.as_path())?;
+                rebase_entries(&mut entries, &guest_path);
+                return Ok(entries);
             }
         };
 
@@ -287,8 +369,12 @@ impl crate::FileSystem for FileSystem {
                 })
                 .collect(),
 
-            Some(Node::ArcDirectory(ArcDirectoryNode { fs, path, .. })) => {
-                return fs.read_dir(path.as_path());
+            Some(Node::ArcDirectory(ArcDirectoryNode {
+                fs, path: fs_path, ..
+            })) => {
+                let mut entries = fs.read_dir(fs_path.as_path())?;
+                rebase_entries(&mut entries, &guest_path);
+                return Ok(entries);
             }
 
             _ => return Err(FsError::InvalidInput),
@@ -435,15 +521,11 @@ impl crate::FileSystem for FileSystem {
     }
 
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async {
+        Box::pin(async move {
             let name_of_to;
 
-            let (
-                (position_of_from, inode, inode_of_from_parent),
-                (inode_of_to_parent, name_of_to),
-                inode_dest,
-            ) = {
-                // Read lock.
+            // Read lock.
+            let (name_of_from, inode_of_from_parent, name_of_to, inode_of_to_parent) = {
                 let fs = self.inner.read().map_err(|_| FsError::Lock)?;
 
                 let from = fs.canonicalize_without_inode(from)?;
@@ -462,85 +544,138 @@ impl crate::FileSystem for FileSystem {
 
                 // Find the parent inodes.
                 let inode_of_from_parent = match fs.inode_of_parent(parent_of_from)? {
-                    InodeResolution::Found(a) => a,
-                    InodeResolution::Redirect(..) => {
-                        return Err(FsError::InvalidInput);
+                    InodeResolution::Found(a) => Either::Left(a),
+                    InodeResolution::Redirect(fs, mut path) => {
+                        path.push(&name_of_from);
+                        Either::Right((fs, path))
                     }
                 };
                 let inode_of_to_parent = match fs.inode_of_parent(parent_of_to)? {
-                    InodeResolution::Found(a) => a,
-                    InodeResolution::Redirect(..) => {
-                        return Err(FsError::InvalidInput);
+                    InodeResolution::Found(a) => Either::Left(a),
+                    InodeResolution::Redirect(fs, mut path) => {
+                        path.push(&name_of_to);
+                        Either::Right((fs, path))
                     }
                 };
 
-                // Find the inode of the dest file if it exists
-                let maybe_position_and_inode_of_file =
-                    fs.as_parent_get_position_and_inode_of_file(inode_of_to_parent, &name_of_to)?;
-
-                // Get the child indexes to update in the parent nodes, in
-                // addition to the inode of the directory to update.
-                let (position_of_from, inode) = fs
-                    .as_parent_get_position_and_inode(inode_of_from_parent, &name_of_from)?
-                    .ok_or(FsError::EntryNotFound)?;
-
                 (
-                    (position_of_from, inode, inode_of_from_parent),
-                    (inode_of_to_parent, name_of_to),
-                    maybe_position_and_inode_of_file,
+                    name_of_from,
+                    inode_of_from_parent,
+                    name_of_to,
+                    inode_of_to_parent,
                 )
             };
 
-            let inode = match inode {
-                InodeResolution::Found(a) => a,
-                InodeResolution::Redirect(..) => {
-                    return Err(FsError::InvalidInput);
-                }
-            };
+            match (inode_of_from_parent, inode_of_to_parent) {
+                // Rename within this MemFS instance
+                (Either::Left(inode_of_from_parent), Either::Left(inode_of_to_parent)) => {
+                    let fs = self.inner.read().map_err(|_| FsError::Lock)?;
 
-            {
-                // Write lock.
-                let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+                    // Find the inode of the dest file if it exists
+                    let maybe_position_and_inode_of_file = fs
+                        .as_parent_get_position_and_inode_of_file(
+                            inode_of_to_parent,
+                            &name_of_to,
+                        )?;
 
-                if let Some((position, inode_of_file)) = inode_dest {
-                    // Remove the file from the storage.
-                    match inode_of_file {
-                        InodeResolution::Found(inode_of_file) => {
-                            fs.storage.remove(inode_of_file);
-                        }
+                    // Get the child indexes to update in the parent nodes, in
+                    // addition to the inode of the directory to update.
+                    let (position_of_from, inode) = fs
+                        .as_parent_get_position_and_inode(inode_of_from_parent, &name_of_from)?
+                        .ok_or(FsError::EntryNotFound)?;
+
+                    let (
+                        (position_of_from, inode, inode_of_from_parent),
+                        (inode_of_to_parent, name_of_to),
+                        inode_dest,
+                    ) = (
+                        (position_of_from, inode, inode_of_from_parent),
+                        (inode_of_to_parent, name_of_to),
+                        maybe_position_and_inode_of_file,
+                    );
+
+                    let inode = match inode {
+                        InodeResolution::Found(a) => a,
                         InodeResolution::Redirect(..) => {
                             return Err(FsError::InvalidInput);
                         }
+                    };
+
+                    drop(fs);
+
+                    {
+                        // Write lock.
+                        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+
+                        if let Some((position, inode_of_file)) = inode_dest {
+                            // Remove the file from the storage.
+                            match inode_of_file {
+                                InodeResolution::Found(inode_of_file) => {
+                                    fs.storage.remove(inode_of_file);
+                                }
+                                InodeResolution::Redirect(..) => {
+                                    return Err(FsError::InvalidInput);
+                                }
+                            }
+
+                            fs.remove_child_from_node(inode_of_to_parent, position)?;
+                        }
+
+                        // Update the file name, and update the modified time.
+                        fs.update_node_name(inode, name_of_to)?;
+
+                        // The parents are different. Let's update them.
+                        if inode_of_from_parent != inode_of_to_parent {
+                            // Remove the file from its parent, and update the
+                            // modified time.
+                            fs.remove_child_from_node(inode_of_from_parent, position_of_from)?;
+
+                            // Add the file to its new parent, and update the modified
+                            // time.
+                            fs.add_child_to_node(inode_of_to_parent, inode)?;
+                        }
+                        // Otherwise, we need to at least update the modified time of the parent.
+                        else {
+                            let mut inode = fs.storage.get_mut(inode_of_from_parent);
+                            match inode.as_mut() {
+                                Some(Node::Directory(node)) => node.metadata.modified = time(),
+                                Some(Node::ArcDirectory(node)) => node.metadata.modified = time(),
+                                _ => return Err(FsError::UnknownError),
+                            }
+                        }
                     }
 
-                    fs.remove_child_from_node(inode_of_to_parent, position)?;
+                    Ok(())
                 }
 
-                // Update the file name, and update the modified time.
-                fs.update_node_name(inode, name_of_to)?;
-
-                // The parents are different. Let's update them.
-                if inode_of_from_parent != inode_of_to_parent {
-                    // Remove the file from its parent, and update the
-                    // modified time.
-                    fs.remove_child_from_node(inode_of_from_parent, position_of_from)?;
-
-                    // Add the file to its new parent, and update the modified
-                    // time.
-                    fs.add_child_to_node(inode_of_to_parent, inode)?;
+                // Rename within the same mounted FS instance
+                (Either::Right((from_fs, from_path)), Either::Right((to_fs, to_path)))
+                    if Arc::ptr_eq(&from_fs, &to_fs) =>
+                {
+                    let same_fs = from_fs;
+                    same_fs.rename(&from_path, &to_path).await
                 }
-                // Otherwise, we need to at least update the modified time of the parent.
-                else {
-                    let mut inode = fs.storage.get_mut(inode_of_from_parent);
-                    match inode.as_mut() {
-                        Some(Node::Directory(node)) => node.metadata.modified = time(),
-                        Some(Node::ArcDirectory(node)) => node.metadata.modified = time(),
-                        _ => return Err(FsError::UnknownError),
+
+                // Rename across file systems; we need to do a create and a delete
+                _ => {
+                    let mut from_file = self.new_open_options().read(true).open(from)?;
+                    let mut to_file = self
+                        .new_open_options()
+                        .create_new(true)
+                        .write(true)
+                        .open(to)?;
+                    tokio::io::copy(from_file.as_mut(), to_file.as_mut()).await?;
+                    if let Err(error) = self.remove_file(from) {
+                        tracing::warn!(
+                            ?from,
+                            ?to,
+                            ?error,
+                            "Failed to remove file after cross-FS rename"
+                        );
                     }
+                    Ok(())
                 }
             }
-
-            Ok(())
         })
     }
 
@@ -557,6 +692,23 @@ impl crate::FileSystem for FileSystem {
             InodeResolution::Redirect(fs, path) => {
                 drop(guard);
                 fs.metadata(path.as_path())
+            }
+        }
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> Result<Metadata> {
+        // Read lock.
+        let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+        match guard.inode_of(path)? {
+            InodeResolution::Found(inode) => Ok(guard
+                .storage
+                .get(inode)
+                .ok_or(FsError::UnknownError)?
+                .metadata()
+                .clone()),
+            InodeResolution::Redirect(fs, path) => {
+                drop(guard);
+                fs.symlink_metadata(path.as_path())
             }
         }
     }
@@ -618,8 +770,18 @@ impl crate::FileSystem for FileSystem {
         Ok(())
     }
 
-    fn new_open_options(&self) -> OpenOptions {
+    fn new_open_options(&self) -> OpenOptions<'_> {
         OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        _name: String,
+        path: &Path,
+        fs: Box<dyn crate::FileSystem + Send + Sync>,
+    ) -> Result<()> {
+        let fs: Arc<dyn crate::FileSystem + Send + Sync> = Arc::new(fs);
+        self.mount(path.to_owned(), &fs, PathBuf::from("/"))
     }
 }
 
@@ -739,7 +901,11 @@ impl FileSystemInner {
                             Some(Err(FsError::DirectoryNotEmpty))
                         }
                     }
-
+                    Node::ArcDirectory(ArcDirectoryNode { name, fs, path, .. })
+                        if name.as_os_str() == name_of_directory =>
+                    {
+                        Some(Ok((0, InodeResolution::Redirect(fs.clone(), path.clone()))))
+                    }
                     _ => None,
                 })
                 .ok_or(FsError::InvalidInput)
@@ -775,6 +941,7 @@ impl FileSystemInner {
                     | Node::ReadOnlyFile(ReadOnlyFileNode { inode, name, .. })
                     | Node::CustomFile(CustomFileNode { inode, name, .. })
                     | Node::ArcFile(ArcFileNode { inode, name, .. })
+                    | Node::Symlink(SymlinkNode { inode, name, .. })
                         if name.as_os_str() == name_of_file =>
                     {
                         Some(Some((nth, InodeResolution::Found(*inode))))
@@ -979,6 +1146,7 @@ impl fmt::Debug for FileSystemInner {
                         Node::ReadOnlyFile { .. } => "ro-file",
                         Node::ArcFile { .. } => "arc-file",
                         Node::CustomFile { .. } => "custom-file",
+                        Node::Symlink { .. } => "symlink",
                         Node::Directory { .. } => "dir",
                         Node::ArcDirectory { .. } => "arc-dir",
                     },
@@ -1059,11 +1227,12 @@ impl DirectoryMustBeEmpty {
 
 #[cfg(test)]
 mod test_filesystem {
-    use std::{borrow::Cow, path::Path};
+    use std::{path::Path, sync::Arc};
 
+    use shared_buffer::OwnedBuffer;
     use tokio::io::AsyncReadExt;
 
-    use crate::{mem_fs::*, ops, DirEntry, FileSystem as FS, FileType, FsError};
+    use crate::{DirEntry, FileSystem as FS, FileType, FsError, mem_fs::*, ops};
 
     macro_rules! path {
         ($path:expr) => {
@@ -1105,7 +1274,7 @@ mod test_filesystem {
             "creating the root which already exists",
         );
 
-        assert_eq!(fs.create_dir(path!("/foo")), Ok(()), "creating a directory",);
+        assert_eq!(fs.create_dir(path!("/foo")), Ok(()), "creating a directory");
 
         {
             let fs_inner = fs.inner.read().unwrap();
@@ -1208,7 +1377,7 @@ mod test_filesystem {
             "cannot remove a directory that doesn't exist",
         );
 
-        assert_eq!(fs.create_dir(path!("/foo")), Ok(()), "creating a directory",);
+        assert_eq!(fs.create_dir(path!("/foo")), Ok(()), "creating a directory");
 
         assert_eq!(
             fs.create_dir(path!("/foo/bar")),
@@ -1237,7 +1406,7 @@ mod test_filesystem {
             "removing a sub-directory",
         );
 
-        assert_eq!(fs.remove_dir(path!("/foo")), Ok(()), "removing a directory",);
+        assert_eq!(fs.remove_dir(path!("/foo")), Ok(()), "removing a directory");
 
         {
             let fs_inner = fs.inner.read().unwrap();
@@ -1252,6 +1421,10 @@ mod test_filesystem {
     #[tokio::test]
     async fn test_rename() {
         let fs = FileSystem::default();
+
+        let fs2 = FileSystem::default();
+        fs2.create_dir(path!("/boz")).unwrap();
+        let arc_fs2: Arc<dyn crate::FileSystem + Send + Sync> = Arc::new(fs2);
 
         assert_eq!(
             fs.rename(path!("/"), path!("/bar")).await,
@@ -1276,30 +1449,29 @@ mod test_filesystem {
         assert_eq!(fs.create_dir(path!("/bar")), Ok(()));
 
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/bar/hello1.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/bar/hello1.txt"))
+                .is_ok(),
             "creating a new file (`hello1.txt`)",
         );
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/bar/hello2.txt")),
-                Ok(_),
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/bar/hello2.txt"))
+                .is_ok(),
             "creating a new file (`hello2.txt`)",
         );
+
+        fs.mount(path!(buf "/mnt"), &arc_fs2, path!(buf "/"))
+            .unwrap();
 
         {
             let fs_inner = fs.inner.read().unwrap();
 
-            assert_eq!(fs_inner.storage.len(), 6, "storage has all files");
+            assert_eq!(fs_inner.storage.len(), 7, "storage has all files");
             assert!(
                 matches!(
                     fs_inner.storage.get(ROOT_INODE),
@@ -1308,9 +1480,9 @@ mod test_filesystem {
                         name,
                         children,
                         ..
-                    })) if name == "/" && children == &[1, 3]
+                    })) if name == "/" && children == &[1, 3, 6]
                 ),
-                "`/` contains `foo` and `bar`",
+                "`/` contains `foo` and `bar` and `mnt`",
             );
             assert!(
                 matches!(
@@ -1386,6 +1558,17 @@ mod test_filesystem {
         );
 
         assert_eq!(
+            fs.rename(path!("/mnt/boz"), path!("/mnt/cat")).await,
+            Ok(()),
+            "renaming a directory within a mounted FS"
+        );
+
+        assert!(
+            arc_fs2.read_dir(path!("/cat")).is_ok(),
+            "The directory was renamed in the inner FS"
+        );
+
+        assert_eq!(
             fs.rename(path!("/bar/hello1.txt"), path!("/bar/world1.txt"))
                 .await,
             Ok(()),
@@ -1399,7 +1582,7 @@ mod test_filesystem {
 
             assert_eq!(
                 fs_inner.storage.len(),
-                6,
+                7,
                 "storage has still all directories"
             );
             assert!(
@@ -1410,9 +1593,9 @@ mod test_filesystem {
                         name,
                         children,
                         ..
-                    })) if name == "/" && children == &[3]
+                    })) if name == "/" && children == &[3, 6]
                 ),
-                "`/` contains `bar`",
+                "`/` contains `bar` and `mnt`",
             );
             assert!(
                 matches!(
@@ -1556,13 +1739,11 @@ mod test_filesystem {
         let fs = FileSystem::default();
 
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/foo.txt")),
-                Ok(_)
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/foo.txt"))
+                .is_ok(),
             "creating a new file",
         );
 
@@ -1635,23 +1816,19 @@ mod test_filesystem {
         assert_eq!(fs.create_dir(path!("/bar")), Ok(()), "creating `bar`");
         assert_eq!(fs.create_dir(path!("/baz")), Ok(()), "creating `bar`");
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/a.txt")),
-                Ok(_)
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/a.txt"))
+                .is_ok(),
             "creating `a.txt`",
         );
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/b.txt")),
-                Ok(_)
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/b.txt"))
+                .is_ok(),
             "creating `b.txt`",
         );
 
@@ -1668,7 +1845,7 @@ mod test_filesystem {
                     path,
                     metadata: Ok(Metadata { ft, .. }),
                 }))
-                    if path == path!(buf "/foo") && ft.is_dir()
+                    if path.as_path() == path!("/foo") && ft.is_dir()
             ),
             "checking entry #1",
         );
@@ -1679,7 +1856,7 @@ mod test_filesystem {
                     path,
                     metadata: Ok(Metadata { ft, .. }),
                 }))
-                    if path == path!(buf "/bar") && ft.is_dir()
+                    if path.as_path() == path!("/bar") && ft.is_dir()
             ),
             "checking entry #2",
         );
@@ -1690,7 +1867,7 @@ mod test_filesystem {
                     path,
                     metadata: Ok(Metadata { ft, .. }),
                 }))
-                    if path == path!(buf "/baz") && ft.is_dir()
+                    if path.as_path() == path!("/baz") && ft.is_dir()
             ),
             "checking entry #3",
         );
@@ -1701,7 +1878,7 @@ mod test_filesystem {
                     path,
                     metadata: Ok(Metadata { ft, .. }),
                 }))
-                    if path == path!(buf "/a.txt") && ft.is_file()
+                    if path.as_path() == path!("/a.txt") && ft.is_file()
             ),
             "checking entry #4",
         );
@@ -1712,11 +1889,11 @@ mod test_filesystem {
                     path,
                     metadata: Ok(Metadata { ft, .. }),
                 }))
-                    if path == path!(buf "/b.txt") && ft.is_file()
+                    if path.as_path() == path!("/b.txt") && ft.is_file()
             ),
             "checking entry #5",
         );
-        assert!(matches!(readdir.next(), None), "no more entries");
+        assert!(readdir.next().is_none(), "no more entries");
     }
 
     #[tokio::test]
@@ -1736,13 +1913,11 @@ mod test_filesystem {
             "creating `qux`",
         );
         assert!(
-            matches!(
-                fs.new_open_options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path!("/foo/bar/baz/qux/hello.txt")),
-                Ok(_)
-            ),
+            fs.new_open_options()
+                .write(true)
+                .create_new(true)
+                .open(path!("/foo/bar/baz/qux/hello.txt"))
+                .is_ok(),
             "creating `hello.txt`",
         );
 
@@ -1838,27 +2013,45 @@ mod test_filesystem {
     }
 
     #[tokio::test]
+    async fn read_dir_rebases_mount_paths() {
+        let mounted = FileSystem::default();
+        ops::touch(&mounted, "/file.txt").unwrap();
+        let mounted: Arc<dyn crate::FileSystem + Send + Sync> = Arc::new(mounted);
+
+        let fs = FileSystem::default();
+        fs.mount("/mnt".into(), &mounted, "/".into()).unwrap();
+
+        let entries: Vec<_> = fs
+            .read_dir(Path::new("/mnt"))
+            .unwrap()
+            .map(|e| e.unwrap().path)
+            .collect();
+
+        assert_eq!(entries, vec![Path::new("/mnt/file.txt").to_path_buf()]);
+    }
+
+    #[tokio::test]
     async fn test_merge_flat() {
         let main = FileSystem::default();
 
         let other = FileSystem::default();
         crate::ops::create_dir_all(&other, "/a/x").unwrap();
         other
-            .insert_ro_file(&Path::new("/a/x/a.txt"), Cow::Borrowed(b"a"))
+            .insert_ro_file(Path::new("/a/x/a.txt"), OwnedBuffer::from_static(b"a"))
             .unwrap();
         other
-            .insert_ro_file(&Path::new("/a/x/b.txt"), Cow::Borrowed(b"b"))
+            .insert_ro_file(Path::new("/a/x/b.txt"), OwnedBuffer::from_static(b"b"))
             .unwrap();
         other
-            .insert_ro_file(&Path::new("/a/x/c.txt"), Cow::Borrowed(b"c"))
+            .insert_ro_file(Path::new("/a/x/c.txt"), OwnedBuffer::from_static(b"c"))
             .unwrap();
 
-        let out = other.read_dir(&Path::new("/")).unwrap();
+        let out = other.read_dir(Path::new("/")).unwrap();
         dbg!(&out);
 
         let other: Arc<dyn crate::FileSystem + Send + Sync> = Arc::new(other);
 
-        main.mount_directory_entries(&Path::new("/"), &other, &Path::new("/a"))
+        main.mount_directory_entries(Path::new("/"), &other, Path::new("/a"))
             .unwrap();
 
         let mut buf = Vec::new();
@@ -1866,7 +2059,7 @@ mod test_filesystem {
         let mut f = main
             .new_open_options()
             .read(true)
-            .open(&Path::new("/x/a.txt"))
+            .open(Path::new("/x/a.txt"))
             .unwrap();
         f.read_to_end(&mut buf).await.unwrap();
 

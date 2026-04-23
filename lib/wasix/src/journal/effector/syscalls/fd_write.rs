@@ -46,14 +46,18 @@ impl JournalEffector {
     }
 
     pub fn apply_fd_write<M: MemorySize>(
-        ctx: &FunctionEnvMut<'_, WasiEnv>,
+        ctx: &mut FunctionEnvMut<'_, WasiEnv>,
         fd: Fd,
         offset: u64,
         data: Cow<'_, [u8]>,
     ) -> anyhow::Result<()> {
+        let fd_entry = ctx.data().state.fs.get_fd(fd).map_err(|err| {
+            anyhow::format_err!("journal restore error: invalid descriptor (fd={fd}) - {err}")
+        })?;
         fd_write_internal(
             ctx,
             fd,
+            fd_entry,
             FdWriteSource::<'_, M>::Buffer(data),
             offset,
             true,
@@ -61,11 +65,7 @@ impl JournalEffector {
         )?
         .map_err(|err| {
             anyhow::format_err!(
-                "journal restore error: failed to write to descriptor (fd={}, offset={}) - {}",
-                fd,
-                offset,
-                err
-            )
+                "journal restore error: failed to write to descriptor (fd={fd}, offset={offset}) - {err}")
         })?;
         Ok(())
     }

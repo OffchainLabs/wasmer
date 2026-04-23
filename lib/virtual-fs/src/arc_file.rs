@@ -2,7 +2,6 @@
 //! effectively this is a symbolic link without all the complex path redirection
 
 use crate::{ClonableVirtualFile, VirtualFile};
-use derivative::Derivative;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{
@@ -11,13 +10,11 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct ArcFile<T>
 where
     T: VirtualFile + Send + Sync + 'static,
 {
-    #[derivative(Debug = "ignore")]
     inner: Arc<Mutex<Box<T>>>,
 }
 
@@ -117,6 +114,10 @@ where
     fn created_time(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.created_time()
+    }
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> crate::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_times(atime, mtime)
     }
     fn size(&self) -> u64 {
         let inner = self.inner.lock().unwrap();

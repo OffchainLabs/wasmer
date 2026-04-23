@@ -6,25 +6,47 @@ use std::{
 };
 
 use anyhow::{Context, Error};
-use futures::{future::BoxFuture, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use once_cell::sync::OnceCell;
 use petgraph::visit::EdgeRef;
-use virtual_fs::{FileSystem, OverlayFileSystem, WebcVolumeFileSystem};
-use webc::{
-    compat::{Container, Volume},
-    metadata::annotations::Atom as AtomAnnotation,
-};
+use virtual_fs::{FileSystem, UnionFileSystem, WebcVolumeFileSystem};
+use wasmer_config::package::PackageId;
+use wasmer_package::utils::wasm_annotations_to_features;
+use webc::metadata::annotations::Atom as AtomAnnotation;
+use webc::{Container, Volume};
 
 use crate::{
     bin_factory::{BinaryPackage, BinaryPackageCommand},
     runtime::{
         package_loader::PackageLoader,
         resolver::{
-            DependencyGraph, ItemLocation, PackageId, PackageSummary, Resolution,
-            ResolvedFileSystemMapping, ResolvedPackage,
+            DependencyGraph, ItemLocation, PackageSummary, Resolution, ResolvedFileSystemMapping,
+            ResolvedPackage,
         },
     },
 };
+
+use super::to_module_hash;
+
+/// Convert WebAssembly feature annotations to a Features object
+fn wasm_annotation_to_features(
+    wasm_annotation: &webc::metadata::annotations::Wasm,
+) -> Option<wasmer_types::Features> {
+    Some(wasm_annotations_to_features(&wasm_annotation.features))
+}
+
+/// Extract WebAssembly features from atom metadata if available
+fn extract_features_from_atom_metadata(
+    atom_metadata: &webc::metadata::Atom,
+) -> Option<wasmer_types::Features> {
+    if let Ok(Some(wasm_annotation)) = atom_metadata
+        .annotation::<webc::metadata::annotations::Wasm>(webc::metadata::annotations::Wasm::KEY)
+    {
+        wasm_annotation_to_features(&wasm_annotation)
+    } else {
+        None
+    }
+}
 
 /// The maximum number of packages that will be loaded in parallel.
 const MAX_PARALLEL_DOWNLOADS: usize = 32;
@@ -35,20 +57,25 @@ pub async fn load_package_tree(
     root: &Container,
     loader: &dyn PackageLoader,
     resolution: &Resolution,
+    root_is_local_dir: bool,
 ) -> Result<BinaryPackage, Error> {
     let mut containers = fetch_dependencies(loader, &resolution.package, &resolution.graph).await?;
     containers.insert(resolution.package.root_package.clone(), root.clone());
-    let fs = filesystem(&containers, &resolution.package)?;
+    let package_ids = containers.keys().cloned().collect();
+    let fs_opt = filesystem(&containers, &resolution.package, root_is_local_dir)?;
 
     let root = &resolution.package.root_package;
-    let commands: Vec<BinaryPackageCommand> =
-        commands(&resolution.package.commands, &containers, resolution)?;
+    let commands = commands(&resolution.package.commands, &containers, resolution)?;
 
-    let file_system_memory_footprint = count_file_system(&fs, Path::new("/"));
+    let file_system_memory_footprint = if let Some(fs) = &fs_opt {
+        count_file_system(fs, Path::new("/"))
+    } else {
+        0
+    };
 
     let loaded = BinaryPackage {
-        package_name: root.package_name.clone(),
-        version: root.version.clone(),
+        id: root.clone(),
+        package_ids,
         when_cached: crate::syscalls::platform_clock_time_get(
             wasmer_wasix_types::wasi::Snapshot0Clockid::Monotonic,
             1_000_000,
@@ -57,10 +84,12 @@ pub async fn load_package_tree(
         .map(|ts| ts as u128),
         hash: OnceCell::new(),
         entrypoint_cmd: resolution.package.entrypoint.clone(),
-        webc_fs: Arc::new(fs),
+        webc_fs: fs_opt.map(Arc::new),
         commands,
         uses: Vec::new(),
         file_system_memory_footprint,
+
+        additional_host_mapped_directories: vec![],
     };
 
     Ok(loaded)
@@ -97,6 +126,7 @@ fn commands(
 
 /// Given a [`webc::metadata::Command`], figure out which atom it uses and load
 /// that atom into a [`BinaryPackageCommand`].
+#[tracing::instrument(skip_all, fields(%package_id, %command_name))]
 fn load_binary_command(
     package_id: &PackageId,
     command_name: &str,
@@ -122,7 +152,7 @@ fn load_binary_command(
 
     let package = &containers[package_id];
 
-    let webc = match dependency {
+    let (webc, resolved_package_id) = match dependency {
         Some(dep) => {
             let ix = resolution
                 .graph
@@ -137,24 +167,59 @@ fn load_binary_command(
                 .with_context(|| format!("Unable to find the \"{dep}\" dependency for the \"{command_name}\" command in \"{package_id}\""))?;
 
             let other_package = graph.node_weight(edge_reference.target()).unwrap();
-            &containers[&other_package.id]
+            let id = &other_package.id;
+
+            tracing::debug!(
+                dependency=%dep,
+                resolved_package_id=%id,
+                "command atom resolution: resolved dependency",
+            );
+            (&containers[id], id)
         }
-        None => package,
+        None => (package, package_id),
     };
 
     let atom = webc.get_atom(&atom_name);
 
     if atom.is_none() && cmd.annotations.is_empty() {
-        return Ok(legacy_atom_hack(webc, command_name, cmd));
+        tracing::info!("applying legacy atom hack");
+        return legacy_atom_hack(webc, package_id, command_name, cmd);
     }
 
+    let hash = to_module_hash(webc.manifest().atom_signature(&atom_name)?);
+
     let atom = atom.with_context(|| {
+
+        let available_atoms = webc.atoms().keys().map(|x| x.as_str()).collect::<Vec<_>>().join(",");
+
+        tracing::warn!(
+            %atom_name,
+            %resolved_package_id,
+            %available_atoms,
+            "invalid command: could not find atom in package",
+        );
+
         format!(
-            "The '{command_name}' command uses the '{atom_name}' atom, but it isn't present in the WEBC file"
+            "The '{command_name}' command uses the '{atom_name}' atom, but it isn't present in the package: {resolved_package_id})"
         )
     })?;
 
-    let cmd = BinaryPackageCommand::new(command_name.to_string(), cmd.clone(), atom);
+    // Get WebAssembly features from manifest atom annotations
+    let features = if let Some(atom_metadata) = webc.manifest().atoms.get(&atom_name) {
+        extract_features_from_atom_metadata(atom_metadata)
+    } else {
+        None
+    };
+
+    let cmd = BinaryPackageCommand::new(
+        command_name.to_string(),
+        cmd.clone(),
+        atom,
+        hash,
+        features,
+        package_id.clone(),
+        resolved_package_id.clone(),
+    );
 
     Ok(Some(cmd))
 }
@@ -163,7 +228,7 @@ fn atom_name_for_command(
     command_name: &str,
     cmd: &webc::metadata::Command,
 ) -> Result<Option<AtomAnnotation>, anyhow::Error> {
-    use webc::metadata::annotations::{EMSCRIPTEN_RUNNER_URI, WASI_RUNNER_URI, WCGI_RUNNER_URI};
+    use webc::metadata::annotations::{WASI_RUNNER_URI, WCGI_RUNNER_URI};
 
     if let Some(atom) = cmd
         .atom()
@@ -172,7 +237,7 @@ fn atom_name_for_command(
         return Ok(Some(atom));
     }
 
-    if [WASI_RUNNER_URI, WCGI_RUNNER_URI, EMSCRIPTEN_RUNNER_URI]
+    if [WASI_RUNNER_URI, WCGI_RUNNER_URI]
         .iter()
         .any(|uri| cmd.runner.starts_with(uri))
     {
@@ -201,10 +266,15 @@ fn atom_name_for_command(
 /// for more.
 fn legacy_atom_hack(
     webc: &Container,
+    package_id: &PackageId,
     command_name: &str,
     metadata: &webc::metadata::Command,
-) -> Option<BinaryPackageCommand> {
-    let (name, atom) = webc.atoms().into_iter().next()?;
+) -> Result<Option<BinaryPackageCommand>, anyhow::Error> {
+    let (name, atom) = webc
+        .atoms()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::Error::msg("container does not have any atom"))?;
 
     tracing::debug!(
         command_name,
@@ -213,11 +283,24 @@ fn legacy_atom_hack(
         "(hack) The command metadata is malformed. Falling back to the first atom in the WEBC file",
     );
 
-    Some(BinaryPackageCommand::new(
+    let hash = to_module_hash(webc.manifest().atom_signature(&name)?);
+
+    // Get WebAssembly features from manifest atom annotations
+    let features = if let Some(atom_metadata) = webc.manifest().atoms.get(&name) {
+        extract_features_from_atom_metadata(atom_metadata)
+    } else {
+        None
+    };
+
+    Ok(Some(BinaryPackageCommand::new(
         command_name.to_string(),
         metadata.clone(),
         atom,
-    ))
+        hash,
+        features,
+        package_id.clone(),
+        package_id.clone(),
+    )))
 }
 
 async fn fetch_dependencies(
@@ -286,36 +369,145 @@ fn count_file_system(fs: &dyn FileSystem, path: &Path) -> u64 {
 /// Given a set of [`ResolvedFileSystemMapping`]s and the [`Container`] for each
 /// package in a dependency tree, construct the resulting filesystem.
 ///
-/// # Note to future readers
-///
-/// Sooo... this code is a bit convoluted because we're constrained by the
-/// filesystem implementations we've got available.
-///
-/// Ideally, we would create a WebcVolumeFileSystem for each volume we're
-/// using, then we'd have a single "union" filesystem which lets you mount
-/// filesystem objects under various paths and can deal with conflicts.
-///
-/// The OverlayFileSystem lets us make files from multiple filesystem
-/// implementations available at the same time, however all of the
-/// filesystems will be mounted at "/", when the user wants to mount volumes
-/// at arbitrary locations.
-///
-/// The TmpFileSystem *does* allow mounting at non-root paths, however it can't
-/// handle nested paths (e.g. mounting to "/lib" and "/lib/python3.10" - see
-/// <https://github.com/wasmerio/wasmer/issues/3678> for more) and you aren't
-/// allowed to mount to "/" because it's a special directory that already
-/// exists.
-///
-/// As a result, we'll duct-tape things together and hope for the best 🤞
+/// Returns `Ok(None)` if no filesystem mappings were specified.
 fn filesystem(
     packages: &HashMap<PackageId, Container>,
     pkg: &ResolvedPackage,
-) -> Result<impl FileSystem + Send + Sync, Error> {
-    let mut filesystems = Vec::new();
+    root_is_local_dir: bool,
+) -> Result<Option<UnionFileSystem>, Error> {
+    if pkg.filesystem.is_empty() {
+        return Ok(None);
+    }
+
+    let mut found_v2 = None;
+    let mut found_v3 = None;
+
+    for ResolvedFileSystemMapping { package, .. } in &pkg.filesystem {
+        let container = packages.get(package).with_context(|| {
+            format!(
+                "\"{}\" wants to use the \"{}\" package, but it isn't in the dependency tree",
+                pkg.root_package, package,
+            )
+        })?;
+
+        match container.version() {
+            webc::Version::V1 => {
+                anyhow::bail!(
+                    "the package '{package}' is a webc v1 package, but webc v1 support was removed"
+                );
+            }
+            webc::Version::V2 => {
+                if found_v2.is_none() {
+                    found_v2 = Some(package.clone());
+                }
+            }
+            webc::Version::V3 => {
+                if found_v3.is_none() {
+                    found_v3 = Some(package.clone());
+                }
+            }
+            other => {
+                anyhow::bail!("the package '{package}' has an unknown webc version: {other}");
+            }
+        }
+    }
+
+    match (found_v2, found_v3) {
+        (None, Some(_)) => filesystem_v3(packages, pkg, root_is_local_dir).map(Some),
+        (Some(_), None) => filesystem_v2(packages, pkg, root_is_local_dir).map(Some),
+        (Some(v2), Some(v3)) => {
+            anyhow::bail!(
+                "Mix of webc v2 and v3 in the same dependency tree is not supported; v2: {v2}, v3: {v3}"
+            )
+        }
+        (None, None) => anyhow::bail!("Internal error: no packages found in tree"),
+    }
+}
+
+/// Build the filesystem for webc v3 packages.
+fn filesystem_v3(
+    packages: &HashMap<PackageId, Container>,
+    pkg: &ResolvedPackage,
+    root_is_local_dir: bool,
+) -> Result<UnionFileSystem, Error> {
     let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
 
-    let mut mountings: Vec<_> = pkg.filesystem.iter().collect();
-    mountings.sort_by_key(|m| std::cmp::Reverse(m.mount_path.as_path()));
+    let union_fs = UnionFileSystem::new();
+
+    for ResolvedFileSystemMapping {
+        mount_path,
+        volume_name,
+        package,
+        ..
+    } in &pkg.filesystem
+    {
+        if *package == pkg.root_package && root_is_local_dir {
+            continue;
+        }
+
+        if mount_path.as_path() == Path::new("/") {
+            tracing::warn!(
+                "The \"{package}\" package wants to mount a volume at \"/\", which breaks WASIX modules' filesystems",
+            );
+        }
+
+        // Note: We want to reuse existing Volume instances if we can. That way
+        // we can keep the memory usage down. A webc::compat::Volume is
+        // reference-counted, anyway.
+        // looks like we need to insert it
+        let container = packages.get(package).with_context(|| {
+            format!(
+                "\"{}\" wants to use the \"{}\" package, but it isn't in the dependency tree",
+                pkg.root_package, package,
+            )
+        })?;
+        let container_volumes = match volumes.entry(package) {
+            std::collections::hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => &*entry.insert(container.volumes()),
+        };
+
+        let volume = container_volumes.get(volume_name).with_context(|| {
+            format!("The \"{package}\" package doesn't have a \"{volume_name}\" volume")
+        })?;
+
+        let webc_vol = WebcVolumeFileSystem::new(volume.clone());
+        union_fs.mount(volume_name.clone(), mount_path, Box::new(webc_vol))?;
+    }
+
+    Ok(union_fs)
+}
+
+/// Build the filesystem for webc v2 packages.
+///
+// # Note to future readers
+//
+// Sooo... this code is a bit convoluted because we're constrained by the
+// filesystem implementations we've got available.
+//
+// Ideally, we would create a WebcVolumeFileSystem for each volume we're
+// using, then we'd have a single "union" filesystem which lets you mount
+// filesystem objects under various paths and can deal with conflicts.
+//
+// The OverlayFileSystem lets us make files from multiple filesystem
+// implementations available at the same time, however all of the
+// filesystems will be mounted at "/", when the user wants to mount volumes
+// at arbitrary locations.
+//
+// The TmpFileSystem *does* allow mounting at non-root paths, however it can't
+// handle nested paths (e.g. mounting to "/lib" and "/lib/python3.10" - see
+// <https://github.com/wasmerio/wasmer/issues/3678> for more) and you aren't
+// allowed to mount to "/" because it's a special directory that already
+// exists.
+//
+// As a result, we'll duct-tape things together and hope for the best 🤞
+fn filesystem_v2(
+    packages: &HashMap<PackageId, Container>,
+    pkg: &ResolvedPackage,
+    root_is_local_dir: bool,
+) -> Result<UnionFileSystem, Error> {
+    let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
+
+    let union_fs = UnionFileSystem::new();
 
     for ResolvedFileSystemMapping {
         mount_path,
@@ -324,6 +516,16 @@ fn filesystem(
         original_path,
     } in &pkg.filesystem
     {
+        if *package == pkg.root_package && root_is_local_dir {
+            continue;
+        }
+
+        if mount_path.as_path() == Path::new("/") {
+            tracing::warn!(
+                "The \"{package}\" package wants to mount a volume at \"/\", which breaks WASIX modules' filesystems",
+            );
+        }
+
         // Note: We want to reuse existing Volume instances if we can. That way
         // we can keep the memory usage down. A webc::compat::Volume is
         // reference-counted, anyway.
@@ -345,30 +547,36 @@ fn filesystem(
             format!("The \"{package}\" package doesn't have a \"{volume_name}\" volume")
         })?;
 
-        let original_path = PathBuf::from(original_path);
-        let mount_path = mount_path.clone();
-        // Get a filesystem which will map "$mount_dir/some-path" to
-        // "$original_path/some-path" on the original volume
-        let fs =
-            MappedPathFileSystem::new(WebcVolumeFileSystem::new(volume.clone()), move |path| {
-                let without_mount_dir = path
-                    .strip_prefix(&mount_path)
-                    .map_err(|_| virtual_fs::FsError::BaseNotDirectory)?;
-                let path_on_original_volume = original_path.join(without_mount_dir);
-                Ok(path_on_original_volume)
-            });
+        // UnionFileSystem strips the mount point before forwarding paths to the
+        // mounted filesystem. That means paths are already relative to the
+        // mount root and shouldn't be stripped by mount_path.
+        let fs = if let Some(original) = original_path {
+            let original = PathBuf::from(original);
 
-        filesystems.push(fs);
+            MappedPathFileSystem::new(
+                WebcVolumeFileSystem::new(volume.clone()),
+                Box::new(move |path: &Path| Ok(original.join(strip_root_prefix(path))))
+                    as DynPathMapper,
+            )
+        } else {
+            MappedPathFileSystem::new(
+                WebcVolumeFileSystem::new(volume.clone()),
+                Box::new(move |path: &Path| Ok(strip_root_prefix(path))) as DynPathMapper,
+            )
+        };
+
+        union_fs.mount(volume_name.clone(), mount_path, Box::new(fs))?;
     }
 
-    let fs = OverlayFileSystem::new(virtual_fs::EmptyFileSystem::default(), filesystems);
-
-    Ok(fs)
+    Ok(union_fs)
 }
 
-/// A [`FileSystem`] implementation that lets you map the [`Path`] to something
-/// else.
-#[derive(Clone, PartialEq)]
+fn strip_root_prefix(path: &Path) -> PathBuf {
+    path.strip_prefix("/").unwrap_or(path).to_owned()
+}
+
+type DynPathMapper = Box<dyn Fn(&Path) -> Result<PathBuf, virtual_fs::FsError> + Send + Sync>;
+
 struct MappedPathFileSystem<F, M> {
     inner: F,
     map: M,
@@ -395,6 +603,11 @@ where
     F: FileSystem,
     M: Fn(&Path) -> Result<PathBuf, virtual_fs::FsError> + Send + Sync + 'static,
 {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        let path = self.path(path)?;
+        self.inner.readlink(&path)
+    }
+
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
         let path = self.path(path)?;
         self.inner.read_dir(&path)
@@ -425,13 +638,28 @@ where
         self.inner.metadata(&path)
     }
 
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
+        let path = self.path(path)?;
+        self.inner.symlink_metadata(&path)
+    }
+
     fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
         let path = self.path(path)?;
         self.inner.remove_file(&path)
     }
 
-    fn new_open_options(&self) -> virtual_fs::OpenOptions {
+    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        name: String,
+        path: &Path,
+        fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> virtual_fs::Result<()> {
+        let path = self.path(path)?;
+        self.inner.mount(name, path.as_path(), fs)
     }
 }
 
@@ -462,5 +690,98 @@ where
             .field("inner", &self.inner)
             .field("map", &std::any::type_name::<M>())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashMap},
+        path::{Path, PathBuf},
+    };
+
+    use ciborium::value::Value;
+    use virtual_fs::FileSystem;
+    use wasmer_config::package::PackageId;
+    use webc::{
+        Container,
+        indexmap::IndexMap,
+        metadata::{
+            Manifest,
+            annotations::{FileSystemMapping, FileSystemMappings},
+        },
+        v2::{
+            SignatureAlgorithm,
+            read::OwnedReader,
+            write::{DirEntry, Directory, FileEntry, Writer},
+        },
+    };
+
+    use super::{ResolvedFileSystemMapping, ResolvedPackage, filesystem_v2};
+
+    #[test]
+    fn v2_filesystem_mapping_resolves_mount_paths() {
+        // Regression test: v2 fs mounts are already relative to the mount root,
+        // so stripping the mount path again breaks lookups like /public.
+        let mut manifest = Manifest::default();
+        let fs = FileSystemMappings(vec![FileSystemMapping {
+            from: None,
+            volume_name: "atom".to_string(),
+            host_path: Some("/public".to_string()),
+            mount_path: "/public".to_string(),
+        }]);
+        let mut package = IndexMap::new();
+        package.insert(
+            FileSystemMappings::KEY.to_string(),
+            Value::serialized(&fs).unwrap(),
+        );
+        manifest.package = package;
+
+        let mut public_children = BTreeMap::new();
+        public_children.insert(
+            "index.html".parse().unwrap(),
+            DirEntry::File(FileEntry::from(b"ok".as_slice())),
+        );
+        let public_dir = Directory {
+            children: public_children,
+        };
+        let mut root_children = BTreeMap::new();
+        root_children.insert("public".parse().unwrap(), DirEntry::Dir(public_dir));
+        let atom_dir = Directory {
+            children: root_children,
+        };
+
+        let writer = Writer::default().write_manifest(&manifest).unwrap();
+        let writer = writer.write_atoms(BTreeMap::new()).unwrap();
+        let writer = writer.with_volume("atom", atom_dir).unwrap();
+        let bytes = writer.finish(SignatureAlgorithm::None).unwrap();
+
+        let reader = OwnedReader::parse(bytes).unwrap();
+        let container = Container::from(reader);
+
+        let pkg_id = PackageId::new_named("ns/pkg", "0.1.0".parse().unwrap());
+        let mut packages = HashMap::new();
+        packages.insert(pkg_id.clone(), container);
+
+        let pkg = ResolvedPackage {
+            root_package: pkg_id.clone(),
+            commands: BTreeMap::new(),
+            entrypoint: None,
+            filesystem: vec![ResolvedFileSystemMapping {
+                mount_path: PathBuf::from("/public"),
+                volume_name: "atom".to_string(),
+                original_path: Some("/public".to_string()),
+                package: pkg_id,
+            }],
+        };
+
+        let union_fs = filesystem_v2(&packages, &pkg, false).unwrap();
+        assert!(union_fs.metadata(Path::new("/public")).unwrap().is_dir());
+        assert!(
+            union_fs
+                .metadata(Path::new("/public/index.html"))
+                .unwrap()
+                .is_file()
+        );
     }
 }

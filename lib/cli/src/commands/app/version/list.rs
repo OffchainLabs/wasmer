@@ -1,16 +1,17 @@
-use wasmer_api::types::{DeployAppVersionsSortBy, GetDeployAppVersionsVars};
+use wasmer_backend_api::types::{DeployAppVersionsSortBy, GetDeployAppVersionsVars};
 
 use crate::{
-    commands::{app::util::AppIdentOpts, AsyncCliCommand},
-    opts::{ApiOpts, ListFormatOpts},
+    commands::{AsyncCliCommand, app::util::AppIdentOpts},
+    config::WasmerEnv,
+    opts::ListFormatOpts,
 };
 
 /// List versions of an app.
 #[derive(clap::Parser, Debug)]
 pub struct CmdAppVersionList {
     #[clap(flatten)]
-    #[allow(missing_docs)]
-    pub api: ApiOpts,
+    pub env: WasmerEnv,
+
     #[allow(missing_docs)]
     #[clap(flatten)]
     pub fmt: ListFormatOpts,
@@ -72,11 +73,12 @@ impl AsyncCliCommand for CmdAppVersionList {
     type Output = ();
 
     async fn run_async(self) -> Result<(), anyhow::Error> {
-        let client = self.api.client()?;
+        let client = self.env.client()?;
         let (_ident, app) = self.ident.load_app(&client).await?;
 
         let versions = if self.all {
-            wasmer_api::query::all_app_versions(&client, app.owner.global_name, app.name).await?
+            wasmer_backend_api::query::all_app_versions(&client, app.owner.global_name, app.name)
+                .await?
         } else {
             let vars = GetDeployAppVersionsVars {
                 owner: app.owner.global_name,
@@ -90,7 +92,7 @@ impl AsyncCliCommand for CmdAppVersionList {
             };
 
             let versions =
-                wasmer_api::query::get_deploy_app_versions(&client, vars.clone()).await?;
+                wasmer_backend_api::query::get_deploy_app_versions(&client, vars.clone()).await?;
 
             versions
                 .edges

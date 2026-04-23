@@ -1,6 +1,7 @@
 mod dummy_waker;
 mod owned_mutex_guard;
 pub mod store;
+pub mod thread_local_executor;
 mod thread_parker;
 
 #[cfg(feature = "js")]
@@ -9,7 +10,7 @@ pub(crate) mod web;
 pub use self::{dummy_waker::WasiDummyWaker, thread_parker::WasiParkingLot};
 
 pub(crate) use owned_mutex_guard::{
-    read_owned, write_owned, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, read_owned, write_owned,
 };
 
 use std::collections::BTreeSet;

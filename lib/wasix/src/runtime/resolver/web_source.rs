@@ -1,5 +1,4 @@
 use std::{
-    fmt::Write as _,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,13 +10,13 @@ use http::Method;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
-use webc::compat::Container;
+use wasmer_config::package::{PackageHash, PackageId, PackageSource};
+use wasmer_package::utils::from_disk;
 
 use crate::{
     http::{HttpClient, HttpRequest},
     runtime::resolver::{
-        DistributionInfo, PackageInfo, PackageSpecifier, PackageSummary, QueryError, Source,
-        WebcHash,
+        DistributionInfo, PackageInfo, PackageSummary, QueryError, Source, WebcHash,
     },
 };
 
@@ -26,7 +25,7 @@ use crate::{
 /// # Implementation Notes
 ///
 /// Unlike other [`Source`] implementations, this will need to download
-/// a package if it is a [`PackageSpecifier::Url`]. Optionally, these downloaded
+/// a package if it is a [`PackageSource::Url`]. Optionally, these downloaded
 /// packages can be cached in a local directory.
 ///
 /// After a certain period ([`WebSource::with_retry_period()`]), the
@@ -137,19 +136,18 @@ impl WebSource {
                 )
             })?;
 
-        if let Some(etag) = etag {
-            if let Err(e) = self
+        if let Some(etag) = etag
+            && let Err(e) = self
                 .atomically_save_file(path.with_extension("etag"), etag.as_bytes())
                 .await
-            {
-                tracing::warn!(
-                    error=&*e,
-                    %etag,
-                    %url,
-                    path=%path.display(),
-                    "Unable to save the etag file",
-                )
-            }
+        {
+            tracing::warn!(
+                error=&*e,
+                %etag,
+                %url,
+                path=%path.display(),
+                "Unable to save the etag file",
+            )
         }
 
         Ok(path)
@@ -224,17 +222,8 @@ impl WebSource {
 
         Ok((body, etag))
     }
-}
 
-#[async_trait::async_trait]
-impl Source for WebSource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
-    async fn query(&self, package: &PackageSpecifier) -> Result<Vec<PackageSummary>, QueryError> {
-        let url = match package {
-            PackageSpecifier::Url(url) => url,
-            _ => return Err(QueryError::Unsupported),
-        };
-
+    async fn load_url(&self, url: &Url) -> Result<Vec<PackageSummary>, anyhow::Error> {
         let local_path = self
             .get_locally_cached_file(url)
             .await
@@ -245,9 +234,13 @@ impl Source for WebSource {
 
         // Note: We want to use Container::from_disk() rather than the bytes
         // our HTTP client gave us because then we can use memory-mapped files
-        let container = crate::block_in_place(|| Container::from_disk(&local_path))
+        let container = crate::block_in_place(|| from_disk(&local_path))
             .with_context(|| format!("Unable to load \"{}\"", local_path.display()))?;
-        let pkg = PackageInfo::from_manifest(container.manifest())
+
+        let id = PackageInfo::package_id_from_manifest(container.manifest())?
+            .unwrap_or_else(|| PackageId::Hash(PackageHash::from_sha256_bytes(webc_sha256.0)));
+
+        let pkg = PackageInfo::from_manifest(id, container.manifest(), container.version())
             .context("Unable to determine the package's metadata")?;
 
         let dist = DistributionInfo {
@@ -259,16 +252,30 @@ impl Source for WebSource {
     }
 }
 
+#[async_trait::async_trait]
+impl Source for WebSource {
+    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
+        let url = match package {
+            PackageSource::Url(url) => url,
+            _ => {
+                return Err(QueryError::Unsupported {
+                    query: package.clone(),
+                });
+            }
+        };
+
+        self.load_url(url)
+            .await
+            .map_err(|error| QueryError::new_other(error, package))
+    }
+}
+
 fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::default();
     hasher.update(bytes);
     let hash = hasher.finalize();
-    let mut buffer = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        write!(buffer, "{byte:02X}").expect("Unreachable");
-    }
-
-    buffer
+    hex::encode_upper(hash)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -327,13 +334,13 @@ fn classify_cache_using_mtime(
         } => {
             return Err(CacheState::UnableToVerify { path });
         }
-        CacheInfo::Miss { .. } => return Err(CacheState::Miss),
+        CacheInfo::Miss => return Err(CacheState::Miss),
     };
 
-    if let Ok(time_since_last_modified) = last_modified.elapsed() {
-        if time_since_last_modified <= invalidation_threshold {
-            return Ok(path);
-        }
+    if let Ok(time_since_last_modified) = last_modified.elapsed()
+        && time_since_last_modified <= invalidation_threshold
+    {
+        return Ok(path);
     }
 
     match etag {
@@ -372,7 +379,7 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use futures::future::BoxFuture;
-    use http::{header::IntoHeaderName, HeaderMap, StatusCode};
+    use http::{HeaderMap, StatusCode, header::IntoHeaderName};
     use tempfile::TempDir;
 
     use crate::http::HttpResponse;
@@ -380,7 +387,9 @@ mod tests {
     use super::*;
 
     const PYTHON: &[u8] = include_bytes!("../../../../c-api/examples/assets/python-0.1.0.wasmer");
-    const COREUTILS: &[u8] = include_bytes!("../../../../../tests/integration/cli/tests/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc");
+    const COREUTILS: &[u8] = include_bytes!(
+        "../../../../../tests/integration/cli/tests/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc"
+    );
     const DUMMY_URL: &str = "http://my-registry.io/some/package";
     const DUMMY_URL_HASH: &str = "4D7481F44E1D971A8C60D3C7BD505E2727602CF9369ED623920E029C2BA2351D";
 
@@ -454,13 +463,13 @@ mod tests {
             .with_etag(dummy_etag)
             .build()]);
         let source = WebSource::new(temp.path(), Arc::new(client));
-        let spec = PackageSpecifier::Url(DUMMY_URL.parse().unwrap());
+        let spec = PackageSource::Url(DUMMY_URL.parse().unwrap());
 
         let summaries = source.query(&spec).await.unwrap();
 
         // We got the right response, as expected
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].pkg.name, "python");
+        assert_eq!(summaries[0].pkg.id.as_named().unwrap().full_name, "python");
         // But we should have also cached the file and etag
         let path = temp.path().join(DUMMY_URL_HASH);
         assert!(path.exists());
@@ -485,7 +494,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let client = Arc::new(DummyClient::with_responses([]));
         let source = WebSource::new(temp.path(), client.clone());
-        let spec = PackageSpecifier::Url(DUMMY_URL.parse().unwrap());
+        let spec = PackageSource::Url(DUMMY_URL.parse().unwrap());
         // Prime the cache
         std::fs::write(temp.path().join(DUMMY_URL_HASH), PYTHON).unwrap();
 
@@ -493,7 +502,7 @@ mod tests {
 
         // We got the right response, as expected
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].pkg.name, "python");
+        assert_eq!(summaries[0].pkg.id.as_named().unwrap().full_name, "python");
         // And no requests were sent
         assert_eq!(client.requests.lock().unwrap().len(), 0);
     }
@@ -517,13 +526,13 @@ mod tests {
         let python_path = temp.path().join(DUMMY_URL_HASH);
         std::fs::write(&python_path, PYTHON).unwrap();
         let source = WebSource::new(temp.path(), client.clone()).with_retry_period(Duration::ZERO);
-        let spec = PackageSpecifier::Url(DUMMY_URL.parse().unwrap());
+        let spec = PackageSource::Url(DUMMY_URL.parse().unwrap());
 
         let summaries = source.query(&spec).await.unwrap();
 
         // We got the right response, as expected
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].pkg.name, "python");
+        assert_eq!(summaries[0].pkg.id.as_named().unwrap().full_name, "python");
         // And one request was sent
         assert_eq!(client.requests.lock().unwrap().len(), 1);
         // The etag file wasn't written
@@ -556,13 +565,16 @@ mod tests {
         // but create a source that will always want to re-check the etags
         let source =
             WebSource::new(temp.path(), client.clone()).with_retry_period(Duration::new(0, 0));
-        let spec = PackageSpecifier::Url(DUMMY_URL.parse().unwrap());
+        let spec = PackageSource::Url(DUMMY_URL.parse().unwrap());
 
         let summaries = source.query(&spec).await.unwrap();
 
         // Instead of Python (the originally cached item), we should get coreutils
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].pkg.name, "sharrattj/coreutils");
+        assert_eq!(
+            summaries[0].pkg.id.as_named().unwrap().full_name,
+            "sharrattj/coreutils"
+        );
         // both a HEAD and GET request were sent
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);

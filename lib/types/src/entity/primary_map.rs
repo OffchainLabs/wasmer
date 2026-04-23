@@ -1,11 +1,11 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Densely numbered entity references as mapping keys.
+use crate::entity::EntityRef;
 use crate::entity::boxed_slice::BoxedSlice;
 use crate::entity::iter::{IntoIter, Iter, IterMut};
 use crate::entity::keys::Keys;
-use crate::entity::EntityRef;
 use crate::lib::std::boxed::Box;
 use crate::lib::std::iter::FromIterator;
 use crate::lib::std::marker::PhantomData;
@@ -34,13 +34,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 #[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(rkyv::CheckBytes))]
 pub struct PrimaryMap<K, V>
 where
     K: EntityRef,
 {
     pub(crate) elems: Vec<V>,
     pub(crate) unused: PhantomData<K>,
+}
+
+#[cfg(feature = "artifact-size")]
+impl<K, V> loupe::MemoryUsage for PrimaryMap<K, V>
+where
+    K: EntityRef,
+    V: loupe::MemoryUsage,
+{
+    fn size_of_val(&self, tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        std::mem::size_of_val(self)
+            + self
+                .elems
+                .iter()
+                .map(|value| value.size_of_val(tracker) - std::mem::size_of_val(value))
+                .sum::<usize>()
+    }
 }
 
 impl<K, V> PrimaryMap<K, V>
@@ -94,22 +109,22 @@ where
     }
 
     /// Iterate over all the values in this map.
-    pub fn values(&self) -> slice::Iter<V> {
+    pub fn values(&self) -> slice::Iter<'_, V> {
         self.elems.iter()
     }
 
     /// Iterate over all the values in this map, mutable edition.
-    pub fn values_mut(&mut self) -> slice::IterMut<V> {
+    pub fn values_mut(&mut self) -> slice::IterMut<'_, V> {
         self.elems.iter_mut()
     }
 
     /// Iterate over all the keys and values in this map.
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter::new(self.elems.iter())
     }
 
     /// Iterate over all the keys and values in this map, mutable edition.
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut::new(self.elems.iter_mut())
     }
 
@@ -153,6 +168,28 @@ where
     /// Consumes this `PrimaryMap` and produces a `BoxedSlice`.
     pub fn into_boxed_slice(self) -> BoxedSlice<K, V> {
         unsafe { BoxedSlice::<K, V>::from_raw(Box::<[V]>::into_raw(self.elems.into_boxed_slice())) }
+    }
+}
+
+impl<K, V> ArchivedPrimaryMap<K, V>
+where
+    K: EntityRef,
+    V: Archive,
+{
+    /// Get the element at `k` if it exists.
+    pub fn get(&self, k: K) -> Option<&V::Archived> {
+        self.elems.get(k.index())
+    }
+}
+
+impl<K, V> std::fmt::Debug for ArchivedPrimaryMap<K, V>
+where
+    K: EntityRef + std::fmt::Debug,
+    V: Archive,
+    V::Archived: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -243,14 +280,15 @@ impl<K, V> ArchivedPrimaryMap<K, V>
 where
     K: EntityRef,
     V: Archive,
+    V::Archived: std::fmt::Debug,
 {
     /// Iterator over all values in the `ArchivedPrimaryMap`
-    pub fn values(&self) -> slice::Iter<Archived<V>> {
+    pub fn values(&self) -> slice::Iter<'_, Archived<V>> {
         self.elems.iter()
     }
 
     /// Iterate over all the keys and values in this map.
-    pub fn iter(&self) -> Iter<K, Archived<V>> {
+    pub fn iter(&self) -> Iter<'_, K, Archived<V>> {
         Iter::new(self.elems.iter())
     }
 }
@@ -261,6 +299,7 @@ impl<K, V> Index<K> for ArchivedPrimaryMap<K, V>
 where
     K: EntityRef,
     V: Archive,
+    V::Archived: std::fmt::Debug,
 {
     type Output = Archived<V>;
 

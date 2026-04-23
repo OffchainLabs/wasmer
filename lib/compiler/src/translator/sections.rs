@@ -1,5 +1,5 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Helper functions to gather information for each of the non-function sections of a
 //! WebAssembly module.
@@ -14,22 +14,23 @@
 use super::environ::ModuleEnvironment;
 use super::error::from_binaryreadererror_wasmerror;
 use super::state::ModuleTranslationState;
-use crate::wasm_unsupported;
 use std::boxed::Box;
+use std::collections::{HashMap, HashSet};
 use std::vec::Vec;
-use wasmer_types::entity::packed_option::ReservedValue;
 use wasmer_types::entity::EntityRef;
+use wasmer_types::entity::packed_option::ReservedValue;
 use wasmer_types::{
     DataIndex, ElemIndex, FunctionIndex, FunctionType, GlobalIndex, GlobalInit, GlobalType,
-    MemoryIndex, MemoryType, Pages, SignatureIndex, TableIndex, TableType, Type, V128,
+    InitExpr, InitExprOp, MemoryIndex, MemoryType, ModuleInfo, Pages, SignatureIndex, TableIndex,
+    TableType, TagIndex, Type, V128,
 };
 use wasmer_types::{WasmError, WasmResult};
 use wasmparser::{
     self, Data, DataKind, DataSectionReader, Element, ElementItems, ElementKind,
     ElementSectionReader, Export, ExportSectionReader, ExternalKind, FunctionSectionReader,
-    GlobalSectionReader, GlobalType as WPGlobalType, ImportSectionReader, MemorySectionReader,
-    MemoryType as WPMemoryType, NameSectionReader, Operator, TableSectionReader, TypeRef,
-    TypeSectionReader,
+    GlobalSectionReader, GlobalType as WPGlobalType, ImportSectionReader, Imports,
+    MemorySectionReader, MemoryType as WPMemoryType, NameSectionReader, Operator,
+    TableSectionReader, TagType as WPTagType, TypeRef, TypeSectionReader,
 };
 
 /// Helper function translating wasmparser types to Wasm Type.
@@ -50,6 +51,9 @@ pub fn wpreftype_to_type(ty: wasmparser::RefType) -> WasmResult<Type> {
         Ok(Type::ExternRef)
     } else if ty.is_func_ref() {
         Ok(Type::FuncRef)
+    } else if ty == wasmparser::RefType::EXNREF || ty == wasmparser::RefType::EXN {
+        // no `.is_exnref` yet
+        Ok(Type::ExceptionRef)
     } else {
         Err(wasm_unsupported!("unsupported reference type: {:?}", ty))
     }
@@ -58,8 +62,12 @@ pub fn wpreftype_to_type(ty: wasmparser::RefType) -> WasmResult<Type> {
 /// Converts a wasmparser heap type to a Wasm Type.
 pub fn wpheaptype_to_type(ty: wasmparser::HeapType) -> WasmResult<Type> {
     match ty {
-        wasmparser::HeapType::Func => Ok(Type::FuncRef),
-        wasmparser::HeapType::Extern => Ok(Type::ExternRef),
+        wasmparser::HeapType::Abstract { ty, .. } => match ty {
+            wasmparser::AbstractHeapType::Func => Ok(Type::FuncRef),
+            wasmparser::AbstractHeapType::Extern => Ok(Type::ExternRef),
+            wasmparser::AbstractHeapType::Exn => Ok(Type::ExceptionRef),
+            other => Err(wasm_unsupported!("unsupported reference type: {other:?}")),
+        },
         other => Err(wasm_unsupported!("unsupported reference type: {other:?}")),
     }
 }
@@ -111,6 +119,11 @@ pub fn parse_import_section<'data>(
 
     for entry in imports {
         let import = entry.map_err(from_binaryreadererror_wasmerror)?;
+        let Imports::Single(_index, import) = import else {
+            return Err(WasmError::Generic(
+                "non-Single section Imports not implemented yet".to_string(),
+            ));
+        };
         let module_name = import.module;
         let field_name = import.name;
 
@@ -122,14 +135,20 @@ pub fn parse_import_section<'data>(
                     field_name,
                 )?;
             }
-            TypeRef::Tag(_) => {
-                unimplemented!("exception handling not implemented yet")
+            TypeRef::FuncExact(_) => {
+                return Err(WasmError::Generic(
+                    "custom-descriptors not implemented yet".to_string(),
+                ));
+            }
+            TypeRef::Tag(t) => {
+                environ.declare_tag_import(t, module_name, field_name)?;
             }
             TypeRef::Memory(WPMemoryType {
                 shared,
                 memory64,
                 initial,
                 maximum,
+                ..
             }) => {
                 if memory64 {
                     unimplemented!("64bit memory not implemented yet");
@@ -158,8 +177,8 @@ pub fn parse_import_section<'data>(
                 environ.declare_table_import(
                     TableType {
                         ty: wpreftype_to_type(tab.element_type)?,
-                        minimum: tab.initial,
-                        maximum: tab.maximum,
+                        minimum: tab.initial as u32,
+                        maximum: tab.maximum.map(|v| v as u32),
                     },
                     module_name,
                     field_name,
@@ -178,7 +197,7 @@ pub fn parse_function_section(
     environ: &mut ModuleEnvironment,
 ) -> WasmResult<()> {
     let num_functions = functions.count();
-    if num_functions == std::u32::MAX {
+    if num_functions == u32::MAX {
         // We reserve `u32::MAX` for our own use.
         return Err(WasmError::ImplLimitExceeded);
     }
@@ -204,8 +223,8 @@ pub fn parse_table_section(
         let table = entry.map_err(from_binaryreadererror_wasmerror)?;
         environ.declare_table(TableType {
             ty: wpreftype_to_type(table.ty.element_type).unwrap(),
-            minimum: table.ty.initial,
-            maximum: table.ty.maximum,
+            minimum: table.ty.initial as u32,
+            maximum: table.ty.maximum.map(|v| v as u32),
         })?;
     }
 
@@ -225,6 +244,7 @@ pub fn parse_memory_section(
             memory64,
             initial,
             maximum,
+            ..
         } = entry.map_err(from_binaryreadererror_wasmerror)?;
         if memory64 {
             unimplemented!("64bit memory not implemented yet");
@@ -239,6 +259,110 @@ pub fn parse_memory_section(
     Ok(())
 }
 
+/// Parser the Tag section of the wasm module.
+pub fn parse_tag_section(
+    tags: wasmparser::SectionLimited<wasmparser::TagType>,
+    environ: &mut ModuleEnvironment,
+) -> WasmResult<()> {
+    environ.reserve_tags(tags.count())?;
+
+    for entry in tags {
+        let WPTagType { func_type_idx, .. } = entry.map_err(from_binaryreadererror_wasmerror)?;
+        environ.declare_tag(SignatureIndex::from_u32(func_type_idx))?;
+    }
+
+    Ok(())
+}
+
+fn parse_serialized_init_expr(
+    expr: &wasmparser::ConstExpr<'_>,
+    section_name: &str,
+    module: &ModuleInfo,
+) -> WasmResult<InitExpr> {
+    let mut reader = expr.get_operators_reader();
+    let mut ops = Vec::new();
+    loop {
+        let op = reader.read().map_err(from_binaryreadererror_wasmerror)?;
+        match op {
+            Operator::End => break,
+            Operator::I32Const { value } => ops.push(InitExprOp::I32Const(value)),
+            Operator::I64Const { value } => ops.push(InitExprOp::I64Const(value)),
+            Operator::GlobalGet { global_index } => {
+                let global_index = GlobalIndex::from_u32(global_index);
+                let global_type = module
+                    .global_type(global_index)
+                    .expect("Global index must be valid");
+
+                match global_type.ty {
+                    Type::I32 => ops.push(InitExprOp::GlobalGetI32(global_index)),
+                    Type::I64 => ops.push(InitExprOp::GlobalGetI64(global_index)),
+                    other => {
+                        return Err(wasm_unsupported!(
+                            "unsupported init expr in {section_name}: global.get type must be i32 or i64, got {other:?}",
+                        ));
+                    }
+                }
+            }
+            Operator::I32Add => ops.push(InitExprOp::I32Add),
+            Operator::I32Sub => ops.push(InitExprOp::I32Sub),
+            Operator::I32Mul => ops.push(InitExprOp::I32Mul),
+            Operator::I64Add => ops.push(InitExprOp::I64Add),
+            Operator::I64Sub => ops.push(InitExprOp::I64Sub),
+            Operator::I64Mul => ops.push(InitExprOp::I64Mul),
+            other => {
+                return Err(wasm_unsupported!(
+                    "unsupported init expr in {section_name}: {other:?}",
+                ));
+            }
+        }
+    }
+
+    if ops.is_empty() {
+        return Err(wasm_unsupported!("empty init expr in {section_name}"));
+    }
+
+    Ok(InitExpr::new(ops.into_boxed_slice()))
+}
+
+fn parse_global_initializer(
+    init_expr: &wasmparser::ConstExpr<'_>,
+    module: &ModuleInfo,
+) -> WasmResult<GlobalInit> {
+    let mut init_expr_reader = init_expr.get_operators_reader();
+    let first = init_expr_reader
+        .read()
+        .map_err(from_binaryreadererror_wasmerror)?;
+    let second = init_expr_reader
+        .read()
+        .map_err(from_binaryreadererror_wasmerror)?;
+
+    if matches!(second, Operator::End) {
+        return match first {
+            Operator::I32Const { value } => Ok(GlobalInit::I32Const(value)),
+            Operator::I64Const { value } => Ok(GlobalInit::I64Const(value)),
+            Operator::F32Const { value } => Ok(GlobalInit::F32Const(f32::from_bits(value.bits()))),
+            Operator::F64Const { value } => Ok(GlobalInit::F64Const(f64::from_bits(value.bits()))),
+            Operator::V128Const { value } => Ok(GlobalInit::V128Const(V128::from(*value.bytes()))),
+            Operator::RefNull { hty: _ } => {
+                // TODO: Do we need to handle different heap types here?
+                Ok(GlobalInit::RefNullConst)
+            }
+            Operator::RefFunc { function_index } => {
+                Ok(GlobalInit::RefFunc(FunctionIndex::from_u32(function_index)))
+            }
+            Operator::GlobalGet { global_index } => {
+                Ok(GlobalInit::GetGlobal(GlobalIndex::from_u32(global_index)))
+            }
+            other => Err(wasm_unsupported!(
+                "unsupported init expr in global section: {other:?}",
+            )),
+        };
+    }
+
+    let expr = parse_serialized_init_expr(init_expr, "global section", module)?;
+    Ok(GlobalInit::Expr(expr))
+}
+
 /// Parses the Global section of the wasm module.
 pub fn parse_global_section(
     globals: GlobalSectionReader,
@@ -248,39 +372,15 @@ pub fn parse_global_section(
 
     for entry in globals {
         let wasmparser::Global {
-            ty: WPGlobalType {
-                content_type,
-                mutable,
-            },
+            ty:
+                WPGlobalType {
+                    content_type,
+                    mutable,
+                    ..
+                },
             init_expr,
         } = entry.map_err(from_binaryreadererror_wasmerror)?;
-        let mut init_expr_reader = init_expr.get_binary_reader();
-        let initializer = match init_expr_reader
-            .read_operator()
-            .map_err(from_binaryreadererror_wasmerror)?
-        {
-            Operator::I32Const { value } => GlobalInit::I32Const(value),
-            Operator::I64Const { value } => GlobalInit::I64Const(value),
-            Operator::F32Const { value } => GlobalInit::F32Const(f32::from_bits(value.bits())),
-            Operator::F64Const { value } => GlobalInit::F64Const(f64::from_bits(value.bits())),
-            Operator::V128Const { value } => GlobalInit::V128Const(V128::from(*value.bytes())),
-            Operator::RefNull { hty: _ } => {
-                // TODO: Do we need to handle different heap types here?
-                GlobalInit::RefNullConst
-            }
-            Operator::RefFunc { function_index } => {
-                GlobalInit::RefFunc(FunctionIndex::from_u32(function_index))
-            }
-            Operator::GlobalGet { global_index } => {
-                GlobalInit::GetGlobal(GlobalIndex::from_u32(global_index))
-            }
-            ref s => {
-                return Err(wasm_unsupported!(
-                    "unsupported init expr in global section: {:?}",
-                    s
-                ));
-            }
-        };
+        let initializer = parse_global_initializer(&init_expr, &environ.module)?;
         let global = GlobalType {
             ty: wptype_to_type(content_type).unwrap(),
             mutability: mutable.into(),
@@ -318,9 +418,8 @@ pub fn parse_export_section<'data>(
             ExternalKind::Global => {
                 environ.declare_global_export(GlobalIndex::new(index), field)?
             }
-            ExternalKind::Tag => {
-                unimplemented!("exception handling not implemented yet")
-            }
+            ExternalKind::Tag => environ.declare_tag_export(TagIndex::new(index), field)?,
+            ExternalKind::FuncExact => unimplemented!("custom-descriptors not implemented yet"),
         }
     }
 
@@ -357,8 +456,8 @@ fn read_elems(items: &ElementItems) -> WasmResult<Box<[FunctionIndex]>> {
                 let expr = res.map_err(from_binaryreadererror_wasmerror)?;
 
                 let op = expr
-                    .get_binary_reader()
-                    .read_operator()
+                    .get_operators_reader()
+                    .read()
                     .map_err(from_binaryreadererror_wasmerror)?;
                 match op {
                     Operator::RefNull { .. } => out.push(FunctionIndex::reserved_value()),
@@ -399,24 +498,9 @@ pub fn parse_element_section(
                 offset_expr,
             } => {
                 let table_index = TableIndex::from_u32(table_index.unwrap_or(0));
-
-                let mut init_expr_reader = offset_expr.get_binary_reader();
-                let (base, offset) = match init_expr_reader
-                    .read_operator()
-                    .map_err(from_binaryreadererror_wasmerror)?
-                {
-                    Operator::I32Const { value } => (None, value as u32 as usize),
-                    Operator::GlobalGet { global_index } => {
-                        (Some(GlobalIndex::from_u32(global_index)), 0)
-                    }
-                    ref s => {
-                        return Err(wasm_unsupported!(
-                            "unsupported init expr in element section: {:?}",
-                            s
-                        ));
-                    }
-                };
-                environ.declare_table_initializers(table_index, base, offset, segments)?
+                let offset_expr =
+                    parse_serialized_init_expr(&offset_expr, "element section", &environ.module)?;
+                environ.declare_table_initializers(table_index, offset_expr, segments)?
             }
             ElementKind::Passive => {
                 let index = ElemIndex::from_u32(index as u32);
@@ -446,26 +530,11 @@ pub fn parse_data_section<'data>(
                 memory_index,
                 offset_expr,
             } => {
-                let mut init_expr_reader = offset_expr.get_binary_reader();
-                let (base, offset) = match init_expr_reader
-                    .read_operator()
-                    .map_err(from_binaryreadererror_wasmerror)?
-                {
-                    Operator::I32Const { value } => (None, value as u32 as usize),
-                    Operator::GlobalGet { global_index } => {
-                        (Some(GlobalIndex::from_u32(global_index)), 0)
-                    }
-                    ref s => {
-                        return Err(wasm_unsupported!(
-                            "unsupported init expr in data section: {:?}",
-                            s
-                        ))
-                    }
-                };
+                let offset_expr =
+                    parse_serialized_init_expr(&offset_expr, "data section", &environ.module)?;
                 environ.declare_data_initialization(
                     MemoryIndex::from_u32(memory_index),
-                    base,
-                    offset,
+                    offset_expr,
                     data,
                 )?;
             }
@@ -484,6 +553,9 @@ pub fn parse_name_section<'data>(
     names: NameSectionReader<'data>,
     environ: &mut ModuleEnvironment<'data>,
 ) -> WasmResult<()> {
+    let mut functions = HashMap::new();
+    let mut names_set = HashSet::new();
+
     for res in names {
         let subsection = if let Ok(subsection) = res {
             subsection
@@ -493,12 +565,21 @@ pub fn parse_name_section<'data>(
         };
         match subsection {
             wasmparser::Name::Function(function_subsection) => {
+                let mut unique_name_map = HashMap::new();
                 for naming in function_subsection.into_iter().flatten() {
-                    if naming.index != std::u32::MAX {
-                        environ.declare_function_name(
-                            FunctionIndex::from_u32(naming.index),
-                            naming.name,
-                        )?;
+                    if naming.index != u32::MAX {
+                        let mut name = naming.name.to_string();
+                        // In very rare cases a function name can have duplicates.
+                        if names_set.contains(&name) {
+                            let index = unique_name_map
+                                .entry(name.clone())
+                                .and_modify(|e| *e += 1)
+                                .or_insert(0);
+                            let alternative = format!("{name}.{index}");
+                            name = alternative;
+                        }
+                        names_set.insert(name.clone());
+                        functions.insert(FunctionIndex::from_u32(naming.index), name);
                     }
                 }
             }
@@ -517,9 +598,10 @@ pub fn parse_name_section<'data>(
             | wasmparser::Name::Element(_)
             | wasmparser::Name::Data(_)
             | wasmparser::Name::Unknown { .. }
+            | wasmparser::Name::Field(_)
             | wasmparser::Name::Tag(..) => {}
         }
     }
 
-    Ok(())
+    environ.declare_function_names(functions)
 }

@@ -1,6 +1,6 @@
 use crate::{
-    net_error_into_io_err, InterestHandler, NetworkError, SocketStatus, VirtualConnectedSocket,
-    VirtualIoSource, VirtualSocket, VirtualTcpSocket,
+    InterestHandler, NetworkError, SocketStatus, VirtualConnectedSocket, VirtualIoSource,
+    VirtualSocket, VirtualTcpSocket, net_error_into_io_err,
 };
 use bytes::{Buf, Bytes};
 use futures_util::Future;
@@ -15,13 +15,21 @@ use std::{net::SocketAddr, task::Poll};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 use virtual_mio::{ArcInterestHandler, InterestType};
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum State {
+    Alive,
+    Dead,
+    Closed,
+    Shutdown,
+}
+
 #[derive(Debug)]
 struct SocketBufferState {
     buffer: RingBuffer<'static, u8>,
     push_handler: Option<ArcInterestHandler>,
     pull_handler: Option<ArcInterestHandler>,
     wakers: Vec<Waker>,
-    dead: bool,
+    state: State,
     // This flag prevents a poll write ready storm
     halt_immediate_poll_write: bool,
 }
@@ -42,8 +50,12 @@ pub(crate) struct SocketBuffer {
 
 impl Drop for SocketBuffer {
     fn drop(&mut self) {
-        if self.dead_on_drop {
-            self.set_dead();
+        if self.state() == State::Alive {
+            if self.dead_on_drop {
+                self.set_state(State::Dead);
+            } else {
+                self.set_state(State::Closed);
+            }
         }
     }
 }
@@ -56,7 +68,7 @@ impl SocketBuffer {
                 push_handler: None,
                 pull_handler: None,
                 wakers: Vec::new(),
-                dead: false,
+                state: State::Alive,
                 halt_immediate_poll_write: false,
             })),
             dead_on_drop: false,
@@ -65,7 +77,7 @@ impl SocketBuffer {
 
     pub fn set_push_handler(&self, mut handler: ArcInterestHandler) {
         let mut state = self.state.lock().unwrap();
-        if state.dead {
+        if state.state != State::Alive {
             handler.push_interest(InterestType::Closed);
         }
         if !state.buffer.is_empty() {
@@ -76,7 +88,7 @@ impl SocketBuffer {
 
     pub fn set_pull_handler(&self, mut handler: ArcInterestHandler) {
         let mut state = self.state.lock().unwrap();
-        if state.dead {
+        if state.state != State::Alive {
             handler.push_interest(InterestType::Closed);
         }
         if !state.buffer.is_full() && state.pull_handler.is_none() {
@@ -100,33 +112,51 @@ impl SocketBuffer {
         if !state.buffer.is_empty() {
             return Poll::Ready(Ok(state.buffer.len()));
         }
-        if state.dead {
-            return Poll::Ready(Ok(0));
+        match state.state {
+            State::Alive => {
+                if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    state.wakers.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            State::Dead => {
+                tracing::trace!("poll_read_ready: socket is dead");
+                Poll::Ready(Err(NetworkError::ConnectionReset))
+            }
+            State::Closed | State::Shutdown => {
+                tracing::trace!("poll_read_ready: socket is closed or shutdown");
+                Poll::Ready(Ok(0))
+            }
         }
-        if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            state.wakers.push(cx.waker().clone());
-        }
-        Poll::Pending
     }
 
     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<crate::Result<usize>> {
         let mut state = self.state.lock().unwrap();
-        if state.dead {
-            return Poll::Ready(Ok(0));
+        match state.state {
+            State::Alive => {
+                if !state.buffer.is_full() && !state.halt_immediate_poll_write {
+                    state.halt_immediate_poll_write = true;
+                    return Poll::Ready(Ok(state.buffer.window()));
+                }
+                if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    state.wakers.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            State::Dead => {
+                tracing::trace!("poll_write_ready: socket is dead");
+                Poll::Ready(Err(NetworkError::ConnectionReset))
+            }
+            State::Closed | State::Shutdown => {
+                tracing::trace!("poll_write_ready: socket is closed or shutdown");
+                Poll::Ready(Ok(0))
+            }
         }
-        if !state.buffer.is_full() && !state.halt_immediate_poll_write {
-            state.halt_immediate_poll_write = true;
-            return Poll::Ready(Ok(state.buffer.window()));
-        }
-        if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            state.wakers.push(cx.waker().clone());
-        }
-        Poll::Pending
     }
 
-    pub fn set_dead(&self) {
+    fn set_state(&self, new_state: State) {
         let mut state = self.state.lock().unwrap();
-        state.dead = true;
+        state.state = new_state;
         if let Some(handler) = state.pull_handler.as_mut() {
             handler.push_interest(InterestType::Closed);
         }
@@ -136,9 +166,9 @@ impl SocketBuffer {
         state.wakers.drain(..).for_each(|w| w.wake());
     }
 
-    pub fn is_dead(&self) -> bool {
+    fn state(&self) -> State {
         let state = self.state.lock().unwrap();
-        state.dead
+        state.state
     }
 
     pub fn try_send(
@@ -148,7 +178,7 @@ impl SocketBuffer {
         waker: Option<&Waker>,
     ) -> crate::Result<usize> {
         let mut state = self.state.lock().unwrap();
-        if state.dead {
+        if state.state != State::Alive {
             return Err(NetworkError::ConnectionReset);
         }
         state.halt_immediate_poll_write = false;
@@ -183,7 +213,7 @@ impl SocketBuffer {
             this: &'a SocketBuffer,
             data: Bytes,
         }
-        impl<'a> Future for Poller<'a> {
+        impl Future for Poller<'_> {
             type Output = crate::Result<()>;
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 loop {
@@ -207,23 +237,39 @@ impl SocketBuffer {
     pub fn try_read(
         &self,
         buf: &mut [std::mem::MaybeUninit<u8>],
+        peek: bool,
         waker: Option<&Waker>,
     ) -> crate::Result<usize> {
         let mut state = self.state.lock().unwrap();
         if state.buffer.is_empty() {
-            if state.dead {
-                return Err(NetworkError::ConnectionReset);
-            }
-
-            if let Some(waker) = waker {
-                state.add_waker(waker)
-            }
-            return Err(NetworkError::WouldBlock);
+            return match state.state {
+                State::Alive => {
+                    if let Some(waker) = waker {
+                        state.add_waker(waker)
+                    }
+                    Err(NetworkError::WouldBlock)
+                }
+                State::Dead => {
+                    tracing::trace!("try_read: socket is dead");
+                    // Note: Returning `ConnectionReset` here may seem logical as other functions return this
+                    // however this code path is not always handled properly. In particular `tokio` inside
+                    // WASIX will panic if it receives this code.
+                    return Ok(0);
+                }
+                State::Closed | State::Shutdown => {
+                    tracing::trace!("try_read: socket is closed or shutdown");
+                    return Ok(0);
+                }
+            };
         }
 
         let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
         let amt = buf.len().min(state.buffer.len());
-        let amt = state.buffer.dequeue_slice(&mut buf[..amt]);
+        let amt = if peek {
+            state.buffer.read_allocated(0, &mut buf[..amt])
+        } else {
+            state.buffer.dequeue_slice(&mut buf[..amt])
+        };
 
         if let Some(handler) = state.pull_handler.as_mut() {
             handler.push_interest(InterestType::Writable);
@@ -272,7 +318,7 @@ impl AsyncWrite for SocketBuffer {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.set_dead();
+        self.set_state(State::Shutdown);
         Poll::Ready(Ok(()))
     }
 }
@@ -283,7 +329,7 @@ impl AsyncRead for SocketBuffer {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.try_read(unsafe { buf.unfilled_mut() }, Some(cx.waker())) {
+        match self.try_read(unsafe { buf.unfilled_mut() }, false, Some(cx.waker())) {
             Ok(amt) => {
                 unsafe { buf.assume_init(amt) };
                 buf.advance(amt);
@@ -334,12 +380,12 @@ impl TcpSocketHalf {
     }
 
     pub fn is_active(&self) -> bool {
-        !self.tx.is_dead()
+        self.tx.state() == State::Alive
     }
 
     pub fn close(&self) -> crate::Result<()> {
-        self.tx.set_dead();
-        self.rx.set_dead();
+        self.tx.set_state(State::Closed);
+        self.rx.set_state(State::Closed);
         Ok(())
     }
 }
@@ -374,10 +420,11 @@ impl VirtualSocket for TcpSocketHalf {
     }
 
     fn status(&self) -> crate::Result<SocketStatus> {
-        Ok(if self.tx.is_dead() {
-            SocketStatus::Closed
-        } else {
-            SocketStatus::Opened
+        Ok(match self.tx.state() {
+            State::Alive => SocketStatus::Opened,
+            State::Dead => SocketStatus::Failed,
+            State::Closed => SocketStatus::Closed,
+            State::Shutdown => SocketStatus::Closed,
         })
     }
 
@@ -410,13 +457,17 @@ impl VirtualConnectedSocket for TcpSocketHalf {
     }
 
     fn close(&mut self) -> crate::Result<()> {
-        self.tx.set_dead();
-        self.rx.set_dead();
+        self.tx.set_state(State::Closed);
+        self.rx.set_state(State::Closed);
         Ok(())
     }
 
-    fn try_recv(&mut self, buf: &mut [std::mem::MaybeUninit<u8>]) -> crate::Result<usize> {
-        self.rx.try_read(buf, None)
+    fn try_recv(
+        &mut self,
+        buf: &mut [std::mem::MaybeUninit<u8>],
+        peek: bool,
+    ) -> crate::Result<usize> {
+        self.rx.try_read(buf, peek, None)
     }
 }
 
@@ -470,21 +521,21 @@ impl VirtualTcpSocket for TcpSocketHalf {
     fn shutdown(&mut self, how: std::net::Shutdown) -> crate::Result<()> {
         match how {
             std::net::Shutdown::Both => {
-                self.tx.set_dead();
-                self.rx.set_dead();
+                self.tx.set_state(State::Shutdown);
+                self.rx.set_state(State::Shutdown);
             }
             std::net::Shutdown::Read => {
-                self.rx.set_dead();
+                self.rx.set_state(State::Shutdown);
             }
             std::net::Shutdown::Write => {
-                self.tx.set_dead();
+                self.tx.set_state(State::Shutdown);
             }
         }
         Ok(())
     }
 
     fn is_closed(&self) -> bool {
-        self.tx.is_dead()
+        self.tx.state() != State::Alive
     }
 }
 
@@ -528,7 +579,7 @@ impl TcpSocketHalfTx {
     }
 
     pub fn close(&self) -> crate::Result<()> {
-        self.tx.set_dead();
+        self.tx.set_state(State::Closed);
         Ok(())
     }
 }
@@ -569,7 +620,7 @@ impl TcpSocketHalfRx {
     }
 
     pub fn close(&mut self) -> crate::Result<()> {
-        self.rx.get_mut().set_dead();
+        self.rx.get_mut().set_state(State::Closed);
         Ok(())
     }
 

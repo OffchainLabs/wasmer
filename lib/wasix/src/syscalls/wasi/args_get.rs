@@ -10,7 +10,7 @@ use crate::syscalls::*;
 /// - `char *argv_buf`
 ///     A pointer to a buffer to write the argument string data.
 ///
-#[instrument(level = "debug", skip_all, ret)]
+#[instrument(level = "trace", skip_all, ret)]
 pub fn args_get<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     argv: WasmPtr<WasmPtr<u8, M>, M>,
@@ -21,6 +21,8 @@ pub fn args_get<M: MemorySize>(
 
     let args = state
         .args
+        .lock()
+        .unwrap()
         .iter()
         .map(|a| a.as_bytes().to_vec())
         .collect::<Vec<_>>();
@@ -30,9 +32,11 @@ pub fn args_get<M: MemorySize>(
         "args:\n{}",
         state
             .args
+            .lock()
+            .unwrap()
             .iter()
             .enumerate()
-            .map(|(i, v)| format!("{:>20}: {}", i, v))
+            .map(|(i, v)| format!("{i:>20}: {v}"))
             .collect::<Vec<String>>()
             .join("\n")
     );

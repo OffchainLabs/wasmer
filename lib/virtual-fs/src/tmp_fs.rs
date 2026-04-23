@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    limiter::DynFsMemoryLimiter, mem_fs, BoxFuture, FileSystem, Metadata, OpenOptions, ReadDir,
-    Result,
+    BoxFuture, FileSystem, Metadata, OpenOptions, ReadDir, Result, limiter::DynFsMemoryLimiter,
+    mem_fs,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -58,9 +58,17 @@ impl TmpFileSystem {
     pub fn canonicalize_unchecked(&self, path: &Path) -> Result<PathBuf> {
         self.fs.canonicalize_unchecked(path)
     }
+
+    pub fn create_symlink(&self, source: &Path, target: &Path) -> Result<()> {
+        self.fs.create_symlink(source, target)
+    }
 }
 
 impl FileSystem for TmpFileSystem {
+    fn readlink(&self, path: &Path) -> Result<PathBuf> {
+        self.fs.readlink(path)
+    }
+
     fn read_dir(&self, path: &Path) -> Result<ReadDir> {
         self.fs.read_dir(path)
     }
@@ -89,7 +97,16 @@ impl FileSystem for TmpFileSystem {
         self.fs.remove_file(path)
     }
 
-    fn new_open_options(&self) -> OpenOptions {
+    fn new_open_options(&self) -> OpenOptions<'_> {
         self.fs.new_open_options()
+    }
+
+    fn mount(
+        &self,
+        name: String,
+        path: &Path,
+        fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> Result<()> {
+        FileSystem::mount(&self.fs, name, path, fs)
     }
 }

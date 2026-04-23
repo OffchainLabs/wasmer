@@ -1,27 +1,32 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! A trampoline generator for calling dynamic host functions from Wasm.
 
-use crate::translator::{compiled_function_unwind_info, signature_to_cranelift_ir};
-use cranelift_codegen::ir;
-use cranelift_codegen::ir::{
-    Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
+use crate::{
+    CraneliftCallbacks,
+    translator::{compiled_function_unwind_info, signature_to_cranelift_ir},
 };
-use cranelift_codegen::isa::TargetIsa;
-use cranelift_codegen::Context;
-use std::cmp;
-use std::mem;
-
+use cranelift_codegen::{
+    Context,
+    ir::{self, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName},
+    isa::TargetIsa,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use wasmer_types::{CompileError, FunctionBody, FunctionType, VMOffsets};
+use std::{cmp, mem};
+use target_lexicon::Architecture;
+use wasmer_compiler::{misc::CompiledKind, types::function::FunctionBody};
+use wasmer_types::{CompileError, FunctionType, VMOffsets};
 
 /// Create a trampoline for invoking a WebAssembly function.
 pub fn make_trampoline_dynamic_function(
+    callbacks: &Option<CraneliftCallbacks>,
     isa: &dyn TargetIsa,
+    arch: Architecture,
     offsets: &VMOffsets,
     fn_builder_ctx: &mut FunctionBuilderContext,
     func_type: &FunctionType,
+    module_hash: &Option<String>,
 ) -> Result<FunctionBody, CompileError> {
     let pointer_type = isa.pointer_type();
     let frontend_config = isa.frontend_config();
@@ -47,6 +52,7 @@ pub fn make_trampoline_dynamic_function(
     let ss = context.func.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
         values_vec_len,
+        0,
     ));
 
     {
@@ -103,10 +109,34 @@ pub fn make_trampoline_dynamic_function(
         builder.finalize()
     }
 
+    if let Some(callbacks) = callbacks.as_ref() {
+        callbacks.preopt_ir(
+            &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
+            module_hash,
+            context.func.display().to_string().as_bytes(),
+        );
+    }
+
     let mut code_buf = Vec::new();
-    context
-        .compile_and_emit(isa, &mut code_buf)
+    let mut ctrl_plane = Default::default();
+    let compiled = context
+        .compile(isa, &mut ctrl_plane)
         .map_err(|error| CompileError::Codegen(error.inner.to_string()))?;
+    code_buf.extend_from_slice(compiled.code_buffer());
+
+    if let Some(callbacks) = callbacks.as_ref() {
+        callbacks.obj_memory_buffer(
+            &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
+            module_hash,
+            &code_buf,
+        );
+        callbacks.asm_memory_buffer(
+            &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
+            module_hash,
+            arch,
+            &code_buf,
+        )?;
+    }
 
     let unwind_info = compiled_function_unwind_info(isa, &context)?.maybe_into_to_windows_unwind();
 

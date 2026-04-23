@@ -1,22 +1,27 @@
-use crate::indexes::{FunctionIndex, GlobalIndex, MemoryIndex, TableIndex};
-use crate::lib::std::boxed::Box;
+/*
+ * ! Remove me once rkyv generates doc-comments for fields or generates an #[allow(missing_docs)]
+ * on their own.
+ */
+#![allow(missing_docs)]
 
-use enumset::__internal::EnumSetTypeRepr;
-use rkyv::{Archive, CheckBytes, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use crate::indexes::{FunctionIndex, MemoryIndex, TableIndex};
+use crate::lib::std::boxed::Box;
+use crate::types::InitExpr;
+
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 
 /// A WebAssembly table initializer.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive_attr(derive(CheckBytes))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug))]
 pub struct TableInitializer {
     /// The index of a table to initialize.
     pub table_index: TableIndex,
-    /// Optionally, a global variable giving a base index.
-    pub base: Option<GlobalIndex>,
-    /// The offset to add to the base.
-    pub offset: usize,
+    /// Serialized offset expression.
+    pub offset_expr: InitExpr,
     /// The values to write into the table elements.
     pub elements: Box<[FunctionIndex]>,
 }
@@ -24,25 +29,22 @@ pub struct TableInitializer {
 /// A memory index and offset within that memory where a data initialization
 /// should be performed.
 #[derive(Clone, Debug, PartialEq, Eq, RkyvSerialize, RkyvDeserialize, Archive)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive_attr(derive(CheckBytes))]
+#[rkyv(derive(Debug))]
 pub struct DataInitializerLocation {
     /// The index of the memory to initialize.
     pub memory_index: MemoryIndex,
 
-    /// Optionally a Global variable base to initialize at.
-    pub base: Option<GlobalIndex>,
-
-    /// A constant offset to initialize at.
-    pub offset: usize,
+    /// Serialized offset expression.
+    pub offset_expr: InitExpr,
 }
 
 /// Any struct that acts like a `DataInitializerLocation`.
 #[allow(missing_docs)]
 pub trait DataInitializerLocationLike {
     fn memory_index(&self) -> MemoryIndex;
-    fn base(&self) -> Option<GlobalIndex>;
-    fn offset(&self) -> usize;
+    fn offset_expr(&self) -> InitExpr;
 }
 
 impl DataInitializerLocationLike for &DataInitializerLocation {
@@ -50,29 +52,18 @@ impl DataInitializerLocationLike for &DataInitializerLocation {
         self.memory_index
     }
 
-    fn base(&self) -> Option<GlobalIndex> {
-        self.base
-    }
-
-    fn offset(&self) -> usize {
-        self.offset
+    fn offset_expr(&self) -> InitExpr {
+        self.offset_expr.clone()
     }
 }
 
 impl DataInitializerLocationLike for &ArchivedDataInitializerLocation {
     fn memory_index(&self) -> MemoryIndex {
-        MemoryIndex::from_u32(self.memory_index.as_u32())
+        MemoryIndex::from_u32(rkyv::deserialize::<_, ()>(&self.memory_index).unwrap().0)
     }
 
-    fn base(&self) -> Option<GlobalIndex> {
-        match self.base {
-            rkyv::option::ArchivedOption::None => None,
-            rkyv::option::ArchivedOption::Some(base) => Some(GlobalIndex::from_u32(base.as_u32())),
-        }
-    }
-
-    fn offset(&self) -> usize {
-        self.offset.to_usize()
+    fn offset_expr(&self) -> InitExpr {
+        rkyv::deserialize::<_, rkyv::rancor::Error>(&self.offset_expr).unwrap()
     }
 }
 
@@ -89,9 +80,10 @@ pub struct DataInitializer<'data> {
 
 /// As `DataInitializer` but owning the data rather than
 /// holding a reference to it
-#[derive(Debug, Clone, PartialEq, Eq, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive_attr(derive(CheckBytes))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[derive(Debug, Clone, PartialEq, Eq, RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug))]
 pub struct OwnedDataInitializer {
     /// The location where the initialization is to be performed.
     pub location: DataInitializerLocation,

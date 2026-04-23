@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use wasmer::{Store, sys::Target};
 use wasmer_wast::Wast as WastSpectest;
 
-use crate::store::StoreOptions;
+use crate::backend::RuntimeOptions;
 
 #[derive(Debug, Parser)]
 /// The options for the `wasmer wast` subcommand
@@ -15,7 +16,7 @@ pub struct Wast {
     path: PathBuf,
 
     #[clap(flatten)]
-    store: StoreOptions,
+    rt: RuntimeOptions,
 
     #[clap(short, long)]
     /// A flag to indicate wast stop at the first error or continue.
@@ -29,7 +30,9 @@ impl Wast {
             .context(format!("failed to test the wast `{}`", self.path.display()))
     }
     fn inner_execute(&self) -> Result<()> {
-        let (store, _compiler_name) = self.store.get_store()?;
+        let engine = self.rt.get_engine(&Target::default())?;
+
+        let store: Store = Store::new(engine);
         let mut wast = WastSpectest::new_with_spectest(store);
         wast.fail_fast = self.fail_fast;
         wast.run_file(&self.path).with_context(|| "tests failed")?;

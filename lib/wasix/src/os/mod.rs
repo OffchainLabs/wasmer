@@ -1,5 +1,6 @@
 pub mod common;
-mod console;
+pub mod console;
+pub(crate) mod epoll;
 pub mod tty;
 
 pub mod command;

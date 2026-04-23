@@ -2,22 +2,21 @@ pub(super) use std::{borrow::Cow, ops::Range, sync::MutexGuard, time::SystemTime
 
 pub(super) use anyhow::bail;
 pub(super) use bytes::Bytes;
-pub(super) use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+pub(super) use wasmer::{FunctionEnvMut, WasmPtr};
 pub(super) use wasmer_types::MemorySize;
 pub(super) use wasmer_wasix_types::{
     types::__wasi_ciovec_t,
     wasi::{
-        Advice, EpollCtl, EpollEventCtl, Errno, ExitCode, Fd, Fdflags, Filesize, Fstflags,
-        LookupFlags, Oflags, Rights, Snapshot0Clockid, Timestamp, Whence,
+        Advice, EpollCtl, EpollEventCtl, Errno, ExitCode, Fd, Fdflags, Fdflagsext, Filesize,
+        Fstflags, LookupFlags, Oflags, Rights, Snapshot0Clockid, Timestamp, Whence,
     },
 };
 
 pub(super) use crate::{
-    mem_error_to_wasi,
+    WasiEnv, WasiThreadId, mem_error_to_wasi,
     os::task::process::WasiProcessInner,
-    syscalls::{fd_write_internal, FdWriteSource},
+    syscalls::{FdWriteSource, fd_write_internal},
     utils::map_snapshot_err,
-    WasiEnv, WasiRuntimeError, WasiThreadId,
 };
 
 use super::*;
@@ -37,6 +36,7 @@ mod syscalls {
     mod fd_pipe;
     mod fd_renumber;
     mod fd_seek;
+    mod fd_set_fdflags;
     mod fd_set_flags;
     mod fd_set_rights;
     mod fd_set_size;
@@ -69,6 +69,7 @@ mod syscalls {
     mod sock_leave_ipv6_multicast;
     mod sock_listen;
     mod sock_open;
+    mod sock_pair;
     mod sock_send;
     mod sock_send_file;
     mod sock_send_to;

@@ -1,3 +1,14 @@
+use super::{
+    control_plane::TaskCountGuard,
+    task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
+};
+use crate::{
+    WasiRuntimeError,
+    os::task::process::{WasiProcessId, WasiProcessInner},
+    state::LinkError,
+    syscalls::HandleRewindType,
+};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -6,24 +17,11 @@ use std::{
     sync::{Arc, Condvar, Mutex, Weak},
     task::Waker,
 };
-
-use bytes::{Bytes, BytesMut};
 use wasmer::{ExportError, InstantiationError, MemoryError};
 use wasmer_wasix_types::{
     types::Signal,
     wasi::{Errno, ExitCode},
     wasix::ThreadStartType,
-};
-
-use crate::{
-    os::task::process::{WasiProcessId, WasiProcessInner},
-    syscalls::HandleRewindType,
-    WasiRuntimeError,
-};
-
-use super::{
-    control_plane::TaskCountGuard,
-    task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
 };
 
 /// Represents the ID of a WASI thread
@@ -107,6 +105,10 @@ pub struct WasiThread {
 }
 
 impl WasiThread {
+    pub fn id(&self) -> WasiThreadId {
+        self.state.id
+    }
+
     /// Sets that a rewind will take place
     pub(crate) fn set_rewind(&mut self, rewind: RewindResult) {
         self.rewind.replace(rewind);
@@ -314,6 +316,7 @@ impl WasiThread {
     pub fn set_or_get_exit_code_for_signal(&self, sig: Signal) -> ExitCode {
         let default_exitcode: ExitCode = match sig {
             Signal::Sigquit | Signal::Sigabrt => Errno::Success.into(),
+            Signal::Sigpipe => Errno::Pipe.into(),
             _ => Errno::Intr.into(),
         };
         // This will only set the status code if its not already set
@@ -341,6 +344,9 @@ impl WasiThread {
 
     /// Adds a signal for this thread to process
     pub fn signal(&self, signal: Signal) {
+        let tid = self.tid();
+        tracing::trace!(%tid, "signal-thread({:?})", signal);
+
         let mut guard = self.state.signals.lock().unwrap();
         if !guard.0.contains(&signal) {
             guard.0.push(signal);
@@ -365,7 +371,7 @@ impl WasiThread {
         struct SignalPoller<'a> {
             thread: &'a WasiThread,
         }
-        impl<'a> std::future::Future for SignalPoller<'a> {
+        impl std::future::Future for SignalPoller<'_> {
             type Output = ();
             fn poll(
                 self: std::pin::Pin<&mut Self>,
@@ -393,6 +399,13 @@ impl WasiThread {
                 None
             }
             false => Some(ret),
+        }
+    }
+
+    pub fn signals_subscribe(&self, waker: &Waker) {
+        let mut guard = self.state.signals.lock().unwrap();
+        if !guard.1.iter().any(|w| w.will_wake(waker)) {
+            guard.1.push(waker.clone());
         }
     }
 
@@ -454,25 +467,29 @@ impl WasiThread {
 
                 // Output debug info for the dead stack
                 let mut disown = Some(Box::new(new_stack));
-                if let Some(disown) = disown.as_ref() {
-                    if !disown.snapshots.is_empty() {
-                        tracing::trace!(
-                            "wasi[{}]::stacks forgotten (memory_stack_before={}, memory_stack_after={})",
-                            self.pid(),
-                            memory_stack_before,
-                            memory_stack_after
-                        );
-                    }
+                if let Some(disown) = disown.as_ref()
+                    && !disown.snapshots.is_empty()
+                {
+                    tracing::trace!(
+                        "wasi[{}]::stacks forgotten (memory_stack_before={}, memory_stack_after={})",
+                        self.pid(),
+                        memory_stack_before,
+                        memory_stack_after
+                    );
                 }
+                let mut total_forgotten = 0usize;
                 while let Some(disowned) = disown {
-                    for hash in disowned.snapshots.keys() {
-                        tracing::trace!(
-                            "wasi[{}]::stack has been forgotten (hash={})",
-                            self.pid(),
-                            hash
-                        );
+                    for _hash in disowned.snapshots.keys() {
+                        total_forgotten += 1;
                     }
                     disown = disowned.next;
+                }
+                if total_forgotten > 0 {
+                    tracing::trace!(
+                        "wasi[{}]::stack has been forgotten (cnt={})",
+                        self.pid(),
+                        total_forgotten
+                    );
                 }
             } else {
                 memory_stack = &memory_stack[pstack.memory_stack.len()..];
@@ -606,7 +623,11 @@ pub enum WasiThreadError {
     MemoryCreateFailed(MemoryError),
     #[error("{0}")]
     ExportError(ExportError),
-    #[error("Failed to create the instance")]
+    #[error("Failed to create additional imports - {0}")]
+    AdditionalImportCreationFailed(Arc<anyhow::Error>),
+    #[error("Linker error: {0}")]
+    LinkError(Arc<LinkError>),
+    #[error("Failed to create the instance - {0}")]
     // Note: Boxed so we can keep the error size down
     InstanceCreateFailed(Box<InstantiationError>),
     #[error("Initialization function failed - {0}")]
@@ -623,6 +644,8 @@ impl From<WasiThreadError> for Errno {
             WasiThreadError::MethodNotFound => Errno::Inval,
             WasiThreadError::MemoryCreateFailed(_) => Errno::Nomem,
             WasiThreadError::ExportError(_) => Errno::Noexec,
+            WasiThreadError::AdditionalImportCreationFailed(_) => Errno::Noexec,
+            WasiThreadError::LinkError(_) => Errno::Noexec,
             WasiThreadError::InstanceCreateFailed(_) => Errno::Noexec,
             WasiThreadError::InitFailed(_) => Errno::Noexec,
             WasiThreadError::InvalidWasmContext => Errno::Noexec,

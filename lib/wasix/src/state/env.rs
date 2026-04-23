@@ -1,30 +1,9 @@
-use std::{
-    collections::HashMap,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-
-use derivative::Derivative;
-use futures::future::BoxFuture;
-use rand::Rng;
-use virtual_fs::{FileSystem, FsError, StaticFile, VirtualFile};
-use virtual_net::DynVirtualNetworking;
-use wasmer::{
-    AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
-    MemoryView, Module, TypedFunction,
-};
-use wasmer_wasix_types::{
-    types::Signal,
-    wasi::{Errno, ExitCode, Snapshot0Clockid},
-    wasix::ThreadStartType,
-};
-
 #[cfg(feature = "journal")]
 use crate::journal::{DynJournal, JournalEffector, SnapshotTrigger};
 use crate::{
-    bin_factory::{BinFactory, BinaryPackage},
+    Runtime, VirtualTaskManager, WasiControlPlane, WasiEnvBuilder, WasiError, WasiFunctionEnv,
+    WasiResult, WasiRuntimeError, WasiStateCreationError, WasiThreadError, WasiVFork,
+    bin_factory::{BinFactory, BinaryPackage, BinaryPackageCommand},
     capabilities::Capabilities,
     fs::{WasiFsRoot, WasiInodes},
     import_object_for_all_wasi_versions,
@@ -33,183 +12,36 @@ use crate::{
         process::{WasiProcess, WasiProcessId},
         thread::{WasiMemoryLayout, WasiThread, WasiThreadHandle, WasiThreadId},
     },
-    runtime::{
-        module_cache::ModuleHash, resolver::PackageSpecifier, task_manager::InlineWaker,
-        SpawnMemoryType,
-    },
     syscalls::platform_clock_time_get,
-    Runtime, VirtualTaskManager, WasiControlPlane, WasiEnvBuilder, WasiError, WasiFunctionEnv,
-    WasiResult, WasiRuntimeError, WasiStateCreationError, WasiVFork,
 };
+use futures::future::BoxFuture;
+use rand::RngExt;
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    path::{Path, PathBuf},
+    str,
+    sync::Arc,
+    time::Duration,
+};
+use virtual_fs::{FileSystem, FsError, VirtualFile};
+use virtual_mio::block_on;
+use virtual_net::DynVirtualNetworking;
+use wasmer::{
+    AsStoreMut, AsStoreRef, ExportError, FunctionEnvMut, Instance, Memory, MemoryType, MemoryView,
+    Module,
+};
+use wasmer_config::package::PackageSource;
+use wasmer_types::ModuleHash;
+use wasmer_wasix_types::{
+    types::Signal,
+    wasi::{Errno, ExitCode, Snapshot0Clockid},
+    wasix::ThreadStartType,
+};
+use webc::metadata::annotations::Wasi;
 
-pub(crate) use super::handles::*;
-use super::WasiState;
-
-/// Various [`TypedFunction`] and [`Global`] handles for an active WASI(X) instance.
-///
-/// Used to access and modify runtime state.
-// TODO: make fields private
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
-pub struct WasiInstanceHandles {
-    // TODO: the two fields below are instance specific, while all others are module specific.
-    // Should be split up.
-    /// Represents a reference to the memory
-    pub(crate) memory: Memory,
-    pub(crate) instance: wasmer::Instance,
-
-    /// Points to the current location of the memory stack pointer
-    pub(crate) stack_pointer: Option<Global>,
-
-    /// Main function that will be invoked (name = "_start")
-    #[derivative(Debug = "ignore")]
-    pub(crate) start: Option<TypedFunction<(), ()>>,
-
-    /// Function thats invoked to initialize the WASM module (name = "_initialize")
-    #[derivative(Debug = "ignore")]
-    // TODO: review allow...
-    #[allow(dead_code)]
-    pub(crate) initialize: Option<TypedFunction<(), ()>>,
-
-    /// Represents the callback for spawning a thread (name = "wasi_thread_start")
-    /// (due to limitations with i64 in browsers the parameters are broken into i32 pairs)
-    /// [this takes a user_data field]
-    #[derivative(Debug = "ignore")]
-    pub(crate) thread_spawn: Option<TypedFunction<(i32, i32), ()>>,
-
-    /// Represents the callback for signals (name = "__wasm_signal")
-    /// Signals are triggered asynchronously at idle times of the process
-    #[derivative(Debug = "ignore")]
-    pub(crate) signal: Option<TypedFunction<i32, ()>>,
-
-    /// Flag that indicates if the signal callback has been set by the WASM
-    /// process - if it has not been set then the runtime behaves differently
-    /// when a CTRL-C is pressed.
-    pub(crate) signal_set: bool,
-
-    /// asyncify_start_unwind(data : i32): call this to start unwinding the
-    /// stack from the current location. "data" must point to a data
-    /// structure as described above (with fields containing valid data).
-    #[derivative(Debug = "ignore")]
-    // TODO: review allow...
-    #[allow(dead_code)]
-    pub(crate) asyncify_start_unwind: Option<TypedFunction<i32, ()>>,
-
-    /// asyncify_stop_unwind(): call this to note that unwinding has
-    /// concluded. If no other code will run before you start to rewind,
-    /// this is not strictly necessary, however, if you swap between
-    /// coroutines, or even just want to run some normal code during a
-    /// "sleep", then you must call this at the proper time. Otherwise,
-    /// the code will think it is still unwinding when it should not be,
-    /// which means it will keep unwinding in a meaningless way.
-    #[derivative(Debug = "ignore")]
-    // TODO: review allow...
-    #[allow(dead_code)]
-    pub(crate) asyncify_stop_unwind: Option<TypedFunction<(), ()>>,
-
-    /// asyncify_start_rewind(data : i32): call this to start rewinding the
-    /// stack vack up to the location stored in the provided data. This prepares
-    /// for the rewind; to start it, you must call the first function in the
-    /// call stack to be unwound.
-    #[derivative(Debug = "ignore")]
-    // TODO: review allow...
-    #[allow(dead_code)]
-    pub(crate) asyncify_start_rewind: Option<TypedFunction<i32, ()>>,
-
-    /// asyncify_stop_rewind(): call this to note that rewinding has
-    /// concluded, and normal execution can resume.
-    #[derivative(Debug = "ignore")]
-    // TODO: review allow...
-    #[allow(dead_code)]
-    pub(crate) asyncify_stop_rewind: Option<TypedFunction<(), ()>>,
-
-    /// asyncify_get_state(): call this to get the current value of the
-    /// internal "__asyncify_state" variable as described above.
-    /// It can be used to distinguish between unwinding/rewinding and normal
-    /// calls, so that you know when to start an asynchronous operation and
-    /// when to propagate results back.
-    #[allow(dead_code)]
-    #[derivative(Debug = "ignore")]
-    pub(crate) asyncify_get_state: Option<TypedFunction<(), i32>>,
-}
-
-impl WasiInstanceHandles {
-    pub fn new(memory: Memory, store: &impl AsStoreRef, instance: Instance) -> Self {
-        WasiInstanceHandles {
-            memory,
-            stack_pointer: instance
-                .exports
-                .get_global("__stack_pointer")
-                .map(|a| a.clone())
-                .ok(),
-            start: instance.exports.get_typed_function(store, "_start").ok(),
-            initialize: instance
-                .exports
-                .get_typed_function(store, "_initialize")
-                .ok(),
-            thread_spawn: instance
-                .exports
-                .get_typed_function(store, "wasi_thread_start")
-                .ok(),
-            signal: instance
-                .exports
-                .get_typed_function(&store, "__wasm_signal")
-                .ok(),
-            signal_set: false,
-            asyncify_start_unwind: instance
-                .exports
-                .get_typed_function(store, "asyncify_start_unwind")
-                .ok(),
-            asyncify_stop_unwind: instance
-                .exports
-                .get_typed_function(store, "asyncify_stop_unwind")
-                .ok(),
-            asyncify_start_rewind: instance
-                .exports
-                .get_typed_function(store, "asyncify_start_rewind")
-                .ok(),
-            asyncify_stop_rewind: instance
-                .exports
-                .get_typed_function(store, "asyncify_stop_rewind")
-                .ok(),
-            asyncify_get_state: instance
-                .exports
-                .get_typed_function(store, "asyncify_get_state")
-                .ok(),
-            instance,
-        }
-    }
-
-    pub fn module(&self) -> &Module {
-        self.instance.module()
-    }
-
-    pub fn module_clone(&self) -> Module {
-        self.instance.module().clone()
-    }
-
-    /// Providers safe access to the memory
-    /// (it must be initialized before it can be used)
-    pub fn memory_view<'a>(&'a self, store: &'a (impl AsStoreRef + ?Sized)) -> MemoryView<'a> {
-        self.memory.view(store)
-    }
-
-    /// Providers safe access to the memory
-    /// (it must be initialized before it can be used)
-    pub fn memory(&self) -> &Memory {
-        &self.memory
-    }
-
-    /// Copy the lazy reference so that when it's initialized during the
-    /// export phase, all the other references get a copy of it
-    pub fn memory_clone(&self) -> Memory {
-        self.memory.clone()
-    }
-
-    pub fn instance(&self) -> &Instance {
-        &self.instance
-    }
-}
+pub use super::handles::*;
+use super::{Linker, WasiState, context_switching::ContextSwitchingEnvironment, conv_env_vars};
 
 /// Data required to construct a [`WasiEnv`].
 #[derive(Debug)]
@@ -236,13 +68,16 @@ pub struct WasiEnvInit {
     /// Indicates if extra tracing should be output
     pub extra_tracing: bool,
 
-    /// Additional functionality provided to the WASIX instance, besides the
-    /// normal WASIX syscalls.
-    pub additional_imports: Imports,
-
     /// Indicates triggers that will cause a snapshot to be taken
     #[cfg(feature = "journal")]
     pub snapshot_on: Vec<SnapshotTrigger>,
+
+    /// Stop running after the first snapshot is taken
+    #[cfg(feature = "journal")]
+    pub stop_running_after_snapshot: bool,
+
+    /// Skip writes to stdout and stderr when bootstrapping from a journal
+    pub skip_stdio_during_bootstrap: bool,
 }
 
 impl WasiEnvInit {
@@ -256,15 +91,16 @@ impl WasiEnvInit {
 
         Self {
             state: WasiState {
-                secret: rand::thread_rng().gen::<[u8; 32]>(),
+                secret: rand::rng().random::<[u8; 32]>(),
                 inodes,
                 fs,
                 futexs: Default::default(),
                 clock_offset: std::sync::Mutex::new(
                     self.state.clock_offset.lock().unwrap().clone(),
                 ),
-                args: self.state.args.clone(),
+                args: std::sync::Mutex::new(self.state.args.lock().unwrap().clone()),
                 envs: std::sync::Mutex::new(self.state.envs.lock().unwrap().deref().clone()),
+                signals: std::sync::Mutex::new(self.state.signals.lock().unwrap().deref().clone()),
                 preopen: self.state.preopen.clone(),
             },
             runtime: self.runtime.clone(),
@@ -281,7 +117,9 @@ impl WasiEnvInit {
             extra_tracing: false,
             #[cfg(feature = "journal")]
             snapshot_on: self.snapshot_on.clone(),
-            additional_imports: self.additional_imports.clone(),
+            #[cfg(feature = "journal")]
+            stop_running_after_snapshot: self.stop_running_after_snapshot,
+            skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
         }
     }
 }
@@ -323,9 +161,12 @@ pub struct WasiEnv {
     /// time that it will pause the CPU)
     pub enable_exponential_cpu_backoff: Option<Duration>,
 
-    /// Flag that indicatees if the environment is currently replaying the journal
+    /// Flag that indicates if the environment is currently replaying the journal
     /// (and hence it should not record new events)
     pub replaying_journal: bool,
+
+    /// Should stdio be skipped when bootstrapping this module from an existing journal?
+    pub skip_stdio_during_bootstrap: bool,
 
     /// Flag that indicates the cleanup of the environment is to be disabled
     /// (this is normally used so that the instance can be reused later on)
@@ -336,6 +177,13 @@ pub struct WasiEnv {
     ///  not be cloned when `WasiEnv` is cloned)
     /// TODO: We should move this outside of `WasiEnv` with some refactoring
     inner: WasiInstanceHandlesPointer,
+
+    /// Tracks the active contexts of the WASIX context switching API
+    ///
+    /// This is `None` when the main function was not launched with context switching
+    ///
+    /// Should probably only be set by [`ContextSwitchingContext::run_main_context`]
+    pub(crate) context_switching_environment: Option<ContextSwitchingEnvironment>,
 }
 
 impl std::fmt::Debug for WasiEnv {
@@ -363,7 +211,9 @@ impl Clone for WasiEnv {
             enable_journal: self.enable_journal,
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: self.replaying_journal,
+            skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
             disable_fs_cleanup: self.disable_fs_cleanup,
+            context_switching_environment: None,
         }
     }
 }
@@ -403,7 +253,9 @@ impl WasiEnv {
             enable_journal: self.enable_journal,
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: false,
+            skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
             disable_fs_cleanup: self.disable_fs_cleanup,
+            context_switching_environment: None,
         };
         Ok((new_env, handle))
     }
@@ -414,6 +266,15 @@ impl WasiEnv {
 
     pub fn tid(&self) -> WasiThreadId {
         self.thread.tid()
+    }
+
+    /// Returns true if this WASM process will need and try to use
+    /// asyncify while its running which normally means.
+    pub fn will_use_asyncify(&self) -> bool {
+        self.inner()
+            .static_module_instance_handles()
+            .map(|handles| self.enable_deep_sleep || handles.has_stack_checkpoint)
+            .unwrap_or(false)
     }
 
     /// Re-initializes this environment so that it can be executed again
@@ -428,7 +289,6 @@ impl WasiEnv {
                 map.clear();
             }
             self.state.fs.preopen_fds.write().unwrap().clear();
-            self.state.fs.next_fd.set_val(3);
             *self.state.fs.current_dir.lock().unwrap() = "/".to_string();
 
             // We need to rebuild the basic file descriptors
@@ -465,20 +325,41 @@ impl WasiEnv {
     }
 
     /// Returns true if this module is capable of deep sleep
-    /// (needs asyncify to unwind and rewin)
+    /// (needs asyncify to unwind and rewind)
     ///
     /// # Safety
     ///
     /// This function should only be called from within a syscall
     /// as it accessed objects that are a thread local (functions)
     pub unsafe fn capable_of_deep_sleep(&self) -> bool {
-        if !self.control_plane.config().enable_asynchronous_threading {
-            return false;
-        }
-        let inner = self.inner();
-        inner.asyncify_get_state.is_some()
-            && inner.asyncify_start_rewind.is_some()
-            && inner.asyncify_start_unwind.is_some()
+        self.deep_sleep_capability_requested() && self.deep_sleep_supported_by_module()
+    }
+
+    pub(crate) fn refresh_deep_sleep_capability(&mut self) {
+        self.enable_deep_sleep = if cfg!(feature = "js") {
+            false
+        } else {
+            self.deep_sleep_capability_requested() && self.deep_sleep_supported_by_module()
+        };
+    }
+
+    fn deep_sleep_capability_requested(&self) -> bool {
+        self.capabilities.threading.enable_deep_sleep
+    }
+
+    fn deep_sleep_supported_by_module(&self) -> bool {
+        self.try_inner()
+            .map(|handles| {
+                handles
+                    .static_module_instance_handles()
+                    .map(|handles| {
+                        handles.asyncify_get_state.is_some()
+                            && handles.asyncify_start_rewind.is_some()
+                            && handles.asyncify_start_unwind.is_some()
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     /// Returns true if this thread can go into a deep sleep
@@ -499,7 +380,9 @@ impl WasiEnv {
 
         #[cfg(feature = "journal")]
         {
-            process.inner.0.lock().unwrap().snapshot_on = init.snapshot_on.into_iter().collect();
+            let mut guard = process.inner.0.lock().unwrap();
+            guard.snapshot_on = init.snapshot_on.into_iter().collect();
+            guard.stop_running_after_checkpoint = init.stop_running_after_snapshot;
         }
 
         let layout = WasiMemoryLayout::default();
@@ -524,7 +407,8 @@ impl WasiEnv {
             #[cfg(not(feature = "journal"))]
             enable_journal: false,
             replaying_journal: false,
-            enable_deep_sleep: init.capabilities.threading.enable_asynchronous_threading,
+            skip_stdio_during_bootstrap: init.skip_stdio_during_bootstrap,
+            enable_deep_sleep: false,
             enable_exponential_cpu_backoff: init
                 .capabilities
                 .threading
@@ -533,6 +417,7 @@ impl WasiEnv {
             bin_factory: init.bin_factory,
             capabilities: init.capabilities,
             disable_fs_cleanup: false,
+            context_switching_environment: None,
         };
         env.owned_handles.push(thread);
 
@@ -550,62 +435,107 @@ impl WasiEnv {
     // FIXME: use custom error type
     #[allow(clippy::result_large_err)]
     pub(crate) fn instantiate(
-        mut init: WasiEnvInit,
+        self,
         module: Module,
-        module_hash: ModuleHash,
         store: &mut impl AsStoreMut,
-    ) -> Result<(Instance, WasiFunctionEnv), WasiRuntimeError> {
-        let call_initialize = init.call_initialize;
-        let spawn_type = init.memory_ty.take();
+        memory: Option<Memory>,
+        update_layout: bool,
+        call_initialize: bool,
+        parent_linker_and_ctx: Option<(Linker, &mut FunctionEnvMut<WasiEnv>)>,
+    ) -> Result<(Instance, WasiFunctionEnv), WasiThreadError> {
+        let pid = self.process.pid();
 
-        if init.extra_tracing {
-            for import in module.imports() {
-                tracing::trace!("import {}.{}", import.module(), import.name());
+        let mut store = store.as_store_mut();
+        let engine = self.runtime().engine();
+        let mut func_env = WasiFunctionEnv::new(&mut store, self);
+
+        let is_dl = super::linker::is_dynamically_linked(&module);
+        if is_dl {
+            let linker = match parent_linker_and_ctx {
+                Some((linker, ctx)) => linker.create_instance_group(ctx, &mut store, &mut func_env),
+                None => {
+                    // FIXME: should we be storing envs as raw byte arrays?
+                    let ld_library_path_owned;
+                    let ld_library_path = {
+                        let envs = func_env.data(&store).state.envs.lock().unwrap();
+                        ld_library_path_owned = match envs
+                            .iter()
+                            .find_map(|env| env.strip_prefix(b"LD_LIBRARY_PATH="))
+                        {
+                            Some(path) => path
+                                .split(|b| *b == b':')
+                                .filter_map(|p| str::from_utf8(p).ok())
+                                .map(PathBuf::from)
+                                .collect::<Vec<_>>(),
+                            None => vec![],
+                        };
+                        ld_library_path_owned
+                            .iter()
+                            .map(AsRef::as_ref)
+                            .collect::<Vec<_>>()
+                    };
+
+                    // TODO: make stack size configurable
+                    Linker::new(
+                        engine,
+                        &module,
+                        &mut store,
+                        memory,
+                        &mut func_env,
+                        8 * 1024 * 1024,
+                        &ld_library_path,
+                    )
+                }
+            };
+
+            match linker {
+                Ok((_, linked_module)) => {
+                    return Ok((linked_module.instance, func_env));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        %pid,
+                        error = &e as &dyn std::error::Error,
+                        "Failed to link DL main module",
+                    );
+                    func_env
+                        .data(&store)
+                        .blocking_on_exit(Some(Errno::Noexec.into()));
+                    return Err(WasiThreadError::LinkError(Arc::new(e)));
+                }
             }
         }
 
-        let additional_imports = init.additional_imports.clone();
-
-        let env = Self::from_init(init, module_hash)?;
-        let pid = env.process.pid();
-
-        let mut store = store.as_store_mut();
-
-        let tasks = env.runtime.task_manager().clone();
-        let mut func_env = WasiFunctionEnv::new(&mut store, env);
-
-        // Determine if shared memory needs to be created and imported
-        let shared_memory = module.imports().memories().next().map(|a| *a.ty());
-
-        // Determine if we are going to create memory and import it or just rely on self creation of memory
-        let spawn_type = if let Some(t) = spawn_type {
-            SpawnMemoryType::CreateMemoryOfType(t)
-        } else {
-            match shared_memory {
-                Some(ty) => SpawnMemoryType::CreateMemoryOfType(ty),
-                None => SpawnMemoryType::CreateMemory,
-            }
-        };
-        let memory = tasks.build_memory(&mut store, spawn_type)?;
-
         // Let's instantiate the module with the imports.
-        let (mut import_object, instance_init_callback) =
+        let mut import_object =
             import_object_for_all_wasi_versions(&module, &mut store, &func_env.env);
+        if let Some(memory) = memory.clone() {
+            import_object.define("env", "memory", memory);
+        }
+        let runtime = func_env.data(&store).runtime.clone();
+        let additional_imports = runtime
+            .additional_imports(&module, &mut store)
+            .map_err(|err| WasiThreadError::AdditionalImportCreationFailed(Arc::new(err)))?;
 
         for ((namespace, name), value) in &additional_imports {
-            // Note: We don't want to let downstream users override WASIX
-            // syscalls
-            if !import_object.exists(&namespace, &name) {
+            // Downstream runtime imports must not override WASIX imports.
+            if import_object.exists(&namespace, &name) {
+                tracing::warn!(
+                    "Skipping duplicate additional import {}.{}",
+                    namespace,
+                    name
+                );
+            } else {
                 import_object.define(&namespace, &name, value);
             }
         }
 
-        let imported_memory = if let Some(memory) = memory {
-            import_object.define("env", "memory", memory.clone());
-            Some(memory)
-        } else {
-            None
-        };
+        let imported_memory = import_object
+            .get_export("env", "memory")
+            .and_then(|ext| match ext {
+                wasmer::Extern::Memory(memory) => Some(memory),
+                _ => None,
+            });
 
         // Construct the instance.
         let instance = match Instance::new(&mut store, &module, &import_object) {
@@ -619,17 +549,53 @@ impl WasiEnv {
                 func_env
                     .data(&store)
                     .blocking_on_exit(Some(Errno::Noexec.into()));
-                return Err(err.into());
+                return Err(WasiThreadError::InstanceCreateFailed(Box::new(err)));
             }
         };
 
-        // Run initializers.
-        instance_init_callback(&instance, &store).unwrap();
+        runtime
+            .configure_new_instance(&module, &mut store, &instance, imported_memory.as_ref())
+            .map_err(|err| WasiThreadError::AdditionalImportCreationFailed(Arc::new(err)))?;
+
+        let handles = match imported_memory {
+            Some(memory) => WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
+                memory,
+                &store,
+                instance.clone(),
+                None,
+            )),
+            None => {
+                let exported_memory = instance
+                    .exports
+                    .iter()
+                    .filter_map(|(_, export)| {
+                        if let wasmer::Extern::Memory(memory) = export {
+                            Some(memory.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+                    .ok_or(WasiThreadError::ExportError(ExportError::Missing(
+                        "No imported or exported memory found".to_owned(),
+                    )))?;
+                WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
+                    exported_memory,
+                    &store,
+                    instance.clone(),
+                    None,
+                ))
+            }
+        };
 
         // Initialize the WASI environment
-        if let Err(err) =
-            func_env.initialize_with_memory(&mut store, instance.clone(), imported_memory, true)
-        {
+        if let Err(err) = func_env.initialize_handles_and_layout(
+            &mut store,
+            instance.clone(),
+            handles,
+            None,
+            update_layout,
+        ) {
             tracing::error!(
                 %pid,
                 error = &err as &dyn std::error::Error,
@@ -638,18 +604,19 @@ impl WasiEnv {
             func_env
                 .data(&store)
                 .blocking_on_exit(Some(Errno::Noexec.into()));
-            return Err(err.into());
+            return Err(WasiThreadError::ExportError(err));
         }
 
         // If this module exports an _initialize function, run that first.
-        if call_initialize {
-            if let Ok(initialize) = instance.exports.get_function("_initialize") {
-                if let Err(err) = crate::run_wasi_func_start(initialize, &mut store) {
-                    func_env
-                        .data(&store)
-                        .blocking_on_exit(Some(Errno::Noexec.into()));
-                    return Err(err);
-                }
+        if call_initialize && let Ok(initialize) = instance.exports.get_function("_initialize") {
+            let initialize_result = initialize.call(&mut store, &[]);
+            if let Err(err) = initialize_result {
+                func_env
+                    .data(&store)
+                    .blocking_on_exit(Some(Errno::Noexec.into()));
+                return Err(WasiThreadError::InitFailed(Arc::new(anyhow::Error::from(
+                    err,
+                ))));
             }
         }
 
@@ -683,14 +650,36 @@ impl WasiEnv {
         self.process.active_threads()
     }
 
+    /// Called by most (if not all) syscalls to process pending operations that are
+    /// cross-cutting, such as signals, thread/process exit, DL operations, etc.
+    pub fn do_pending_operations(ctx: &mut FunctionEnvMut<'_, Self>) -> Result<(), WasiError> {
+        Self::do_pending_link_operations(ctx, true)?;
+        _ = Self::process_signals_and_exit(ctx)?;
+        Ok(())
+    }
+
+    pub fn do_pending_link_operations(
+        ctx: &mut FunctionEnvMut<'_, Self>,
+        fast: bool,
+    ) -> Result<(), WasiError> {
+        if let Some(linker) = ctx.data().inner().linker().cloned()
+            && let Err(e) = linker.do_pending_link_operations(ctx, fast)
+        {
+            tracing::warn!(err = ?e, "Failed to process pending link operations");
+            return Err(WasiError::Exit(Errno::Noexec.into()));
+        }
+        Ok(())
+    }
+
     /// Porcesses any signals that are batched up or any forced exit codes
     pub fn process_signals_and_exit(ctx: &mut FunctionEnvMut<'_, Self>) -> WasiResult<bool> {
         // If a signal handler has never been set then we need to handle signals
         // differently
         let env = ctx.data();
-        let inner = env
+        let env_inner = env
             .try_inner()
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+        let inner = env_inner.main_module_instance_handles();
         if !inner.signal_set {
             let signals = env.thread.pop_signals();
             if !signals.is_empty() {
@@ -699,6 +688,7 @@ impl WasiEnv {
                         || sig == Signal::Sigquit
                         || sig == Signal::Sigkill
                         || sig == Signal::Sigabrt
+                        || sig == Signal::Sigpipe
                     {
                         let exit_code = env.thread.set_or_get_exit_code_for_signal(sig);
                         return Err(WasiError::Exit(exit_code));
@@ -723,9 +713,10 @@ impl WasiEnv {
         // If a signal handler has never been set then we need to handle signals
         // differently
         let env = ctx.data();
-        let inner = env
+        let env_inner = env
             .try_inner()
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+        let inner = env_inner.main_module_instance_handles();
         if !inner.signal_set {
             return Ok(Ok(false));
         }
@@ -747,15 +738,16 @@ impl WasiEnv {
         mut signals: Vec<Signal>,
     ) -> Result<bool, WasiError> {
         let env = ctx.data();
-        let inner = env
+        let env_inner = env
             .try_inner()
             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+        let inner = env_inner.main_module_instance_handles();
         if let Some(handler) = inner.signal.clone() {
             // We might also have signals that trigger on timers
             let mut now = 0;
             {
                 let mut has_signal_interval = false;
-                let inner = env.process.inner.0.lock().unwrap();
+                let mut inner = env.process.inner.0.lock().unwrap();
                 if !inner.signal_intervals.is_empty() {
                     now = platform_clock_time_get(Snapshot0Clockid::Monotonic, 1_000_000).unwrap()
                         as u128;
@@ -768,7 +760,6 @@ impl WasiEnv {
                     }
                 }
                 if has_signal_interval {
-                    let mut inner = env.process.inner.0.lock().unwrap();
                     for signal in inner.signal_intervals.values_mut() {
                         let elapsed = now - signal.last_signal;
                         if elapsed >= signal.interval.as_nanos() {
@@ -780,10 +771,15 @@ impl WasiEnv {
             }
 
             for signal in signals {
+                // Skip over Sigwakeup, which is host-side-only
+                if matches!(signal, Signal::Sigwakeup) {
+                    continue;
+                }
+
                 tracing::trace!(
                     pid=%ctx.data().pid(),
                     ?signal,
-                    "Processing signal",
+                    "processing signal via handler",
                 );
                 if let Err(err) = handler.call(ctx, signal as i32) {
                     match err.downcast::<WasiError>() {
@@ -809,6 +805,10 @@ impl WasiEnv {
                         }
                     }
                 }
+                tracing::trace!(
+                    pid=%ctx.data().pid(),
+                    "signal processed",
+                );
             }
             Ok(true)
         } else {
@@ -848,10 +848,16 @@ impl WasiEnv {
 
     /// Providers safe access to the initialized part of WasiEnv
     /// (it must be initialized before it can be used)
-    /// This has been marked as unsafe as it will panic if its executed
-    /// on the wrong thread or before the inner is set
-    pub(crate) unsafe fn inner(&self) -> WasiInstanceGuard<'_> {
+    pub(crate) fn inner(&self) -> WasiInstanceGuard<'_> {
         self.inner.get().expect(
+            "You must initialize the WasiEnv before using it and can not pass it between threads",
+        )
+    }
+
+    /// Provides safe access to the initialized part of WasiEnv
+    /// (it must be initialized before it can be used)
+    pub(crate) fn inner_mut(&mut self) -> WasiInstanceGuardMut<'_> {
+        self.inner.get_mut().expect(
             "You must initialize the WasiEnv before using it and can not pass it between threads",
         )
     }
@@ -863,6 +869,7 @@ impl WasiEnv {
 
     /// Providers safe access to the initialized part of WasiEnv
     /// (it must be initialized before it can be used)
+    #[allow(dead_code)]
     pub(crate) fn try_inner_mut(&mut self) -> Option<WasiInstanceGuardMut<'_>> {
         self.inner.get_mut()
     }
@@ -871,8 +878,9 @@ impl WasiEnv {
     /// creating the instance and eventually should be moved out
     /// of the WasiEnv)
     #[doc(hidden)]
-    pub(crate) fn set_inner(&mut self, handles: WasiInstanceHandles) {
-        self.inner.set(handles)
+    pub(crate) fn set_inner(&mut self, handles: WasiModuleTreeHandles) {
+        self.inner.set(handles);
+        self.refresh_deep_sleep_capability();
     }
 
     /// Swaps this inner with the WasiEnvironment of another, this
@@ -883,22 +891,38 @@ impl WasiEnv {
         std::mem::swap(&mut self.inner, &mut other.inner);
     }
 
-    /// Tries to clone the instance from this environment
+    /// Helper function to ensure the module isn't dynamically linked, needed since
+    /// we only support a subset of WASIX functionality for dynamically linked modules.
+    /// Specifically, anything that requires asyncify is not supported right now.
+    pub(crate) fn ensure_static_module(&self) -> Result<(), ()> {
+        self.inner.get().unwrap().ensure_static_module()
+    }
+
+    /// Tries to clone the instance from this environment, but only if it's a static
+    /// module, since dynamically linked modules are made up of multiple instances.
     pub fn try_clone_instance(&self) -> Option<Instance> {
-        self.inner.get().map(|i| i.instance.clone())
+        let guard = self.inner.get();
+        match guard {
+            Some(guard) => guard
+                .static_module_instance_handles()
+                .map(|instance| instance.instance.clone()),
+            None => None,
+        }
     }
 
     /// Providers safe access to the memory
     /// (it must be initialized before it can be used)
-    pub(crate) fn try_memory(&self) -> Option<WasiInstanceGuardMemory<'_>> {
+    pub fn try_memory(&self) -> Option<WasiInstanceGuardMemory<'_>> {
         self.try_inner().map(|i| i.memory())
     }
 
     /// Providers safe access to the memory
     /// (it must be initialized before it can be used)
+    ///
+    /// # Safety
     /// This has been marked as unsafe as it will panic if its executed
     /// on the wrong thread or before the inner is set
-    pub(crate) unsafe fn memory(&self) -> WasiInstanceGuardMemory<'_> {
+    pub unsafe fn memory(&self) -> WasiInstanceGuardMemory<'_> {
         self.try_memory().expect(
             "You must initialize the WasiEnv before using it and can not pass it between threads",
         )
@@ -906,7 +930,7 @@ impl WasiEnv {
 
     /// Providers safe access to the memory
     /// (it must be initialized before it can be used)
-    pub(crate) fn try_memory_view<'a>(
+    pub fn try_memory_view<'a>(
         &self,
         store: &'a (impl AsStoreRef + ?Sized),
     ) -> Option<MemoryView<'a>> {
@@ -915,12 +939,11 @@ impl WasiEnv {
 
     /// Providers safe access to the memory
     /// (it must be initialized before it can be used)
+    ///
+    /// # Safety
     /// This has been marked as unsafe as it will panic if its executed
     /// on the wrong thread or before the inner is set
-    pub(crate) unsafe fn memory_view<'a>(
-        &self,
-        store: &'a (impl AsStoreRef + ?Sized),
-    ) -> MemoryView<'a> {
+    pub unsafe fn memory_view<'a>(&self, store: &'a (impl AsStoreRef + ?Sized)) -> MemoryView<'a> {
         self.try_memory_view(store).expect(
             "You must initialize the WasiEnv before using it and can not pass it between threads",
         )
@@ -930,7 +953,8 @@ impl WasiEnv {
     /// export phase, all the other references get a copy of it
     #[allow(dead_code)]
     pub(crate) fn try_memory_clone(&self) -> Option<Memory> {
-        self.try_inner().map(|i| i.memory_clone())
+        self.try_inner()
+            .map(|i| i.main_module_instance_handles().memory_clone())
     }
 
     /// Get the WASI state
@@ -958,11 +982,17 @@ impl WasiEnv {
         self.enable_journal && !self.replaying_journal
     }
 
+    /// Returns true if the environment has an active journal
+    #[cfg(feature = "journal")]
+    pub fn has_active_journal(&self) -> bool {
+        self.runtime().active_journal().is_some()
+    }
+
     /// Returns the active journal or fails with an error
     #[cfg(feature = "journal")]
     pub fn active_journal(&self) -> Result<&DynJournal, Errno> {
         self.runtime().active_journal().ok_or_else(|| {
-            tracing::warn!("failed to save thread exit as there is not active journal");
+            tracing::debug!("failed to save thread exit as there is not active journal");
             Errno::Fault
         })
     }
@@ -1003,8 +1033,8 @@ impl WasiEnv {
         &'a self,
         store: &'a impl AsStoreRef,
         _mem_index: u32,
-    ) -> (MemoryView<'a>, &WasiState) {
-        let memory = self.memory_view(store);
+    ) -> (MemoryView<'a>, &'a WasiState) {
+        let memory = unsafe { self.memory_view(store) };
         let state = self.state.deref();
         (memory, state)
     }
@@ -1018,8 +1048,8 @@ impl WasiEnv {
         &'a self,
         store: &'a impl AsStoreRef,
         _mem_index: u32,
-    ) -> (MemoryView<'a>, &WasiState, &WasiInodes) {
-        let memory = self.memory_view(store);
+    ) -> (MemoryView<'a>, &'a WasiState, &'a WasiInodes) {
+        let memory = unsafe { self.memory_view(store) };
         let state = self.state.deref();
         let inodes = &state.inodes;
         (memory, state, inodes)
@@ -1029,6 +1059,10 @@ impl WasiEnv {
         let state = self.state.deref();
         let inodes = &state.inodes;
         (state, inodes)
+    }
+
+    pub fn use_package(&self, pkg: &BinaryPackage) -> Result<(), WasiStateCreationError> {
+        block_on(self.use_package_async(pkg))
     }
 
     /// Make all the commands in a [`BinaryPackage`] available to the WASI
@@ -1042,13 +1076,16 @@ impl WasiEnv {
     ///
     /// [cmd-atom]: crate::bin_factory::BinaryPackageCommand::atom()
     /// [pkg-fs]: crate::bin_factory::BinaryPackage::webc_fs
-    pub fn use_package(&self, pkg: &BinaryPackage) -> Result<(), WasiStateCreationError> {
-        tracing::trace!(packagae=%pkg.package_name, "merging package dependency into wasi environment");
+    pub async fn use_package_async(
+        &self,
+        pkg: &BinaryPackage,
+    ) -> Result<(), WasiStateCreationError> {
+        tracing::trace!(package=%pkg.id, "merging package dependency into wasi environment");
         let root_fs = &self.state.fs.root_fs;
 
-        // We first need to copy any files in the package over to the
-        // main file system
-        if let Err(e) = InlineWaker::block_on(root_fs.merge(&pkg.webc_fs)) {
+        // We first need to merge the filesystem in the package into the
+        // main file system, if it has not been merged already.
+        if let Err(e) = self.state.fs.conditional_union(pkg).await {
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
                 "Unable to merge the package's filesystem into the main one",
@@ -1059,37 +1096,62 @@ impl WasiEnv {
 
         if !pkg.commands.is_empty() {
             let _ = root_fs.create_dir(Path::new("/bin"));
+            let _ = root_fs.create_dir(Path::new("/usr"));
+            let _ = root_fs.create_dir(Path::new("/usr/bin"));
 
             for command in &pkg.commands {
                 let path = format!("/bin/{}", command.name());
+                let path2 = format!("/usr/bin/{}", command.name());
                 let path = Path::new(path.as_str());
+                let path2 = Path::new(path2.as_str());
 
-                // FIXME(Michael-F-Bryan): This is pretty sketchy.
-                // We should be using some sort of reference-counted
-                // pointer to some bytes that are either on the heap
-                // or from a memory-mapped file. However, that's not
-                // possible here because things like memfs and
-                // WasiEnv are expecting a Cow<'static, [u8]>. It's
-                // too hard to refactor those at the moment, and we
-                // were pulling the same trick before by storing an
-                // "ownership" object in the BinaryPackageCommand,
-                // so as long as packages aren't removed from the
-                // module cache it should be fine.
-                // See https://github.com/wasmerio/wasmer/issues/3875
-                let atom: &'static [u8] = unsafe { std::mem::transmute(command.atom()) };
+                let atom = command.atom();
 
                 match root_fs {
                     WasiFsRoot::Sandbox(root_fs) => {
-                        // As a short-cut, when we are using a TmpFileSystem
-                        // we can (unsafely) add the file to the filesystem
-                        // without any copying.
                         if let Err(err) = root_fs
                             .new_open_options_ext()
-                            .insert_ro_file(path, atom.into())
+                            .insert_ro_file(path, atom.clone())
                         {
                             tracing::debug!(
                                 "failed to add package [{}] command [{}] - {}",
-                                pkg.package_name,
+                                pkg.id,
+                                command.name(),
+                                err
+                            );
+                            continue;
+                        }
+                        if let Err(err) = root_fs.new_open_options_ext().insert_ro_file(path2, atom)
+                        {
+                            tracing::debug!(
+                                "failed to add package [{}] command [{}] - {}",
+                                pkg.id,
+                                command.name(),
+                                err
+                            );
+                            continue;
+                        }
+                    }
+                    WasiFsRoot::Overlay(ofs) => {
+                        let root_fs = ofs.primary();
+
+                        if let Err(err) = root_fs
+                            .new_open_options_ext()
+                            .insert_ro_file(path, atom.clone())
+                        {
+                            tracing::debug!(
+                                "failed to add package [{}] command [{}] - {}",
+                                pkg.id,
+                                command.name(),
+                                err
+                            );
+                            continue;
+                        }
+                        if let Err(err) = root_fs.new_open_options_ext().insert_ro_file(path2, atom)
+                        {
+                            tracing::debug!(
+                                "failed to add package [{}] command [{}] - {}",
+                                pkg.id,
                                 command.name(),
                                 err
                             );
@@ -1097,10 +1159,17 @@ impl WasiEnv {
                         }
                     }
                     WasiFsRoot::Backing(fs) => {
+                        // FIXME: we're counting on the fs being a mem_fs here. Otherwise, memory
+                        // usage will be very high.
                         let mut f = fs.new_open_options().create(true).write(true).open(path)?;
-                        if let Err(e) =
-                            InlineWaker::block_on(f.copy_reference(Box::new(StaticFile::new(atom))))
-                        {
+                        if let Err(e) = f.copy_from_owned_buffer(&atom).await {
+                            tracing::warn!(
+                                error = &e as &dyn std::error::Error,
+                                "Unable to copy file reference",
+                            );
+                        }
+                        let mut f = fs.new_open_options().create(true).write(true).open(path2)?;
+                        if let Err(e) = f.copy_from_owned_buffer(&atom).await {
                             tracing::warn!(
                                 error = &e as &dyn std::error::Error,
                                 "Unable to copy file reference",
@@ -1111,11 +1180,14 @@ impl WasiEnv {
 
                 let mut package = pkg.clone();
                 package.entrypoint_cmd = Some(command.name().to_string());
+                let package_arc = Arc::new(package);
                 self.bin_factory
-                    .set_binary(path.as_os_str().to_string_lossy().as_ref(), package);
+                    .set_binary(path.to_string_lossy().as_ref(), &package_arc);
+                self.bin_factory
+                    .set_binary(path2.to_string_lossy().as_ref(), &package_arc);
 
                 tracing::debug!(
-                    package=%pkg.package_name,
+                    package=%pkg.id,
                     command_name=command.name(),
                     path=%path.display(),
                     "Injected a command into the filesystem",
@@ -1135,20 +1207,16 @@ impl WasiEnv {
         let rt = self.runtime();
 
         for package_name in uses {
-            let specifier = package_name.parse::<PackageSpecifier>().map_err(|e| {
+            let specifier = package_name.parse::<PackageSource>().map_err(|e| {
                 WasiStateCreationError::WasiIncludePackageError(format!(
-                    "package_name={package_name}, {}",
-                    e
+                    "package_name={package_name}, {e}",
                 ))
             })?;
-            let pkg = InlineWaker::block_on(BinaryPackage::from_registry(&specifier, rt)).map_err(
-                |e| {
-                    WasiStateCreationError::WasiIncludePackageError(format!(
-                        "package_name={package_name}, {}",
-                        e
-                    ))
-                },
-            )?;
+            let pkg = block_on(BinaryPackage::from_registry(&specifier, rt)).map_err(|e| {
+                WasiStateCreationError::WasiIncludePackageError(format!(
+                    "package_name={package_name}, {e}",
+                ))
+            })?;
             self.use_package(&pkg)?;
         }
 
@@ -1164,6 +1232,7 @@ impl WasiEnv {
         #[allow(unused_imports)]
         use std::path::Path;
 
+        use shared_buffer::OwnedBuffer;
         #[allow(unused_imports)]
         use virtual_fs::FileSystem;
 
@@ -1177,19 +1246,33 @@ impl WasiEnv {
                     err
                 ))
             })?;
-            let file: std::borrow::Cow<'static, [u8]> = file.into();
+            let file = OwnedBuffer::from(file);
 
             if let WasiFsRoot::Sandbox(root_fs) = &self.state.fs.root_fs {
                 let _ = root_fs.create_dir(Path::new("/bin"));
+                let _ = root_fs.create_dir(Path::new("/usr"));
+                let _ = root_fs.create_dir(Path::new("/usr/bin"));
 
-                let path = format!("/bin/{}", command);
+                let path = format!("/bin/{command}");
+                let path = Path::new(path.as_str());
+                if let Err(err) = root_fs
+                    .new_open_options_ext()
+                    .insert_ro_file(path, file.clone())
+                {
+                    tracing::debug!("failed to add atom command [{}] - {}", command, err);
+                    continue;
+                }
+                let path = format!("/usr/bin/{command}");
                 let path = Path::new(path.as_str());
                 if let Err(err) = root_fs.new_open_options_ext().insert_ro_file(path, file) {
                     tracing::debug!("failed to add atom command [{}] - {}", command, err);
                     continue;
                 }
             } else {
-                tracing::debug!("failed to add atom command [{}] to the root file system as it is not sandboxed", command);
+                tracing::debug!(
+                    "failed to add atom command [{}] to the root file system as it is not sandboxed",
+                    command
+                );
                 continue;
             }
         }
@@ -1198,32 +1281,33 @@ impl WasiEnv {
 
     /// Cleans up all the open files (if this is the main thread)
     #[allow(clippy::await_holding_lock)]
-    pub fn blocking_on_exit(&self, exit_code: Option<ExitCode>) {
-        let cleanup = self.on_exit(exit_code);
-        InlineWaker::block_on(cleanup);
+    pub fn blocking_on_exit(&self, process_exit_code: Option<ExitCode>) {
+        let cleanup = self.on_exit(process_exit_code);
+        block_on(cleanup);
     }
 
     /// Cleans up all the open files (if this is the main thread)
     #[allow(clippy::await_holding_lock)]
-    pub fn on_exit(&self, exit_code: Option<ExitCode>) -> BoxFuture<'static, ()> {
+    pub fn on_exit(&self, process_exit_code: Option<ExitCode>) -> BoxFuture<'static, ()> {
         const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
         // If snap-shooting is enabled then we should record an event that the thread has exited.
         #[cfg(feature = "journal")]
-        if self.should_journal() {
-            if let Err(err) = JournalEffector::save_thread_exit(self, self.tid(), exit_code) {
+        if self.should_journal() && self.has_active_journal() {
+            if let Err(err) = JournalEffector::save_thread_exit(self, self.tid(), process_exit_code)
+            {
                 tracing::warn!("failed to save snapshot event for thread exit - {}", err);
             }
 
-            if self.thread.is_main() {
-                if let Err(err) = JournalEffector::save_process_exit(self, exit_code) {
-                    tracing::warn!("failed to save snapshot event for process exit - {}", err);
-                }
+            if self.thread.is_main()
+                && let Err(err) = JournalEffector::save_process_exit(self, process_exit_code)
+            {
+                tracing::warn!("failed to save snapshot event for process exit - {}", err);
             }
         }
 
-        // If this is the main thread then also close all the files
-        if self.thread.is_main() {
+        // If the process wants to exit, also close all files and terminate it
+        if let Some(process_exit_code) = process_exit_code {
             let process = self.process.clone();
             let disable_fs_cleanup = self.disable_fs_cleanup;
             let pid = self.pid();
@@ -1249,11 +1333,50 @@ impl WasiEnv {
                 }
 
                 // Terminate the process
-                let exit_code = exit_code.unwrap_or_else(|| Errno::Canceled.into());
-                process.terminate(exit_code);
+                process.terminate(process_exit_code);
             })
         } else {
             Box::pin(async {})
+        }
+    }
+
+    pub fn prepare_spawn(&self, cmd: &BinaryPackageCommand) {
+        if let Ok(Some(Wasi {
+            main_args,
+            env: env_vars,
+            exec_name,
+            ..
+        })) = cmd.metadata().wasi()
+        {
+            if let Some(env_vars) = env_vars {
+                let env_vars = env_vars
+                    .into_iter()
+                    .map(|env_var| {
+                        let (k, v) = env_var.split_once('=').unwrap();
+
+                        (k.to_string(), v.as_bytes().to_vec())
+                    })
+                    .collect::<Vec<_>>();
+
+                let env_vars = conv_env_vars(env_vars);
+
+                self.state
+                    .envs
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(env_vars.as_slice());
+            }
+
+            if let Some(main_args) = main_args {
+                let mut args: std::sync::MutexGuard<'_, Vec<String>> =
+                    self.state.args.lock().unwrap();
+                // Insert main-args before user args
+                args.splice(1..1, main_args);
+            }
+
+            if let Some(exec_name) = exec_name {
+                self.state.args.lock().unwrap()[0] = exec_name;
+            }
         }
     }
 }

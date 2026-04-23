@@ -13,12 +13,12 @@
 //! You can run the example directly by executing in Wasmer root:
 //!
 //! ```shell
-//! cargo run --example engine-universal --release --features "cranelift"
+//! cargo run --example engine --release --features "cranelift"
 //! ```
 //!
 //! Ready?
 
-use wasmer::{imports, wat2wasm, EngineBuilder, Instance, Module, Store, Value};
+use wasmer::{Instance, Module, Store, Value, imports, sys::EngineBuilder, wat2wasm};
 use wasmer_compiler_cranelift::Cranelift;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sum = instance.exports.get_function("sum")?;
     let results = sum.call(&mut store, &[Value::I32(1), Value::I32(2)])?;
 
-    println!("Results: {:?}", results);
+    println!("Results: {results:?}");
     assert_eq!(results.to_vec(), vec![Value::I32(3)]);
 
     Ok(())

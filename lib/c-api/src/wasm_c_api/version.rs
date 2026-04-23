@@ -1,20 +1,24 @@
-use lazy_static::lazy_static;
 use std::os::raw::c_char;
+use std::sync::LazyLock;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 const VERSION_PRE: &str = concat!(env!("CARGO_PKG_VERSION_PRE"), "\0");
 
-lazy_static! {
-    static ref VERSION_MAJOR: u8 = env!("CARGO_PKG_VERSION_MAJOR")
+static VERSION_MAJOR: LazyLock<u8> = LazyLock::new(|| {
+    env!("CARGO_PKG_VERSION_MAJOR")
         .parse()
-        .expect("Failed to parse value for `VERSION_MAJOR` from `CARGO_PKG_VERSION_MAJOR`");
-    static ref VERSION_MINOR: u8 = env!("CARGO_PKG_VERSION_MINOR")
+        .expect("Failed to parse value for `VERSION_MAJOR` from `CARGO_PKG_VERSION_MAJOR`")
+});
+static VERSION_MINOR: LazyLock<u8> = LazyLock::new(|| {
+    env!("CARGO_PKG_VERSION_MINOR")
         .parse()
-        .expect("Failed to parse value for `VERSION_MINOR` from `CARGO_PKG_VERSION_MINOR`");
-    static ref VERSION_PATCH: u8 = env!("CARGO_PKG_VERSION_PATCH")
+        .expect("Failed to parse value for `VERSION_MINOR` from `CARGO_PKG_VERSION_MINOR`")
+});
+static VERSION_PATCH: LazyLock<u8> = LazyLock::new(|| {
+    env!("CARGO_PKG_VERSION_PATCH")
         .parse()
-        .expect("Failed to parse value for `VERSION_PATCH` from `CARGO_PKG_VERSION_PATCH`");
-}
+        .expect("Failed to parse value for `VERSION_PATCH` from `CARGO_PKG_VERSION_PATCH`")
+});
 
 /// Get the version of the Wasmer C API.
 ///
@@ -28,7 +32,7 @@ lazy_static! {
 /// # Example
 ///
 /// See the module's documentation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_version() -> *const c_char {
     VERSION.as_ptr() as *const _
 }
@@ -67,7 +71,7 @@ pub unsafe extern "C" fn wasmer_version() -> *const c_char {
 /// #     );
 /// # }
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_version_major() -> u8 {
     *VERSION_MAJOR
 }
@@ -75,7 +79,7 @@ pub unsafe extern "C" fn wasmer_version_major() -> u8 {
 /// Get the minor version of the Wasmer C API.
 ///
 /// See [`wasmer_version_major`] to learn more and get an example.  
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_version_minor() -> u8 {
     *VERSION_MINOR
 }
@@ -83,7 +87,7 @@ pub unsafe extern "C" fn wasmer_version_minor() -> u8 {
 /// Get the patch version of the Wasmer C API.
 ///
 /// See [`wasmer_version_major`] to learn more and get an example.  
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_version_patch() -> u8 {
     *VERSION_PATCH
 }
@@ -118,7 +122,7 @@ pub unsafe extern "C" fn wasmer_version_patch() -> u8 {
 /// #    .stdout(env!("CARGO_PKG_VERSION_PRE"));
 /// # }
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasmer_version_pre() -> *const c_char {
     VERSION_PRE.as_ptr() as *const _
 }

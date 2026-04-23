@@ -18,7 +18,7 @@ use crate::{net::socket::TimeType, syscalls::*};
 /// Number of bytes stored in ri_data and message flags.
 #[instrument(level = "trace", skip_all, fields(%sock, nread = field::Empty, peer = field::Empty), ret)]
 pub fn sock_recv_from<M: MemorySize>(
-    ctx: FunctionEnvMut<'_, WasiEnv>,
+    mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     ri_data: WasmPtr<__wasi_iovec_t<M>, M>,
     ri_data_len: M::Offset,
@@ -27,6 +27,8 @@ pub fn sock_recv_from<M: MemorySize>(
     ro_flags: WasmPtr<RoFlags, M>,
     ro_addr: WasmPtr<__wasi_addr_port_t, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     sock_recv_from_internal(
         ctx,
         sock,
@@ -44,16 +46,17 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
     sock: WasiFd,
     ri_data: WasmPtr<__wasi_iovec_t<M>, M>,
     ri_data_len: M::Offset,
-    _ri_flags: RiFlags,
+    ri_flags: RiFlags,
     ro_data_len: WasmPtr<M::Offset, M>,
     ro_flags: WasmPtr<RoFlags, M>,
     ro_addr: WasmPtr<__wasi_addr_port_t, M>,
 ) -> Result<Errno, WasiError> {
-    wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
-
     let mut env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let iovs_arr = wasi_try_mem_ok!(ri_data.slice(&memory, ri_data_len));
+
+    let peek = (ri_flags & __WASI_SOCK_RECV_INPUT_PEEK) != 0;
+    let nonblocking_flag = (ri_flags & __WASI_SOCK_RECV_INPUT_DONT_WAIT) != 0;
 
     let max_size = {
         let mut max_size = 0usize;
@@ -74,14 +77,21 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
                 sock,
                 Rights::SOCK_RECV,
                 |socket, fd| async move {
-                    let nonblocking = fd.flags.contains(Fdflags::NONBLOCK);
+                    let nonblocking =
+                        nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
                     let timeout = socket
                         .opt_time(TimeType::ReadTimeout)
                         .ok()
                         .flatten()
                         .unwrap_or(Duration::from_secs(30));
                     socket
-                        .recv_from(env.tasks().deref(), writer, Some(timeout), nonblocking)
+                        .recv_from(
+                            env.tasks().deref(),
+                            writer,
+                            Some(timeout),
+                            nonblocking,
+                            peek,
+                        )
                         .await
                 },
             ));
@@ -99,7 +109,7 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
                 sock,
                 Rights::SOCK_RECV_FROM,
                 |socket, fd| async move {
-                    let nonblocking = fd.flags.contains(Fdflags::NONBLOCK);
+                    let nonblocking = fd.inner.flags.contains(Fdflags::NONBLOCK);
                     let timeout = socket
                         .opt_time(TimeType::ReadTimeout)
                         .ok()
@@ -111,7 +121,13 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
                         buf.set_len(max_size);
                     }
                     socket
-                        .recv_from(env.tasks().deref(), &mut buf, Some(timeout), nonblocking)
+                        .recv_from(
+                            env.tasks().deref(),
+                            &mut buf,
+                            Some(timeout),
+                            nonblocking,
+                            peek,
+                        )
                         .await
                         .map(|(amt, addr)| {
                             unsafe {
@@ -134,7 +150,7 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
     };
     Span::current()
         .record("nread", bytes_read)
-        .record("peer", &format!("{:?}", peer));
+        .record("peer", format!("{peer:?}"));
 
     wasi_try_ok!(write_ip_port(&memory, ro_addr, peer.ip(), peer.port()));
 

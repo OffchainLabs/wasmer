@@ -1,17 +1,15 @@
-use wasmer_api::types::GetAllDomainsVariables;
+use wasmer_backend_api::types::GetAllDomainsVariables;
 
-use crate::{
-    commands::AsyncCliCommand,
-    opts::{ApiOpts, ListFormatOpts},
-};
+use crate::{commands::AsyncCliCommand, config::WasmerEnv, opts::ListFormatOpts};
 
 /// List domains.
 #[derive(clap::Parser, Debug)]
 pub struct CmdDomainList {
     #[clap(flatten)]
     fmt: ListFormatOpts,
+
     #[clap(flatten)]
-    api: ApiOpts,
+    env: WasmerEnv,
 
     /// Name of the namespace.
     namespace: Option<String>,
@@ -22,8 +20,8 @@ impl AsyncCliCommand for CmdDomainList {
     type Output = ();
 
     async fn run_async(self) -> Result<(), anyhow::Error> {
-        let client = self.api.client()?;
-        let domains = wasmer_api::query::get_all_domains(
+        let client = self.env.client()?;
+        let domains = wasmer_backend_api::query::get_all_domains(
             &client,
             GetAllDomainsVariables {
                 first: None,

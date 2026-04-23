@@ -1,5 +1,5 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 use std::boxed::Box;
 use wasmer_types::entity::PrimaryMap;
@@ -50,6 +50,7 @@ impl ModuleTranslationState {
 }
 
 /// A helper enum for representing either a single or multiple values.
+#[derive(Clone)]
 pub enum SingleOrMultiValue<'a> {
     /// A single value.
     Single(&'a wasmparser::ValType),
@@ -57,7 +58,7 @@ pub enum SingleOrMultiValue<'a> {
     Multi(&'a [wasmparser::ValType]),
 }
 
-impl<'a> SingleOrMultiValue<'a> {
+impl SingleOrMultiValue<'_> {
     /// True if empty.
     pub fn is_empty(&self) -> bool {
         match self {
@@ -119,7 +120,7 @@ impl<'a> Iterator for SingleOrMultiValueIterator<'a> {
     }
 }
 
-impl<'a> PartialEq<[wasmparser::ValType]> for SingleOrMultiValue<'a> {
+impl PartialEq<[wasmparser::ValType]> for SingleOrMultiValue<'_> {
     fn eq(&self, other: &[wasmparser::ValType]) -> bool {
         match self {
             SingleOrMultiValue::Single(ty) => other.len() == 1 && &other[0] == *ty,

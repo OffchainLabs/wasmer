@@ -1,15 +1,10 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 use std::{
     io::{self, Read, Write},
     ptr, slice,
 };
-
-// /// Round `size` up to the nearest multiple of `page_size`.
-// fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
-//     (size + (page_size - 1)) & !(page_size - 1)
-// }
 
 /// A simple struct consisting of a page-aligned pointer to page-aligned
 /// and initially-zeroed memory and a length.
@@ -65,13 +60,6 @@ impl FdMmap {
         }
     }
 
-    // /// Create a new `Mmap` pointing to at least `size` bytes of page-aligned accessible memory.
-    // pub fn with_at_least(size: usize) -> Result<Self, String> {
-    //     let page_size = region::page::size();
-    //     let rounded_size = round_up_to_page_size(size, page_size);
-    //     Self::accessible_reserved(rounded_size, rounded_size)
-    // }
-
     /// Create a new `Mmap` pointing to `accessible_size` bytes of page-aligned accessible memory,
     /// within a reserved mapping of `mapping_size` bytes. `accessible_size` and `mapping_size`
     /// must be native page-size multiples.
@@ -109,9 +97,6 @@ impl FdMmap {
             }
         }
 
-        // Compute the flags
-        let flags = libc::MAP_FILE | libc::MAP_SHARED;
-
         Ok(if accessible_size == mapping_size {
             // Allocate a single read-write region at once.
             let ptr = unsafe {
@@ -119,7 +104,7 @@ impl FdMmap {
                     ptr::null_mut(),
                     mapping_size,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    flags,
+                    libc::MAP_FILE | libc::MAP_SHARED,
                     fd.0,
                     0,
                 )
@@ -140,7 +125,7 @@ impl FdMmap {
                     ptr::null_mut(),
                     mapping_size,
                     libc::PROT_NONE,
-                    flags,
+                    libc::MAP_FILE | libc::MAP_SHARED,
                     fd.0,
                     0,
                 )
@@ -349,14 +334,6 @@ fn copy_file_range(
 mod tests {
     use super::*;
 
-    // #[test]
-    // fn test_round_up_to_page_size() {
-    //     assert_eq!(round_up_to_page_size(0, 4096), 0);
-    //     assert_eq!(round_up_to_page_size(1, 4096), 4096);
-    //     assert_eq!(round_up_to_page_size(4096, 4096), 4096);
-    //     assert_eq!(round_up_to_page_size(4097, 4096), 8192);
-    // }
-
     #[cfg(target_family = "unix")]
     #[test]
     fn test_copy_file_range() -> Result<(), std::io::Error> {
@@ -379,7 +356,7 @@ mod tests {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&pa)
+            .open(pa)
             .unwrap();
         a.write_all(&data).unwrap();
 
@@ -388,7 +365,7 @@ mod tests {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&pb)
+            .open(pb)
             .unwrap();
         b.write_all(&datb).unwrap();
 

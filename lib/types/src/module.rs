@@ -1,5 +1,5 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Data structure for representing WebAssembly modules in a
 //! `wasmer::Module`.
@@ -8,15 +8,13 @@ use crate::entity::{EntityRef, PrimaryMap};
 use crate::{
     CustomSectionIndex, DataIndex, ElemIndex, ExportIndex, ExportType, ExternType, FunctionIndex,
     FunctionType, GlobalIndex, GlobalInit, GlobalType, ImportIndex, ImportType, LocalFunctionIndex,
-    LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex, MemoryType, SignatureIndex,
-    TableIndex, TableInitializer, TableType,
+    LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, LocalTagIndex, MemoryIndex, MemoryType,
+    ModuleHash, SignatureIndex, TableIndex, TableInitializer, TableType, TagIndex, TagType,
 };
+
 use indexmap::IndexMap;
-use rkyv::{
-    de::SharedDeserializeRegistry, ser::ScratchSpace, ser::Serializer,
-    ser::SharedSerializeRegistry, Archive, Archived, CheckBytes, Deserialize as RkyvDeserialize,
-    Fallible, Serialize as RkyvSerialize,
-};
+use rkyv::rancor::{Fallible, Source, Trace};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,7 +24,8 @@ use std::iter::ExactSizeIterator;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 #[derive(Debug, Clone, RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(CheckBytes))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug))]
 pub struct ModuleId {
     id: usize,
 }
@@ -49,7 +48,7 @@ impl Default for ModuleId {
 /// Hash key of an import
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Default, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive_attr(derive(CheckBytes, PartialEq, Eq, Hash))]
+#[rkyv(derive(PartialOrd, Ord, PartialEq, Eq, Hash, Debug))]
 pub struct ImportKey {
     /// Module name
     pub module: String,
@@ -99,8 +98,13 @@ mod serde_imports {
 
 /// A translated WebAssembly module, excluding the function bodies and
 /// memory initializers.
+///
+/// IMPORTANT: since this struct will be serialized as part of the compiled module artifact,
+/// if you change this struct, do not forget to update [`MetadataHeader::version`](crate::serialize::MetadataHeader)
+/// to make sure we don't break compatibility between versions.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct ModuleInfo {
     /// A unique identifier (within this process) for this module.
     ///
@@ -110,6 +114,9 @@ pub struct ModuleInfo {
     /// it's still deserialized back as a garbage number, and later override from computed by the process
     #[cfg_attr(feature = "enable-serde", serde(skip_serializing, skip_deserializing))]
     pub id: ModuleId,
+
+    /// hash of the module
+    pub hash: Option<ModuleHash>,
 
     /// The name of this wasm module, often found in the wasm file.
     pub name: Option<String>,
@@ -158,6 +165,9 @@ pub struct ModuleInfo {
     /// WebAssembly global variables (imported and local).
     pub globals: PrimaryMap<GlobalIndex, GlobalType>,
 
+    /// WebAssembly tag variables (imported and local).
+    pub tags: PrimaryMap<TagIndex, SignatureIndex>,
+
     /// Custom sections in the module.
     pub custom_sections: IndexMap<String, CustomSectionIndex>,
 
@@ -173,15 +183,19 @@ pub struct ModuleInfo {
     /// Number of imported memories in the module.
     pub num_imported_memories: usize,
 
+    /// Number of imported tags in the module.
+    pub num_imported_tags: usize,
+
     /// Number of imported globals in the module.
     pub num_imported_globals: usize,
 }
 
 /// Mirror version of ModuleInfo that can derive rkyv traits
-#[derive(RkyvSerialize, RkyvDeserialize, Archive)]
-#[archive_attr(derive(CheckBytes))]
+#[derive(Debug, RkyvSerialize, RkyvDeserialize, Archive)]
+#[rkyv(derive(Debug))]
 pub struct ArchivableModuleInfo {
     name: Option<String>,
+    hash: Option<ModuleHash>,
     imports: IndexMap<ImportKey, ImportIndex>,
     exports: IndexMap<String, ExportIndex>,
     start_function: Option<FunctionIndex>,
@@ -195,10 +209,12 @@ pub struct ArchivableModuleInfo {
     tables: PrimaryMap<TableIndex, TableType>,
     memories: PrimaryMap<MemoryIndex, MemoryType>,
     globals: PrimaryMap<GlobalIndex, GlobalType>,
+    tags: PrimaryMap<TagIndex, SignatureIndex>,
     custom_sections: IndexMap<String, CustomSectionIndex>,
     custom_sections_data: PrimaryMap<CustomSectionIndex, Box<[u8]>>,
     num_imported_functions: usize,
     num_imported_tables: usize,
+    num_imported_tags: usize,
     num_imported_memories: usize,
     num_imported_globals: usize,
 }
@@ -207,6 +223,7 @@ impl From<ModuleInfo> for ArchivableModuleInfo {
     fn from(it: ModuleInfo) -> Self {
         Self {
             name: it.name,
+            hash: it.hash,
             imports: it.imports,
             exports: it.exports,
             start_function: it.start_function,
@@ -220,10 +237,12 @@ impl From<ModuleInfo> for ArchivableModuleInfo {
             tables: it.tables,
             memories: it.memories,
             globals: it.globals,
+            tags: it.tags,
             custom_sections: it.custom_sections,
             custom_sections_data: it.custom_sections_data,
             num_imported_functions: it.num_imported_functions,
             num_imported_tables: it.num_imported_tables,
+            num_imported_tags: it.num_imported_tags,
             num_imported_memories: it.num_imported_memories,
             num_imported_globals: it.num_imported_globals,
         }
@@ -235,6 +254,7 @@ impl From<ArchivableModuleInfo> for ModuleInfo {
         Self {
             id: Default::default(),
             name: it.name,
+            hash: it.hash,
             imports: it.imports,
             exports: it.exports,
             start_function: it.start_function,
@@ -248,10 +268,12 @@ impl From<ArchivableModuleInfo> for ModuleInfo {
             tables: it.tables,
             memories: it.memories,
             globals: it.globals,
+            tags: it.tags,
             custom_sections: it.custom_sections,
             custom_sections_data: it.custom_sections_data,
             num_imported_functions: it.num_imported_functions,
             num_imported_tables: it.num_imported_tables,
+            num_imported_tags: it.num_imported_tags,
             num_imported_memories: it.num_imported_memories,
             num_imported_globals: it.num_imported_globals,
         }
@@ -268,26 +290,28 @@ impl Archive for ModuleInfo {
     type Archived = <ArchivableModuleInfo as Archive>::Archived;
     type Resolver = <ArchivableModuleInfo as Archive>::Resolver;
 
-    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
-        ArchivableModuleInfo::from(self).resolve(pos, resolver, out)
+    fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+        ArchivableModuleInfo::from(self).resolve(resolver, out)
     }
 }
 
-impl<S: Serializer + SharedSerializeRegistry + ScratchSpace + ?Sized> RkyvSerialize<S>
+impl<S: rkyv::ser::Allocator + rkyv::ser::Writer + Fallible + ?Sized> RkyvSerialize<S>
     for ModuleInfo
+where
+    <S as Fallible>::Error: rkyv::rancor::Source + rkyv::rancor::Trace,
 {
     fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
         ArchivableModuleInfo::from(self).serialize(serializer)
     }
 }
 
-impl<D: Fallible + ?Sized + SharedDeserializeRegistry> RkyvDeserialize<ModuleInfo, D>
-    for Archived<ModuleInfo>
+impl<D: Fallible + ?Sized> RkyvDeserialize<ModuleInfo, D> for ArchivedArchivableModuleInfo
+where
+    D::Error: Source + Trace,
 {
     fn deserialize(&self, deserializer: &mut D) -> Result<ModuleInfo, D::Error> {
-        let r: ArchivableModuleInfo =
-            RkyvDeserialize::<ArchivableModuleInfo, D>::deserialize(self, deserializer)?;
-        Ok(ModuleInfo::from(r))
+        let archived = RkyvDeserialize::<ArchivableModuleInfo, D>::deserialize(self, deserializer)?;
+        Ok(ModuleInfo::from(archived))
     }
 }
 
@@ -308,10 +332,12 @@ impl PartialEq for ModuleInfo {
             && self.tables == other.tables
             && self.memories == other.memories
             && self.globals == other.globals
+            && self.tags == other.tags
             && self.custom_sections == other.custom_sections
             && self.custom_sections_data == other.custom_sections_data
             && self.num_imported_functions == other.num_imported_functions
             && self.num_imported_tables == other.num_imported_tables
+            && self.num_imported_tags == other.num_imported_tags
             && self.num_imported_memories == other.num_imported_memories
             && self.num_imported_globals == other.num_imported_globals
     }
@@ -323,6 +349,16 @@ impl ModuleInfo {
     /// Allocates the module data structures.
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Returns the module hash if available
+    pub fn hash(&self) -> Option<ModuleHash> {
+        self.hash
+    }
+
+    /// Returns the module hash as String if available
+    pub fn hash_string(&self) -> Option<String> {
+        self.hash.map(|m| m.to_string())
     }
 
     /// Get the given passive element, if it exists.
@@ -346,7 +382,7 @@ impl ModuleInfo {
     }
 
     /// Get the export types of the module
-    pub fn exports(&'_ self) -> ExportsIterator<impl Iterator<Item = ExportType> + '_> {
+    pub fn exports(&'_ self) -> ExportsIterator<Box<dyn Iterator<Item = ExportType> + '_>> {
         let iter = self.exports.iter().map(move |(name, export_index)| {
             let extern_type = match export_index {
                 ExportIndex::Function(i) => {
@@ -366,14 +402,23 @@ impl ModuleInfo {
                     let global_type = self.globals.get(*i).unwrap();
                     ExternType::Global(*global_type)
                 }
+                ExportIndex::Tag(i) => {
+                    let signature = self.tags.get(*i).unwrap();
+                    let tag_type = self.signatures.get(*signature).unwrap();
+
+                    ExternType::Tag(TagType {
+                        kind: crate::types::TagKind::Exception,
+                        params: tag_type.params().into(),
+                    })
+                }
             };
             ExportType::new(name, extern_type)
         });
-        ExportsIterator::new(iter, self.exports.len())
+        ExportsIterator::new(Box::new(iter), self.exports.len())
     }
 
     /// Get the import types of the module
-    pub fn imports(&'_ self) -> ImportsIterator<impl Iterator<Item = ImportType> + '_> {
+    pub fn imports(&'_ self) -> ImportsIterator<Box<dyn Iterator<Item = ImportType> + '_>> {
         let iter =
             self.imports
                 .iter()
@@ -396,22 +441,35 @@ impl ModuleInfo {
                             let global_type = self.globals.get(*i).unwrap();
                             ExternType::Global(*global_type)
                         }
+                        ImportIndex::Tag(i) => {
+                            let tag_type = self.tags.get(*i).unwrap();
+                            let func_type = self.signatures.get(*tag_type).unwrap();
+                            ExternType::Tag(TagType::from_fn_type(
+                                crate::TagKind::Exception,
+                                func_type.clone(),
+                            ))
+                        }
                     };
                     ImportType::new(module, field, extern_type)
                 });
-        ImportsIterator::new(iter, self.imports.len())
+        ImportsIterator::new(Box::new(iter), self.imports.len())
     }
 
     /// Get the custom sections of the module given a `name`.
-    pub fn custom_sections<'a>(&'a self, name: &'a str) -> impl Iterator<Item = Box<[u8]>> + 'a {
-        self.custom_sections
-            .iter()
-            .filter_map(move |(section_name, section_index)| {
-                if name != section_name {
-                    return None;
-                }
-                Some(self.custom_sections_data[*section_index].clone())
-            })
+    pub fn custom_sections<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Box<impl Iterator<Item = Box<[u8]>> + 'a> {
+        Box::new(
+            self.custom_sections
+                .iter()
+                .filter_map(move |(section_name, section_index)| {
+                    if name != section_name {
+                        return None;
+                    }
+                    Some(self.custom_sections_data[*section_index].clone())
+                }),
+        )
     }
 
     /// Convert a `LocalFunctionIndex` into a `FunctionIndex`.
@@ -489,6 +547,29 @@ impl ModuleInfo {
         index.index() < self.num_imported_globals
     }
 
+    /// Get the type of a global by its index.
+    pub fn global_type(&self, global_index: GlobalIndex) -> Option<GlobalType> {
+        self.globals.get(global_index).copied()
+    }
+
+    /// Convert a `LocalTagIndex` into a `TagIndex`.
+    pub fn tag_index(&self, local_tag: LocalTagIndex) -> TagIndex {
+        TagIndex::new(self.num_imported_tags + local_tag.index())
+    }
+
+    /// Convert a `TagIndex` into a `LocalTagIndex`. Returns None if the
+    /// index is an imported tag.
+    pub fn local_tag_index(&self, tag: TagIndex) -> Option<LocalTagIndex> {
+        tag.index()
+            .checked_sub(self.num_imported_tags)
+            .map(LocalTagIndex::new)
+    }
+
+    /// Test whether the given tag index is for an imported tag.
+    pub fn is_imported_tag(&self, index: TagIndex) -> bool {
+        index.index() < self.num_imported_tags
+    }
+
     /// Get the Module name
     pub fn name(&self) -> String {
         match self.name {
@@ -503,6 +584,14 @@ impl ModuleInfo {
             .values()
             .take(self.num_imported_functions)
             .map(move |sig_index| self.signatures[*sig_index].clone())
+    }
+
+    /// Get the name of a function by its index.
+    pub fn get_function_name(&self, func_index: FunctionIndex) -> String {
+        self.function_names
+            .get(&func_index)
+            .cloned()
+            .unwrap_or_else(|| format!("function_{}", func_index.as_u32()))
     }
 }
 
@@ -562,6 +651,13 @@ impl<I: Iterator<Item = ExportType> + Sized> ExportsIterator<I> {
     pub fn globals(self) -> impl Iterator<Item = ExportType<GlobalType>> + Sized {
         self.iter.filter_map(|extern_| match extern_.ty() {
             ExternType::Global(ty) => Some(ExportType::new(extern_.name(), *ty)),
+            _ => None,
+        })
+    }
+    /// Get only the tags
+    pub fn tags(self) -> impl Iterator<Item = ExportType<TagType>> + Sized {
+        self.iter.filter_map(|extern_| match extern_.ty() {
+            ExternType::Tag(ty) => Some(ExportType::new(extern_.name(), ty.clone())),
             _ => None,
         })
     }
@@ -625,6 +721,17 @@ impl<I: Iterator<Item = ImportType> + Sized> ImportsIterator<I> {
     pub fn globals(self) -> impl Iterator<Item = ImportType<GlobalType>> + Sized {
         self.iter.filter_map(|extern_| match extern_.ty() {
             ExternType::Global(ty) => Some(ImportType::new(extern_.module(), extern_.name(), *ty)),
+            _ => None,
+        })
+    }
+    /// Get only the tags
+    pub fn tags(self) -> impl Iterator<Item = ImportType<TagType>> + Sized {
+        self.iter.filter_map(|extern_| match extern_.ty() {
+            ExternType::Tag(ty) => Some(ImportType::new(
+                extern_.module(),
+                extern_.name(),
+                ty.clone(),
+            )),
             _ => None,
         })
     }

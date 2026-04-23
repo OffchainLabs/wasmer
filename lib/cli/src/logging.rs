@@ -1,8 +1,8 @@
 //! Logging functions for the debug feature.
 
-use is_terminal::IsTerminal;
+use std::io::IsTerminal as _;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 const WHITELISTED_LOG_TARGETS: &[&str] = &["wasmer", "wasmer_wasix", "virtual_fs"];
 
@@ -18,6 +18,9 @@ pub struct Output {
     /// The format to use when generating logs.
     #[clap(long, global = true, env, default_value = "text")]
     pub log_format: LogFormat,
+    /// Which span events to log.
+    #[clap(long, global = true, env, default_value = "close")]
+    pub log_events: LogEvents,
     /// When to display colored output.
     #[clap(long, default_value_t = clap::ColorChoice::Auto, global = true)]
     pub color: clap::ColorChoice,
@@ -29,28 +32,48 @@ impl Output {
         self.verbose > 0
     }
 
+    /// Returns true if either the `--quiet` flag is set or stderr is not a TTY.
+    pub fn is_quiet_or_no_tty(&self) -> bool {
+        self.quiet || !std::io::stderr().is_terminal()
+    }
+
     /// Initialize logging based on the `$RUST_LOG` environment variable and
     /// command-line flags.
     pub fn initialize_logging(&self) {
+        let filter_layer = self.log_filter();
+
         let fmt_layer = fmt::layer()
             .with_target(true)
-            .with_span_events(fmt::format::FmtSpan::CLOSE)
             .with_ansi(self.should_emit_colors())
             .with_thread_ids(true)
             .with_writer(std::io::stderr);
 
-        let filter_layer = self.log_filter();
+        let fmt_layer = match self.log_events {
+            LogEvents::New => fmt_layer.with_span_events(fmt::format::FmtSpan::NEW),
+            LogEvents::Close => fmt_layer.with_span_events(fmt::format::FmtSpan::CLOSE),
+            LogEvents::All => {
+                fmt_layer.with_span_events(fmt::format::FmtSpan::NEW | fmt::format::FmtSpan::CLOSE)
+            }
+        };
+
+        let registry = tracing_subscriber::registry();
+
+        #[cfg(feature = "tokio-subscriber")]
+        let registry = registry.with(console_subscriber::spawn());
 
         match self.log_format {
-            LogFormat::Text => tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt_layer.compact().with_target(true))
+            LogFormat::Text => registry
+                .with(
+                    fmt_layer
+                        .compact()
+                        .with_target(true)
+                        .with_filter(filter_layer),
+                )
                 .init(),
-            LogFormat::Json => tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt_layer.json().with_target(true))
+            LogFormat::Json => registry
+                .with(fmt_layer.json().with_target(true).with_filter(filter_layer))
                 .init(),
-        }
+        };
     }
 
     fn log_filter(&self) -> EnvFilter {
@@ -124,4 +147,16 @@ pub enum LogFormat {
     Text,
     /// Machine-readable logs.
     Json,
+}
+
+/// Which span events to log.
+#[derive(Debug, Default, Copy, Clone, PartialEq, clap::ValueEnum)]
+pub enum LogEvents {
+    // Only log at the start of a new span.
+    New,
+    // Only log at the end of a span.
+    #[default]
+    Close,
+    // Log at the start and end of a span.
+    All,
 }

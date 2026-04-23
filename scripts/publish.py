@@ -18,7 +18,6 @@ import itertools
 import os
 import re
 import subprocess
-import time
 import sys
 import typing
 from pprint import pprint
@@ -45,13 +44,13 @@ SETTINGS = {
     # extra features to put when publishing, for example wasmer-cli needs a
     # compiler by default otherwise it won't work standalone
     "publish_features": {
+        "wasmer-compiler": "compiler",
         "wasmer-cli": "default,cranelift",
-        "wasmer-wasix": "sys,wasmer/sys",
-        "wasmer-wasix-types": "wasmer/sys",
-        "wasmer-wast": "wasmer/sys",
+        "wasmer-wasix": "sys,wasmer/sys-default",
+        "wasmer-wasix-types": "wasmer/sys-default",
+        "wasmer-wast": "wasmer/sys-default",
         "wai-bindgen-wasmer": "sys",
-        "wasmer-cache": "wasmer/sys",
-        "wasmer-emscripten": "wasmer/sys"
+        "wasmer-cache": "wasmer/sys-default",
     },
     # workspace members we want to publish but whose path doesn't start by
     # "./lib/"
@@ -118,24 +117,49 @@ class Publisher:
             data = tomllib.load(file)
 
         if version is None:
-            version = data["package"]["version"]
+            version = data["workspace"]["package"]["version"]
         self.version: str = version
 
-        if self.verbose and not self.dry_run:
-            print(f"Publishing version {self.version}")
-        elif self.verbose and self.dry_run:
-            print(f"Publishing version {self.version} dry run!")
+        if self.verbose:
+            if self.dry_run:
+                print(f"Publishing version {self.version} dry run!")
+            else:
+                print(f"Publishing version {self.version}")
+
+            print("Dependencies:")
+            print(data["dependencies"])
+
+        def check_local_workspace_dep(t):
+            return (
+                t[0] in data["dependencies"]
+                and isinstance(data["dependencies"][t[0]], dict)
+                and "path" in data["dependencies"][t[0]]
+            ) or (
+                t[0] in data["workspace"]["dependencies"]
+                and isinstance(data["workspace"]["dependencies"][t[0]], dict)
+                and "path" in data["workspace"]["dependencies"][t[0]]
+            )
 
         # define helper function
-        check_local_dep_fn = lambda t: isinstance(t[1], dict) and "path" in t[1]
+        def check_local_dep_fn(t):
+            return isinstance(t[1], dict) and (
+                "path" in t[1]
+                or "workspace" in t[1]
+                and t[1]["workspace"] is True
+                and check_local_workspace_dep(t)
+            )
+
         members = set(
             map(
                 lambda p: p + "/Cargo.toml",
                 filter(
                     lambda path: (
-                        path.startswith("lib/") and os.path.exists(path + "/Cargo.toml")
-                    )
-                    or path in SETTINGS["non-lib-workspace-members"],
+                        (
+                            path.startswith("lib/")
+                            and os.path.exists(path + "/Cargo.toml")
+                        )
+                        or path in SETTINGS["non-lib-workspace-members"]
+                    ),
                     itertools.chain(
                         data["workspace"]["members"],
                         map(
@@ -160,11 +184,29 @@ class Publisher:
                         acc.update(
                             list(
                                 map(
-                                    lambda dep: dep[1]["package"]
-                                    if "package" in dep[1]
-                                    else dep[0],
+                                    lambda dep: (
+                                        dep[1]["package"]
+                                        if "package" in dep[1]
+                                        else dep[0]
+                                    ),
                                     filter(
                                         check_local_dep_fn, toml["dependencies"].items()
+                                    ),
+                                )
+                            )
+                        )
+                    if "dev-dependencies" in toml:
+                        acc.update(
+                            list(
+                                map(
+                                    lambda dep: (
+                                        dep[1]["package"]
+                                        if "package" in dep[1]
+                                        else dep[0]
+                                    ),
+                                    filter(
+                                        check_local_dep_fn,
+                                        toml["dev-dependencies"].items(),
                                     ),
                                 )
                             )
@@ -203,7 +245,18 @@ class Publisher:
         if found_string is None:
             return False
 
-        return self.version == found_string
+        if self.version == found_string:
+            return True
+
+        crate = self.crate_index[crate_name]
+        with open(crate.path + "/Cargo.toml", "rb") as file:
+            data = tomllib.load(file)
+        crate_version = data["package"]["version"]
+
+        if crate_version is None:
+            return False
+
+        return crate_version == found_string
 
     def publish_crate(self, crate_name: str):
         # pylint: disable=broad-except
@@ -252,8 +305,8 @@ class Publisher:
         status = {}
         failures = 0
 
-        for crate_name in self.publish_order:
-            print(f"Publishing `{crate_name}`...")
+        for i, crate_name in enumerate(self.publish_order):
+            print(f"Publishing `{crate_name}` ({i + 1}/{len(self.publish_order)}) ...")
             if not self.is_crate_already_published(crate_name):
                 status[crate_name] = self.publish_crate(crate_name)
                 if status[crate_name]:
@@ -262,15 +315,6 @@ class Publisher:
                 print(f"`{crate_name}` was already published!")
                 continue
 
-            # sleep for 16 seconds between crates to ensure the crates.io
-            # index has time to update
-            if not self.dry_run:
-                print(
-                    "Sleeping for 16 seconds to allow the `crates.io` index to update..."
-                )
-                time.sleep(16)
-            else:
-                print("In dry-run: not sleeping for crates.io to update.")
         if failures > 0 and self.verbose:
             print(f"encountered {failures} failures.")
             for key, value in status.items():

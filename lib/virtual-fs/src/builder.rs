@@ -62,9 +62,19 @@ impl RootFileSystemBuilder {
     }
 
     pub fn build(self) -> TmpFileSystem {
+        self.build_ext(&[])
+    }
+
+    pub fn build_ext(self, mapped_dirs: &[&str]) -> TmpFileSystem {
         let tmp = TmpFileSystem::new();
+
         if self.default_root_dirs {
-            for root_dir in &["/.app", "/.private", "/bin", "/dev", "/etc", "/tmp"] {
+            let default_dirs = ["/.app", "/.private", "/bin", "/dev", "/etc", "/tmp"]
+                .into_iter()
+                .filter(|d| !mapped_dirs.contains(d))
+                .collect::<Vec<_>>();
+
+            for root_dir in &default_dirs {
                 if let Err(err) = tmp.create_dir(Path::new(root_dir)) {
                     debug!("failed to create dir [{}] - {}", root_dir, err);
                 }
@@ -104,6 +114,8 @@ impl RootFileSystemBuilder {
                 PathBuf::from("/dev/tty"),
                 self.tty.unwrap_or_else(|| Box::<NullFile>::default()),
             );
+
+            let _ = tmp.create_dir(Path::new("/dev/shm"));
         }
         tmp
     }
@@ -112,6 +124,7 @@ impl RootFileSystemBuilder {
 #[cfg(test)]
 mod test_builder {
     use crate::{FileSystem, RootFileSystemBuilder};
+    use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -180,5 +193,8 @@ mod test_builder {
             .open("/dev/stderr")
             .unwrap();
         assert_eq!(dev_stderr.get_special_fd().unwrap(), 2);
+
+        let dev_shm_metadata = root_fs.metadata(Path::new("/dev/shm")).unwrap();
+        assert!(dev_shm_metadata.is_dir());
     }
 }

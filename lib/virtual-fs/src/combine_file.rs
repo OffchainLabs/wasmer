@@ -1,11 +1,8 @@
-use derivative::Derivative;
-
 use super::*;
 
 use crate::VirtualFile;
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct CombineFile {
     tx: Box<dyn VirtualFile + Send + Sync + 'static>,
     rx: Box<dyn VirtualFile + Send + Sync + 'static>,
@@ -31,6 +28,10 @@ impl VirtualFile for CombineFile {
 
     fn created_time(&self) -> u64 {
         self.tx.created_time()
+    }
+
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> crate::Result<()> {
+        self.tx.set_times(atime, mtime)
     }
 
     fn size(&self) -> u64 {

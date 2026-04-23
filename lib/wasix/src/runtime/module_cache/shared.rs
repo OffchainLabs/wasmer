@@ -1,7 +1,8 @@
 use dashmap::DashMap;
 use wasmer::{Engine, Module};
 
-use crate::runtime::module_cache::{CacheError, ModuleCache, ModuleHash};
+use crate::runtime::module_cache::{CacheError, ModuleCache};
+use wasmer_types::ModuleHash;
 
 /// A [`ModuleCache`] based on a <code>[DashMap]<[ModuleHash], [Module]></code>.
 #[derive(Debug, Default, Clone)]
@@ -19,7 +20,7 @@ impl SharedCache {
 impl ModuleCache for SharedCache {
     #[tracing::instrument(level = "debug", skip_all, fields(%key))]
     async fn load(&self, key: ModuleHash, engine: &Engine) -> Result<Module, CacheError> {
-        let key = (key, engine.deterministic_id().to_string());
+        let key = (key, engine.deterministic_id());
 
         match self.modules.get(&key) {
             Some(m) => {
@@ -29,6 +30,11 @@ impl ModuleCache for SharedCache {
 
             None => Err(CacheError::NotFound),
         }
+    }
+
+    async fn contains(&self, key: ModuleHash, engine: &Engine) -> Result<bool, CacheError> {
+        let key = (key, engine.deterministic_id().to_string());
+        Ok(self.modules.contains_key(&key))
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(%key))]
@@ -64,7 +70,7 @@ mod tests {
         let engine = Engine::default();
         let module = Module::new(&engine, ADD_WAT).unwrap();
         let cache = SharedCache::default();
-        let key = ModuleHash::from_bytes([0; 8]);
+        let key = ModuleHash::from_bytes([0; _]);
 
         cache.save(key, &engine, &module).await.unwrap();
         let round_tripped = cache.load(key, &engine).await.unwrap();

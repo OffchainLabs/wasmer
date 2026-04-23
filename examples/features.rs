@@ -10,7 +10,11 @@
 //!
 //! Ready?
 
-use wasmer::{imports, wat2wasm, EngineBuilder, Features, Instance, Module, Store, Value};
+use wasmer::{
+    Instance, Module, Store, Value, imports,
+    sys::{EngineBuilder, Features},
+    wat2wasm,
+};
 use wasmer_compiler_cranelift::Cranelift;
 
 fn main() -> anyhow::Result<()> {

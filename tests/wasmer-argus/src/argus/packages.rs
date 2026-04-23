@@ -2,12 +2,16 @@ use super::Argus;
 use crate::ArgusConfig;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::{header, Client};
+use reqwest::{Client, header};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::{fs::File, io::AsyncWriteExt, sync::mpsc::UnboundedSender};
+use tokio::{
+    fs::File,
+    io::AsyncWriteExt,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+};
 use tracing::*;
 use url::Url;
-use wasmer_api::{
+use wasmer_backend_api::{
     query::get_package_versions_stream,
     types::{AllPackageVersionsVars, PackageVersionSortBy, PackageVersionWithPackage},
 };
@@ -20,6 +24,8 @@ impl Argus {
         s: UnboundedSender<PackageVersionWithPackage>,
         p: ProgressBar,
         config: Arc<ArgusConfig>,
+        successes_rx: UnboundedReceiver<()>,
+        failures_rx: UnboundedReceiver<()>,
     ) -> anyhow::Result<()> {
         info!("starting to fetch packages..");
         let vars = AllPackageVersionsVars {
@@ -30,7 +36,7 @@ impl Argus {
         p.set_style(
             ProgressStyle::with_template("{spinner:.blue} {msg}")
                 .unwrap()
-                .tick_strings(&["✶", "✸", "✹", "✺", "✹", "✷"]),
+                .tick_strings(&["✶", "✸", "✹", "✺", "✹", "✷", "✶"]),
         );
         p.enable_steady_tick(Duration::from_millis(1000));
 
@@ -49,17 +55,22 @@ impl Argus {
                     anyhow::bail!("failed to fetch packages: {e}")
                 }
             };
-            p.set_message(format!("fetched {} packages", count));
+            p.set_message(format!(
+                "fetched {} packages [ok: {}, err: {}]",
+                count,
+                successes_rx.len(),
+                failures_rx.len()
+            ));
             count += pkgs.len();
 
             for pkg in pkgs {
-                if self.to_test(&pkg).await {
-                    if let Err(e) = s.send(pkg) {
-                        error!("failed to send packages: {e}");
-                        p.finish_and_clear();
-                        anyhow::bail!("failed to send packages: {e}")
-                    };
-                }
+                if self.to_test(&pkg).await
+                    && let Err(e) = s.send(pkg)
+                {
+                    error!("failed to send packages: {e}");
+                    p.finish_and_clear();
+                    anyhow::bail!("failed to send packages: {e}")
+                };
             }
         }
 
@@ -70,7 +81,19 @@ impl Argus {
     }
 
     #[tracing::instrument(skip(p))]
-    pub(crate) async fn download_package<'a>(
+    pub(crate) async fn download_webcs<'a>(
+        test_id: u64,
+        path: &'a PathBuf,
+        webc_v2_url: &'a Url,
+        webc_v3_url: &'a Url,
+        p: &'a ProgressBar,
+    ) -> anyhow::Result<()> {
+        Argus::download_package(test_id, &path.join("package_v2.webc"), webc_v2_url, p).await?;
+        Argus::download_package(test_id, &path.join("package_v3.webc"), webc_v3_url, p).await?;
+        Ok(())
+    }
+
+    async fn download_package<'a>(
         test_id: u64,
         path: &'a PathBuf,
         url: &'a Url,
@@ -78,12 +101,15 @@ impl Argus {
     ) -> anyhow::Result<()> {
         info!("downloading package from {} to file {:?}", url, path);
         static APP_USER_AGENT: &str =
-            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-        if !path.exists() {
-            tokio::fs::create_dir_all(path).await?;
-        } else if path.exists() && !path.is_dir() {
-            anyhow::bail!("path {:?} exists, but it is not a directory!", path)
+        let mut dir_path = path.clone();
+        dir_path.pop();
+
+        if !dir_path.exists() {
+            tokio::fs::create_dir_all(dir_path).await?;
+        } else if dir_path.exists() && !dir_path.is_dir() {
+            anyhow::bail!("path {path:?} exists, but it is not a directory!")
         }
 
         let client = Client::builder().user_agent(APP_USER_AGENT).build()?;
@@ -97,11 +123,8 @@ impl Argus {
                     .and_then(|ct_len| ct_len.parse().ok())
                     .unwrap_or(0) // Fallback to 0
             } else {
-                anyhow::bail!(
-                    "Couldn't fetch head from URL {}. Error: {:?}",
-                    url,
-                    resp.status()
-                )
+                let status = resp.status();
+                anyhow::bail!("Couldn't fetch head from URL {url}. Error: {status:?}")
             }
         };
 
@@ -120,20 +143,18 @@ impl Argus {
 
         p.set_message(format!("downloading from {url}"));
 
-        let mut outfile = match File::create(&path.join("package.webc")).await {
+        let mut outfile = match File::create(&path).await {
             Ok(o) => o,
             Err(e) => {
                 error!(
                     "[{test_id}] failed to create file at {:?}. Error: {e}",
-                    path.join("package.webc")
+                    path.display()
                 );
 
                 p.finish_and_clear();
 
-                anyhow::bail!(
-                    "[{test_id}] failed to create file at {:?}. Error: {e}",
-                    path.join("package.webc")
-                );
+                let path_display = path.display();
+                anyhow::bail!("[{test_id}] failed to create file at {path_display}. Error: {e}");
             }
         };
         let mut download = match request.send().await {
@@ -154,8 +175,7 @@ impl Argus {
                     );
                     p.finish_and_clear();
                     anyhow::bail!(
-                        "[{test_id}] failed to download chunk from {:?}. Error: {e}",
-                        download
+                        "[{test_id}] failed to download chunk from {download:?}. Error: {e}"
                     );
                 }
                 Ok(chunk) => {
@@ -168,8 +188,7 @@ impl Argus {
                             );
                             p.finish_and_clear();
                             anyhow::bail!(
-                                "[{test_id}] failed to write chunk to file {:?}. Error: {e}",
-                                outfile
+                                "[{test_id}] failed to write chunk to file {outfile:?}. Error: {e}"
                             );
                         };
                     } else {
@@ -188,7 +207,7 @@ impl Argus {
     /// Return the complete path to the folder of the test for the package, from the outdir to the
     /// hash
     pub async fn get_path(config: Arc<ArgusConfig>, pkg: &PackageVersionWithPackage) -> PathBuf {
-        let hash = match &pkg.distribution.pirita_sha256_hash {
+        let hash = match &pkg.distribution_v2.pirita_sha256_hash {
             Some(hash) => hash,
             None => {
                 unreachable!("no package without an hash should reach this function!")

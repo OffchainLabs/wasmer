@@ -4,21 +4,20 @@ use std::task::Poll;
 
 use futures::{Future, FutureExt};
 use http::{Request, Response, Uri};
-use hyper::Body;
+use http_body_util::BodyExt;
 use tower::Service;
 
-use crate::runners::dproxy::shard::Shard;
+use super::super::Body;
 use crate::Runtime;
+use crate::runners::dproxy::shard::Shard;
 
-use super::factory::DProxyInstanceFactory;
 use super::Config;
+use super::factory::DProxyInstanceFactory;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct SharedState {
     pub(crate) config: Config,
     pub(crate) command_name: String,
-    #[derivative(Debug = "ignore")]
     pub(crate) runtime: Arc<dyn Runtime + Send + Sync>,
     pub(crate) factory: DProxyInstanceFactory,
 }
@@ -45,7 +44,7 @@ impl Handler {
     #[tracing::instrument(level = "debug", skip_all, err)]
     pub(crate) async fn handle<T>(
         &self,
-        mut req: Request<Body>,
+        mut req: Request<hyper::body::Incoming>,
         _token: T,
     ) -> anyhow::Result<Response<Body>>
     where
@@ -91,7 +90,15 @@ impl Handler {
         let client = instance.client.clone();
 
         // Perform the request
-        Ok(client.request(req).await?)
+        let resp = client.request(req).await?;
+        let (parts, body) = resp.into_parts();
+        let body = body
+            .collect()
+            .await?
+            .map_err(|_| anyhow::anyhow!("Infallible"))
+            .boxed();
+
+        Ok(Response::from_parts(parts, body))
     }
 }
 
@@ -103,7 +110,7 @@ impl std::ops::Deref for Handler {
     }
 }
 
-impl Service<Request<Body>> for Handler {
+impl Service<Request<hyper::body::Incoming>> for Handler {
     type Response = Response<Body>;
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = anyhow::Result<Response<Body>>> + Send>>;
@@ -112,7 +119,7 @@ impl Service<Request<Body>> for Handler {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
+    fn call(&mut self, request: Request<hyper::body::Incoming>) -> Self::Future {
         // Note: all fields are reference-counted so cloning is pretty cheap
         let handler = self.clone();
         let fut = async move { handler.handle(request, ()).await };

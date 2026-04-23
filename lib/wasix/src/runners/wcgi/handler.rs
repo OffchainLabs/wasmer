@@ -1,29 +1,34 @@
-use std::{collections::HashMap, ops::Deref, pin::Pin, sync::Arc, task::Poll};
+use std::{collections::HashMap, ops::Deref, pin::Pin, sync::Arc};
 
 use anyhow::Error;
-use futures::{Future, FutureExt, StreamExt};
+use bytes::Bytes;
+use futures::{Future, FutureExt};
 use http::{Request, Response, StatusCode};
-use hyper::{service::Service, Body};
+use http_body_util::BodyExt;
+use hyper::body::Frame;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::Instrument;
-use virtual_mio::InlineWaker;
+use virtual_mio::block_on;
 use wasmer::Module;
 use wasmer_wasix_types::wasi::ExitCode;
 use wcgi_host::CgiDialect;
 
+use super::super::Body;
+
 use crate::{
+    Runtime, VirtualTaskManager, WasiEnvBuilder,
     bin_factory::run_exec,
     os::task::OwnedTaskStatus,
-    runners::wcgi::{
-        callbacks::{CreateEnvConfig, RecycleEnvConfig},
-        Callbacks,
+    runners::{
+        body_from_data, body_from_stream,
+        wcgi::{
+            Callbacks,
+            callbacks::{CreateEnvConfig, RecycleEnvConfig},
+        },
     },
-    runtime::{
-        module_cache::ModuleHash,
-        task_manager::{TaskWasm, TaskWasmRecycleProperties},
-    },
-    Runtime, VirtualTaskManager, WasiEnvBuilder,
+    runtime::task_manager::{TaskWasm, TaskWasmRecycleProperties},
 };
+use wasmer_types::ModuleHash;
 
 /// The shared object that manages the instantiaion of WASI executables and
 /// communicating with them via the CGI protocol.
@@ -38,7 +43,7 @@ impl Handler {
     #[tracing::instrument(level = "debug", skip_all, err)]
     pub(crate) async fn handle<T>(
         &self,
-        req: Request<Body>,
+        req: Request<hyper::body::Incoming>,
         token: T,
     ) -> Result<Response<Body>, Error>
     where
@@ -86,7 +91,7 @@ impl Handler {
         let recycle = {
             let callbacks = callbacks.clone();
             move |props: TaskWasmRecycleProperties| {
-                InlineWaker::block_on(callbacks.recycle_env(RecycleEnvConfig {
+                block_on(callbacks.recycle_env(RecycleEnvConfig {
                     env: props.env,
                     store: props.store,
                     memory: props.memory,
@@ -121,7 +126,7 @@ impl Handler {
         // threading, etc...
         task_manager
             .task_wasm(
-                TaskWasm::new(Box::new(run_exec), env, module, false)
+                TaskWasm::new(Box::new(run_exec), env, module, false, false)
                     //.with_optional_memory(spawn_type)
                     .with_recycle(Box::new(recycle)),
             )
@@ -153,12 +158,12 @@ impl Handler {
         // will cause the stderr pipe to be read to the end
         // before transmitting the body
         if propagate_stderr {
-            if let Some(stderr) = work_consume_stderr.await {
-                if !stderr.is_empty() {
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(stderr))?);
-                }
+            if let Some(stderr) = work_consume_stderr.await
+                && !stderr.is_empty()
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(body_from_data(stderr))?);
             }
         } else {
             task_manager
@@ -177,7 +182,7 @@ impl Handler {
                 tracing::error!(error = e, "Unable to drive the request to completion");
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(e.as_bytes().to_vec()))?);
+                    .body(body_from_data(Bytes::from(e)))?);
             }
         }
 
@@ -200,16 +205,16 @@ impl Handler {
 
         let chunks = futures::stream::try_unfold(res_body_receiver, |mut r| async move {
             match r.fill_buf().await {
-                Ok(chunk) if chunk.is_empty() => Ok(None),
+                Ok([]) => Ok(None),
                 Ok(chunk) => {
-                    let chunk = chunk.to_vec();
+                    let chunk: bytes::Bytes = chunk.to_vec().into();
                     r.consume(chunk.len());
-                    Ok(Some((chunk, r)))
+                    Ok(Some((Frame::data(chunk), r)))
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(anyhow::Error::from(e)),
             }
         });
-        let body = hyper::Body::wrap_stream(chunks);
+        let body = body_from_stream(chunks);
 
         tracing::trace!(
             dialect=%self.dialect,
@@ -233,7 +238,7 @@ impl Deref for Handler {
 /// instance and waiting for it to exit.
 async fn drive_request_to_completion(
     finished: Arc<OwnedTaskStatus>,
-    mut request_body: hyper::Body,
+    mut request_body: hyper::body::Incoming,
     mut instance_stdin: impl AsyncWrite + Send + Sync + Unpin + 'static,
 ) -> Result<ExitCode, Error> {
     let request_body_send = async move {
@@ -241,12 +246,16 @@ async fn drive_request_to_completion(
         // dies before we finish writing the body, the instance's side of the
         // pipe will be automatically closed and we'll error out.
         let mut request_size = 0;
-        while let Some(res) = request_body.next().await {
+        while let Some(res) = request_body.frame().await {
             // FIXME(theduke): figure out how to propagate a body error to the
             // CGI instance.
             let chunk = res?;
-            request_size += chunk.len();
-            instance_stdin.write_all(chunk.as_ref()).await?;
+            if let Some(data) = chunk.data_ref() {
+                request_size += data.len();
+                instance_stdin.write_all(data.as_ref()).await?;
+            } else {
+                // Trailers are not supported...
+            }
         }
 
         instance_stdin.shutdown().await?;
@@ -283,7 +292,7 @@ async fn consume_stderr(
     // able to show users the partial result.
     loop {
         match stderr.fill_buf().await {
-            Ok(chunk) if chunk.is_empty() => {
+            Ok([]) => {
                 // EOF - the instance's side of the pipe was closed.
                 break;
             }
@@ -309,33 +318,32 @@ async fn consume_stderr(
 
 pub type SetupBuilder = Arc<dyn Fn(&mut WasiEnvBuilder) -> Result<(), anyhow::Error> + Send + Sync>;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(derive_more::Debug)]
 pub(crate) struct SharedState {
     pub(crate) module: Module,
     pub(crate) module_hash: ModuleHash,
     pub(crate) dialect: CgiDialect,
     pub(crate) program_name: String,
     pub(crate) propagate_stderr: bool,
-    #[derivative(Debug = "ignore")]
+    #[debug(ignore)]
     pub(crate) setup_builder: SetupBuilder,
-    #[derivative(Debug = "ignore")]
     pub(crate) callbacks: Arc<dyn Callbacks>,
-    #[derivative(Debug = "ignore")]
     pub(crate) runtime: Arc<dyn Runtime + Send + Sync>,
 }
 
-impl Service<Request<Body>> for Handler {
+impl tower::Service<Request<hyper::body::Incoming>> for Handler {
     type Response = Response<Body>;
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
 
-    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // TODO: We probably should implement some sort of backpressure here...
-        Poll::Ready(Ok(()))
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
+    fn call(&mut self, request: Request<hyper::body::Incoming>) -> Self::Future {
         // Note: all fields are reference-counted so cloning is pretty cheap
         let handler = self.clone();
         let fut = async move { handler.handle(request, ()).await };

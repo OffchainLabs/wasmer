@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use wasmer::*;
 
@@ -42,7 +44,7 @@ pub fn run_basic_static_function(store: &mut Store, compiler_name: &str, c: &mut
     let dyn_f: &Function = instance.exports.get("add").unwrap();
     let f: TypedFunction<(i32, i32), i32> = dyn_f.typed(store).unwrap();
 
-    c.bench_function(&format!("basic static func {}", compiler_name), |b| {
+    c.bench_function(&format!("basic static func {compiler_name}"), |b| {
         b.iter(|| {
             let result = black_box(f.call(store, 4, 6).unwrap());
             assert_eq!(result, 10);
@@ -50,33 +52,31 @@ pub fn run_basic_static_function(store: &mut Store, compiler_name: &str, c: &mut
     });
 
     let dyn_f_many: &Function = instance.exports.get("add20").unwrap();
-    let f_many: TypedFunction<
-        (
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-        ),
+    type TupleWithMany = (
         i32,
-    > = dyn_f_many.typed(store).unwrap();
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+    );
+    let f_many: TypedFunction<TupleWithMany, i32> = dyn_f_many.typed(store).unwrap();
     c.bench_function(
-        &format!("basic static func with many args {}", compiler_name),
+        &format!("basic static func with many args {compiler_name}"),
         |b| {
             b.iter(|| {
                 let result = black_box(
@@ -103,7 +103,7 @@ pub fn run_basic_dynamic_function(store: &mut Store, compiler_name: &str, c: &mu
     let instance = Instance::new(store, &module, &import_object).unwrap();
 
     let dyn_f: &Function = instance.exports.get("add").unwrap();
-    c.bench_function(&format!("basic dynfunc {}", compiler_name), |b| {
+    c.bench_function(&format!("basic dynfunc {compiler_name}"), |b| {
         b.iter(|| {
             let dyn_result = black_box(dyn_f.call(store, &[Value::I32(4), Value::I32(6)]).unwrap());
             assert_eq!(dyn_result[0], Value::I32(10));
@@ -112,7 +112,7 @@ pub fn run_basic_dynamic_function(store: &mut Store, compiler_name: &str, c: &mu
 
     let dyn_f_many: &Function = instance.exports.get("add20").unwrap();
     c.bench_function(
-        &format!("basic dynfunc with many args {}", compiler_name),
+        &format!("basic dynfunc with many args {compiler_name}"),
         |b| {
             b.iter(|| {
                 let dyn_result = black_box(

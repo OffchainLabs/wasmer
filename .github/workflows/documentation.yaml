@@ -3,34 +3,35 @@ name: Documentation
 on:
   push:
     branches:
-      - 'master'
+      - "main"
     paths:
-      - 'lib/**'
-
-env:
-  MSRV: "1.73"
+      - "lib/**"
 
 jobs:
   documentation:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: ./.github/actions/load_toolchain
+        id: load_toolchain
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.MSRV }}
+          toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
       - name: Install LLVM
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf ${{ env.LLVM_URL }} -L -o llvm.tar.xz
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf ${{ env.LLVM_URL }} -L -o llvm.tar.xz
           mkdir ${{ env.LLVM_DIR }}
           tar xf llvm.tar.xz --strip-components=1 -C ${{ env.LLVM_DIR }}
           echo "${{ env.LLVM_DIR }}/bin" >> $GITHUB_PATH
-          echo "LLVM_SYS_120_PREFIX=${{ env.LLVM_DIR }}" >> $GITHUB_ENV
+          echo "LLVM_SYS_211_PREFIX=${{ env.LLVM_DIR }}" >> $GITHUB_ENV
         env:
-          LLVM_DIR: ${{ github.workspace }}/llvm-13
-          LLVM_URL: 'https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.0/clang+llvm-13.0.0-x86_64-linux-gnu-ubuntu-16.04.tar.xz'
+          LLVM_DIR: ${{ github.workspace }}/llvm-21
+          LLVM_URL: "https://github.com/wasmerio/llvm-custom-builds/releases/download/21.x/llvm-linux-amd64.tar.xz"
       - name: Build & package documentation
         run: make package-docs
       - name: Publish documentation

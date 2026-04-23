@@ -1,12 +1,15 @@
 use std::sync::Mutex;
 use std::{num::NonZeroUsize, pin::Pin, sync::Arc, time::Duration};
 
-use futures::{future::BoxFuture, Future};
+use futures::{Future, future::BoxFuture};
 use tokio::runtime::{Handle, Runtime};
+use virtual_mio::block_on;
+use wasmer::AsStoreMut;
 
-use crate::{os::task::thread::WasiThreadError, WasiFunctionEnv};
+use crate::runtime::SpawnType;
+use crate::{WasiFunctionEnv, os::task::thread::WasiThreadError};
 
-use super::{TaskWasm, TaskWasmRunProperties, VirtualTaskManager};
+use super::{SpawnMemoryTypeOrStore, TaskWasm, TaskWasmRunProperties, VirtualTaskManager};
 
 #[derive(Debug, Clone)]
 pub enum RuntimeOrHandle {
@@ -26,10 +29,10 @@ impl From<Runtime> for RuntimeOrHandle {
 
 impl Drop for RuntimeOrHandle {
     fn drop(&mut self) {
-        if let Self::Runtime(_, runtime) = self {
-            if let Some(h) = runtime.lock().unwrap().take() {
-                h.shutdown_timeout(Duration::from_secs(0))
-            }
+        if let Self::Runtime(_, runtime) = self
+            && let Some(h) = runtime.lock().unwrap().take()
+        {
+            h.shutdown_timeout(Duration::from_secs(0))
         }
     }
 }
@@ -110,14 +113,6 @@ impl Default for TokioTaskManager {
     }
 }
 
-struct TokioRuntimeGuard<'g> {
-    #[allow(unused)]
-    inner: tokio::runtime::EnterGuard<'g>,
-}
-impl<'g> Drop for TokioRuntimeGuard<'g> {
-    fn drop(&mut self) {}
-}
-
 impl VirtualTaskManager for TokioTaskManager {
     /// See [`VirtualTaskManager::sleep_now`].
     fn sleep_now(&self, time: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
@@ -145,21 +140,84 @@ impl VirtualTaskManager for TokioTaskManager {
 
     /// See [`VirtualTaskManager::task_wasm`].
     fn task_wasm(&self, task: TaskWasm) -> Result<(), WasiThreadError> {
-        // Create the context on a new store
         let run = task.run;
         let recycle = task.recycle;
-        let (ctx, mut store) = WasiFunctionEnv::new_with_store(
-            task.module,
-            task.env,
-            task.globals,
-            task.spawn_type,
-            task.update_layout,
-        )?;
+        let env = task.env;
+        let pre_run = task.pre_run;
 
-        // If we have a trigger then we first need to run
-        // the poller to completion
+        let make_memory: SpawnMemoryTypeOrStore = match &task.spawn_type {
+            SpawnType::CreateMemory | SpawnType::NewLinkerInstanceGroup(..) => {
+                SpawnMemoryTypeOrStore::New
+            }
+            SpawnType::CreateMemoryOfType(t) => SpawnMemoryTypeOrStore::Type(*t),
+            SpawnType::ShareMemory(_, _) | SpawnType::CopyMemory(_, _) => {
+                let mut store = env.runtime().new_store();
+                let memory = self.build_memory(&mut store.as_store_mut(), &task.spawn_type)?;
+                SpawnMemoryTypeOrStore::StoreAndMemory(store, memory)
+            }
+        };
+
+        // This should actually run in the blocking thread, just like the task itself.
+        // See the comment below for why we can't do it there yet.
+        //
+        // For now block_in_place at least ensures that we don't block the async runtime
+        let ret = tokio::task::block_in_place(move || {
+            if let SpawnType::NewLinkerInstanceGroup(linker, func_env, mut store) = task.spawn_type
+            {
+                WasiFunctionEnv::new_with_store(
+                    task.module,
+                    env,
+                    task.globals,
+                    make_memory,
+                    task.update_layout,
+                    task.call_initialize,
+                    Some((linker, &mut func_env.into_mut(&mut store))),
+                )
+            } else {
+                WasiFunctionEnv::new_with_store(
+                    task.module,
+                    env,
+                    task.globals,
+                    make_memory,
+                    task.update_layout,
+                    task.call_initialize,
+                    None,
+                )
+            }
+        });
+
         if let Some(trigger) = task.trigger {
             tracing::trace!("spawning task_wasm trigger in async pool");
+            // In principle, we'd need to create this in the `pool.execute` function below, that is
+            //
+            // ```
+            // 227: pool.execute(move || {
+            // ...:      let (ctx, mut store) = WasiFunctionEnv::new_with_store(
+            // ...:      ...
+            // ```
+            //
+            // However, in the loop spawned below we need to have a `FunctionEnvMut<WasiEnv>`, which
+            // must be created with a mutable reference to the store. We can't, however since
+            // ```
+            // pool.execute(move || {
+            //      let (ctx, mut store) = WasiFunctionEnv::new_with_store(
+            //      ...
+            //      tx.send(store.as_store_mut())
+            // ```
+            // or
+            // ```
+            // pool.execute(move || {
+            //      let (ctx, mut store) = WasiFunctionEnv::new_with_store(
+            //      ...
+            //      tx.send(ctx.env.clone().into_mut(&mut store.as_store_mut()))
+            // ```
+            // Since the reference would outlive the owned value.
+            //
+            // So, we create the store (and memory, and instance) outside the execution thread (the
+            // pool's one), and let it fail for runtimes that don't support entities created in a
+            // thread that's not the one in which execution happens in; this until we can clone
+            // stores.
+            let (mut ctx, mut store) = ret?;
 
             let mut trigger = trigger();
             let pool = self.pool.clone();
@@ -172,7 +230,14 @@ impl VirtualTaskManager for TokioTaskManager {
                         _ = env.thread.wait_for_signal() => {
                             tracing::debug!("wait-for-signal(triggered)");
                             let mut ctx = ctx.env.clone().into_mut(&mut store);
-                            if let Err(err) = crate::WasiEnv::process_signals_and_exit(&mut ctx) {
+                            if let Err(err) =
+                                crate::WasiEnv::do_pending_link_operations(
+                                    &mut ctx,
+                                    false
+                                ).and_then(|()|
+                                    crate::WasiEnv::process_signals_and_exit(&mut ctx)
+                                )
+                            {
                                 match err {
                                     crate::WasiError::Exit(code) => Err(code),
                                     err => {
@@ -193,6 +258,10 @@ impl VirtualTaskManager for TokioTaskManager {
                     };
                 };
 
+                if let Some(pre_run) = pre_run {
+                    pre_run(&mut ctx, &mut store).await;
+                }
+
                 // Build the task that will go on the callback
                 pool.execute(move || {
                     // Invoke the callback
@@ -207,9 +276,25 @@ impl VirtualTaskManager for TokioTaskManager {
         } else {
             tracing::trace!("spawning task_wasm in blocking thread");
 
+            let (sx, rx) = std::sync::mpsc::channel();
+
             // Run the callback on a dedicated thread
             self.pool.execute(move || {
                 tracing::trace!("task_wasm started in blocking thread");
+                let (mut ctx, mut store) = match ret {
+                    Ok(x) => {
+                        sx.send(Ok(())).unwrap();
+                        x
+                    }
+                    Err(c) => {
+                        sx.send(Err(c)).unwrap();
+                        return;
+                    }
+                };
+
+                if let Some(pre_run) = pre_run {
+                    block_on(pre_run(&mut ctx, &mut store));
+                }
 
                 // Invoke the callback
                 run(TaskWasmRunProperties {
@@ -219,6 +304,9 @@ impl VirtualTaskManager for TokioTaskManager {
                     recycle,
                 });
             });
+
+            rx.recv()
+                .map_err(|_| WasiThreadError::InvalidWasmContext)??;
         }
         Ok(())
     }

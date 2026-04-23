@@ -1,12 +1,13 @@
 use anyhow::Context;
 use colored::Colorize;
-use dialoguer::Select;
-use edge_schema::schema::StringWebcIdent;
-use wasmer_api::WasmerClient;
+use dialoguer::{Select, theme::ColorfulTheme};
+use wasmer_backend_api::WasmerClient;
+use wasmer_config::package::NamedPackageIdent;
 
 pub fn prompt_for_ident(message: &str, default: Option<&str>) -> Result<String, anyhow::Error> {
     loop {
-        let diag = dialoguer::Input::new()
+        let theme = ColorfulTheme::default();
+        let diag = dialoguer::Input::with_theme(&theme)
             .with_prompt(message)
             .with_initial_text(default.unwrap_or_default());
 
@@ -14,11 +15,36 @@ pub fn prompt_for_ident(message: &str, default: Option<&str>) -> Result<String, 
         //     diag.validate_with(val);
         // }
 
-        let raw: String = diag.interact()?;
+        let raw: String = diag.interact_text()?;
         let val = raw.trim();
         if !val.is_empty() {
             break Ok(val.to_string());
         }
+    }
+}
+
+/// Ask a user for an application name.
+///
+/// Will continue looping until the user provides a valid name that contains
+/// neither dots nor spaces. Returns an error if there are issues with
+/// the input interaction.
+pub fn prompt_for_app_ident(message: &str, default: Option<&str>) -> Result<String, anyhow::Error> {
+    loop {
+        let theme = ColorfulTheme::default();
+        let diag = dialoguer::Input::with_theme(&theme)
+            .with_prompt(message)
+            .with_initial_text(default.unwrap_or_default());
+
+        let raw: String = diag.interact_text()?;
+        let val = raw.trim();
+        if val.is_empty() {
+            continue;
+        }
+        if val.contains('.') || val.contains(' ') {
+            eprintln!("The name must not contain dots or spaces. Please try again.");
+            continue;
+        }
+        return Ok(val.to_string());
     }
 }
 
@@ -28,15 +54,16 @@ pub fn prompt_for_ident(message: &str, default: Option<&str>) -> Result<String, 
 pub fn prompt_for_package_ident(
     message: &str,
     default: Option<&str>,
-) -> Result<StringWebcIdent, anyhow::Error> {
+) -> Result<NamedPackageIdent, anyhow::Error> {
     loop {
-        let raw: String = dialoguer::Input::new()
+        let theme = ColorfulTheme::default();
+        let raw: String = dialoguer::Input::with_theme(&theme)
             .with_prompt(message)
             .with_initial_text(default.unwrap_or_default())
             .interact_text()
             .context("could not read user input")?;
 
-        match raw.parse::<StringWebcIdent>() {
+        match raw.parse::<NamedPackageIdent>() {
             Ok(p) => break Ok(p),
             Err(err) => {
                 eprintln!("invalid package name: {err}");
@@ -54,6 +81,30 @@ pub enum PackageCheckMode {
     MustNotExist,
 }
 
+/// Ask a user for a package version.
+///
+/// Will continue looping until the user provides a valid version.
+pub fn prompt_for_package_version(
+    message: &str,
+    default: Option<&str>,
+) -> Result<semver::Version, anyhow::Error> {
+    loop {
+        let theme = ColorfulTheme::default();
+        let raw: String = dialoguer::Input::with_theme(&theme)
+            .with_prompt(message)
+            .with_initial_text(default.unwrap_or_default())
+            .interact_text()
+            .context("could not read user input")?;
+
+        match raw.parse::<semver::Version>() {
+            Ok(p) => break Ok(p),
+            Err(err) => {
+                eprintln!("invalid package version: {err}");
+            }
+        }
+    }
+}
+
 /// Ask for a package name.
 ///
 /// Will continue looping until the user provides a valid name.
@@ -64,23 +115,41 @@ pub async fn prompt_for_package(
     default: Option<&str>,
     check: Option<PackageCheckMode>,
     client: Option<&WasmerClient>,
-) -> Result<(StringWebcIdent, Option<wasmer_api::types::Package>), anyhow::Error> {
+) -> Result<
+    (
+        NamedPackageIdent,
+        Option<wasmer_backend_api::types::Package>,
+    ),
+    anyhow::Error,
+> {
     loop {
         let ident = prompt_for_package_ident(message, default)?;
 
         if let Some(check) = &check {
             let api = client.expect("Check mode specified, but no API provided");
 
-            let pkg = wasmer_api::query::get_package(api, ident.to_string())
+            let pkg = if let Some(v) = ident.version_opt() {
+                wasmer_backend_api::query::get_package_version(
+                    api,
+                    ident.full_name(),
+                    v.to_string(),
+                )
                 .await
-                .context("could not query backend for package")?;
+                .context("could not query backend for package")?
+                .map(|p| p.package)
+            } else {
+                wasmer_backend_api::query::get_package(api, ident.to_string())
+                    .await
+                    .context("could not query backend for package")?
+            };
 
             match check {
                 PackageCheckMode::MustExist => {
                     if let Some(pkg) = pkg {
                         let mut ident = ident;
                         if let Some(v) = &pkg.last_version {
-                            ident.0.tag = Some(v.version.clone());
+                            ident.tag =
+                                Some(wasmer_config::package::Tag::VersionReq(v.version.parse()?));
                         }
                         break Ok((ident, Some(pkg)));
                     } else {
@@ -95,6 +164,8 @@ pub async fn prompt_for_package(
                     }
                 }
             }
+        } else {
+            break Ok((ident, None));
         }
     }
 }
@@ -108,7 +179,7 @@ pub async fn prompt_for_package(
 pub fn prompt_for_namespace(
     message: &str,
     default: Option<&str>,
-    user: Option<&wasmer_api::types::UserWithNamespaces>,
+    user: Option<&wasmer_backend_api::types::UserWithNamespaces>,
 ) -> Result<String, anyhow::Error> {
     if let Some(user) = user {
         let namespaces = user
@@ -125,7 +196,7 @@ pub fn prompt_for_namespace(
             .chain(namespaces.iter().map(|ns| ns.global_name.clone()))
             .collect::<Vec<_>>();
 
-        let selection_index = Select::new()
+        let selection_index = Select::with_theme(&ColorfulTheme::default())
             .with_prompt(message)
             .default(0)
             .items(&labels)
@@ -135,7 +206,8 @@ pub fn prompt_for_namespace(
         Ok(labels[selection_index].clone())
     } else {
         loop {
-            let value = dialoguer::Input::<String>::new()
+            let theme = ColorfulTheme::default();
+            let value = dialoguer::Input::<String>::with_theme(&theme)
                 .with_prompt(message)
                 .with_initial_text(default.map(|x| x.trim().to_string()).unwrap_or_default())
                 .interact_text()
@@ -162,17 +234,27 @@ pub async fn prompt_new_app_name(
     loop {
         let ident = prompt_for_ident(message, default)?;
 
-        if let Some(api) = &api {
-            let app = wasmer_api::query::get_app(api, namespace.to_string(), ident.clone()).await?;
-            eprintln!("Checking name availability...");
+        if ident.len() < 5 {
+            eprintln!(
+                "{}: Name is too short. It must be longer than 5 characters.",
+                "WARN".bold().yellow()
+            )
+        } else if let Some(api) = &api {
+            let app = wasmer_backend_api::query::get_app(api, namespace.to_string(), ident.clone())
+                .await?;
+            eprint!("Checking name availability... ");
             if app.is_some() {
                 eprintln!(
-                    "{}: app '{}/{}' already exists - pick a different name",
-                    "WARN:".yellow(),
-                    namespace,
-                    ident
+                    "{}",
+                    format!(
+                        "app {} already exists in namespace {}",
+                        ident.bold(),
+                        namespace.bold()
+                    )
+                    .yellow()
                 );
             } else {
+                eprintln!("{}", "available!".bold().green());
                 break Ok(ident);
             }
         }
@@ -191,7 +273,7 @@ pub async fn prompt_new_app_alias(
         let ident = prompt_for_ident(message, default)?;
 
         if let Some(api) = &api {
-            let app = wasmer_api::query::get_app_by_alias(api, ident.clone()).await?;
+            let app = wasmer_backend_api::query::get_app_by_alias(api, ident.clone()).await?;
             eprintln!("Checking name availability...");
             if app.is_some() {
                 eprintln!(

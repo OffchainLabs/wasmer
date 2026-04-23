@@ -1,5 +1,5 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! An `Instance` contains all the runtime state used by execution of
 //! a WebAssembly module (except its callstack and register state). An
@@ -8,21 +8,22 @@
 
 mod allocator;
 
-use crate::export::VMExtern;
+use crate::LinearMemory;
 use crate::imports::Imports;
 use crate::store::{InternalStoreHandle, StoreObjects};
 use crate::table::TableElement;
-use crate::trap::{catch_traps, Trap, TrapCode};
+use crate::trap::{Trap, TrapCode};
 use crate::vmcontext::{
-    memory32_atomic_check32, memory32_atomic_check64, memory_copy, memory_fill,
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionContext,
     VMFunctionImport, VMFunctionKind, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition,
-    VMMemoryImport, VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
+    VMMemoryImport, VMSharedSignatureIndex, VMSharedTagIndex, VMTableDefinition, VMTableImport,
+    VMTrampoline, memory_copy, memory_fill, memory32_atomic_check32, memory32_atomic_check64,
 };
-use crate::{FunctionBodyPtr, MaybeInstanceOwned, TrapHandlerFn, VMFunctionBody};
-use crate::{LinearMemory, NotifyLocation};
+use crate::{FunctionBodyPtr, MaybeInstanceOwned, TrapHandlerFn, VMTag, wasmer_call_trampoline};
 use crate::{VMConfig, VMFuncRef, VMFunction, VMGlobal, VMMemory, VMTable};
+use crate::{export::VMExtern, threadconditions::ExpectedValue};
 pub use allocator::InstanceAllocator;
+use itertools::Itertools;
 use memoffset::offset_of;
 use more_asserts::assert_lt;
 use std::alloc::Layout;
@@ -34,11 +35,12 @@ use std::mem;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::Arc;
-use wasmer_types::entity::{packed_option::ReservedValue, BoxedSlice, EntityRef, PrimaryMap};
+use wasmer_types::entity::{BoxedSlice, EntityRef, PrimaryMap, packed_option::ReservedValue};
 use wasmer_types::{
     DataIndex, DataInitializer, ElemIndex, ExportIndex, FunctionIndex, GlobalIndex, GlobalInit,
-    LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, MemoryError,
-    MemoryIndex, ModuleInfo, Pages, SignatureIndex, TableIndex, TableInitializer, VMOffsets,
+    InitExpr, InitExprOp, LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex,
+    MemoryError, MemoryIndex, ModuleInfo, Pages, RawValue, SignatureIndex, TableIndex, TagIndex,
+    VMOffsets,
 };
 
 /// A WebAssembly instance.
@@ -67,6 +69,9 @@ pub(crate) struct Instance {
 
     /// WebAssembly global data.
     globals: BoxedSlice<LocalGlobalIndex, InternalStoreHandle<VMGlobal>>,
+
+    /// WebAssembly tag data. Notably, this stores *all* tags, not just local ones.
+    tags: BoxedSlice<TagIndex, InternalStoreHandle<VMTag>>,
 
     /// Pointers to functions in executable memory.
     functions: BoxedSlice<LocalFunctionIndex, FunctionBodyPtr>,
@@ -108,9 +113,11 @@ impl Instance {
     /// Helper function to access various locations offset from our `*mut
     /// VMContext` object.
     unsafe fn vmctx_plus_offset<T>(&self, offset: u32) -> *mut T {
-        (self.vmctx_ptr() as *mut u8)
-            .add(usize::try_from(offset).unwrap())
-            .cast()
+        unsafe {
+            (self.vmctx_ptr() as *mut u8)
+                .add(usize::try_from(offset).unwrap())
+                .cast()
+        }
     }
 
     fn module(&self) -> &Arc<ModuleInfo> {
@@ -121,11 +128,11 @@ impl Instance {
         &self.module
     }
 
-    fn context(&self) -> &StoreObjects {
+    pub(crate) fn context(&self) -> &StoreObjects {
         unsafe { &*self.context }
     }
 
-    fn context_mut(&mut self) -> &mut StoreObjects {
+    pub(crate) fn context_mut(&mut self) -> &mut StoreObjects {
         unsafe { &mut *self.context }
     }
 
@@ -181,6 +188,18 @@ impl Instance {
     /// Return a pointer to the `VMGlobalImport`s.
     fn imported_globals_ptr(&self) -> *mut VMGlobalImport {
         unsafe { self.vmctx_plus_offset(self.offsets.vmctx_imported_globals_begin()) }
+    }
+
+    /// Return the indexed `VMSharedTagIndex`.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) fn shared_tag_ptr(&self, index: TagIndex) -> &VMSharedTagIndex {
+        let index = usize::try_from(index.as_u32()).unwrap();
+        unsafe { &*self.shared_tags_ptr().add(index) }
+    }
+
+    /// Return a pointer to the `VMSharedTagIndex`s.
+    pub(crate) fn shared_tags_ptr(&self) -> *mut VMSharedTagIndex {
+        unsafe { self.vmctx_plus_offset(self.offsets.vmctx_tag_ids_begin()) }
     }
 
     /// Return the indexed `VMTableDefinition`.
@@ -355,13 +374,22 @@ impl Instance {
             }
         };
 
-        // Make the call.
+        let sig = self.module.functions[start_index];
+        let trampoline = self.function_call_trampolines[sig];
+        let mut values_vec = vec![];
+
         unsafe {
-            catch_traps(trap_handler, config, || {
-                mem::transmute::<*const VMFunctionBody, unsafe extern "C" fn(VMFunctionContext)>(
-                    callee_address,
-                )(callee_vmctx)
-            })
+            // Even though we already know the type of the function we need to call, in certain
+            // specific cases trampoline prepare callee arguments for specific optimizations, such
+            // as passing g0 and m0_base_ptr as paramters.
+            wasmer_call_trampoline(
+                trap_handler,
+                config,
+                callee_vmctx,
+                trampoline,
+                callee_address,
+                values_vec.as_mut_ptr(),
+            )
         }
     }
 
@@ -599,10 +627,8 @@ impl Instance {
             .get(&elem_index)
             .map_or::<&[Option<VMFuncRef>], _>(&[], |e| &**e);
 
-        if src
-            .checked_add(len)
-            .map_or(true, |n| n as usize > elem.len())
-            || dst.checked_add(len).map_or(true, |m| m > table.size())
+        if src.checked_add(len).is_none_or(|n| n as usize > elem.len())
+            || dst.checked_add(len).is_none_or(|m| m > table.size())
         {
             return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
@@ -635,7 +661,7 @@ impl Instance {
 
         if start_index
             .checked_add(len)
-            .map_or(true, |n| n as usize > table_size)
+            .is_none_or(|n| n as usize > table_size)
         {
             return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
@@ -752,12 +778,10 @@ impl Instance {
         let data = passive_data.get(&data_index).map_or(&[][..], |d| &**d);
 
         let current_length = unsafe { memory.vmmemory().as_ref().current_length };
-        if src
-            .checked_add(len)
-            .map_or(true, |n| n as usize > data.len())
+        if src.checked_add(len).is_none_or(|n| n as usize > data.len())
             || dst
                 .checked_add(len)
-                .map_or(true, |m| usize::try_from(m).unwrap() > current_length)
+                .is_none_or(|m| usize::try_from(m).unwrap() > current_length)
         {
             return Err(Trap::lib(TrapCode::HeapAccessOutOfBounds));
         }
@@ -807,14 +831,20 @@ impl Instance {
         }
     }
 
-    fn memory_wait(memory: &mut VMMemory, dst: u32, timeout: i64) -> Result<u32, Trap> {
-        let location = NotifyLocation { address: dst };
+    /// # Safety
+    /// See [`LinearMemory::do_wait`].
+    unsafe fn memory_wait(
+        memory: &mut VMMemory,
+        dst: u32,
+        expected: ExpectedValue,
+        timeout: i64,
+    ) -> Result<u32, Trap> {
         let timeout = if timeout < 0 {
             None
         } else {
             Some(std::time::Duration::from_nanos(timeout as u64))
         };
-        match memory.do_wait(location, timeout) {
+        match unsafe { memory.do_wait(dst, expected, timeout) } {
             Ok(count) => Ok(count),
             Err(_err) => {
                 // ret is None if there is more than 2^32 waiter in queue or some other error
@@ -836,12 +866,14 @@ impl Instance {
         // We should trap according to spec, but official test rely on not trapping...
         //}
 
+        // Do a fast-path check of the expected value, and also ensure proper alignment
         let ret = unsafe { memory32_atomic_check32(&memory, dst, val) };
 
         if let Ok(mut ret) = ret {
             if ret == 0 {
                 let memory = self.get_local_vmmemory_mut(memory_index);
-                ret = Self::memory_wait(memory, dst, timeout)?;
+                // Safety: we have already checked alignment and bounds in memory32_atomic_check32
+                ret = unsafe { Self::memory_wait(memory, dst, ExpectedValue::U32(val), timeout)? };
             }
             Ok(ret)
         } else {
@@ -863,11 +895,14 @@ impl Instance {
         // We should trap according to spec, but official test rely on not trapping...
         //}
 
+        // Do a fast-path check of the expected value, and also ensure proper alignment
         let ret = unsafe { memory32_atomic_check32(memory, dst, val) };
+
         if let Ok(mut ret) = ret {
             if ret == 0 {
                 let memory = self.get_vmmemory_mut(memory_index);
-                ret = Self::memory_wait(memory, dst, timeout)?;
+                // Safety: we have already checked alignment and bounds in memory32_atomic_check32
+                ret = unsafe { Self::memory_wait(memory, dst, ExpectedValue::U32(val), timeout)? };
             }
             Ok(ret)
         } else {
@@ -888,12 +923,14 @@ impl Instance {
         // We should trap according to spec, but official test rely on not trapping...
         //}
 
+        // Do a fast-path check of the expected value, and also ensure proper alignment
         let ret = unsafe { memory32_atomic_check64(&memory, dst, val) };
 
         if let Ok(mut ret) = ret {
             if ret == 0 {
                 let memory = self.get_local_vmmemory_mut(memory_index);
-                ret = Self::memory_wait(memory, dst, timeout)?;
+                // Safety: we have already checked alignment and bounds in memory32_atomic_check64
+                ret = unsafe { Self::memory_wait(memory, dst, ExpectedValue::U64(val), timeout)? };
             }
             Ok(ret)
         } else {
@@ -915,12 +952,14 @@ impl Instance {
         // We should trap according to spec, but official test rely on not trapping...
         //}
 
+        // Do a fast-path check of the expected value, and also ensure proper alignment
         let ret = unsafe { memory32_atomic_check64(memory, dst, val) };
 
         if let Ok(mut ret) = ret {
             if ret == 0 {
                 let memory = self.get_vmmemory_mut(memory_index);
-                ret = Self::memory_wait(memory, dst, timeout)?;
+                // Safety: we have already checked alignment and bounds in memory32_atomic_check64
+                ret = unsafe { Self::memory_wait(memory, dst, ExpectedValue::U64(val), timeout)? };
             }
             Ok(ret)
         } else {
@@ -936,9 +975,7 @@ impl Instance {
         count: u32,
     ) -> Result<u32, Trap> {
         let memory = self.get_local_vmmemory_mut(memory_index);
-        // fetch the notifier
-        let location = NotifyLocation { address: dst };
-        Ok(memory.do_notify(location, count))
+        Ok(memory.do_notify(dst, count))
     }
 
     /// Perform an Atomic.Notify
@@ -949,9 +986,7 @@ impl Instance {
         count: u32,
     ) -> Result<u32, Trap> {
         let memory = self.get_vmmemory_mut(memory_index);
-        // fetch the notifier
-        let location = NotifyLocation { address: dst };
-        Ok(memory.do_notify(location, count))
+        Ok(memory.do_notify(dst, count))
     }
 }
 
@@ -993,7 +1028,7 @@ impl Drop for VMInstance {
 }
 
 impl VMInstance {
-    /// Create a new `VMInstance` pointing at a new [`Instance`].
+    /// Create a new `VMInstance` pointing at freshly allocated instance data.
     ///
     /// # Safety
     ///
@@ -1024,110 +1059,124 @@ impl VMInstance {
         finished_memories: BoxedSlice<LocalMemoryIndex, InternalStoreHandle<VMMemory>>,
         finished_tables: BoxedSlice<LocalTableIndex, InternalStoreHandle<VMTable>>,
         finished_globals: BoxedSlice<LocalGlobalIndex, InternalStoreHandle<VMGlobal>>,
+        tags: BoxedSlice<TagIndex, InternalStoreHandle<VMTag>>,
         imports: Imports,
         vmshared_signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
     ) -> Result<Self, Trap> {
-        let vmctx_globals = finished_globals
-            .values()
-            .map(|m| m.get(context).vmglobal())
-            .collect::<PrimaryMap<LocalGlobalIndex, _>>()
-            .into_boxed_slice();
-        let passive_data = RefCell::new(
-            module
-                .passive_data
-                .clone()
-                .into_iter()
-                .map(|(idx, bytes)| (idx, Arc::from(bytes)))
-                .collect::<HashMap<_, _>>(),
-        );
+        unsafe {
+            let vmctx_tags = tags
+                .values()
+                .map(|m: &InternalStoreHandle<VMTag>| VMSharedTagIndex::new(m.index() as u32))
+                .collect::<PrimaryMap<TagIndex, VMSharedTagIndex>>()
+                .into_boxed_slice();
+            let vmctx_globals = finished_globals
+                .values()
+                .map(|m: &InternalStoreHandle<VMGlobal>| m.get(context).vmglobal())
+                .collect::<PrimaryMap<LocalGlobalIndex, NonNull<VMGlobalDefinition>>>()
+                .into_boxed_slice();
+            let passive_data = RefCell::new(
+                module
+                    .passive_data
+                    .clone()
+                    .into_iter()
+                    .map(|(idx, bytes)| (idx, Arc::from(bytes)))
+                    .collect::<HashMap<_, _>>(),
+            );
 
-        let handle = {
-            let offsets = allocator.offsets().clone();
-            // use dummy value to create an instance so we can get the vmctx pointer
-            let funcrefs = PrimaryMap::new().into_boxed_slice();
-            let imported_funcrefs = PrimaryMap::new().into_boxed_slice();
-            // Create the `Instance`. The unique, the One.
-            let instance = Instance {
-                module,
-                context,
-                offsets,
-                memories: finished_memories,
-                tables: finished_tables,
-                globals: finished_globals,
-                functions: finished_functions,
-                function_call_trampolines: finished_function_call_trampolines,
-                passive_elements: Default::default(),
-                passive_data,
-                funcrefs,
-                imported_funcrefs,
-                vmctx: VMContext {},
-            };
-
-            let mut instance_handle = allocator.into_vminstance(instance);
-
-            // Set the funcrefs after we've built the instance
-            {
-                let instance = instance_handle.instance_mut();
-                let vmctx_ptr = instance.vmctx_ptr();
-                (instance.funcrefs, instance.imported_funcrefs) = build_funcrefs(
-                    &instance.module,
+            let handle = {
+                let offsets = allocator.offsets().clone();
+                // use dummy value to create an instance so we can get the vmctx pointer
+                let funcrefs = PrimaryMap::new().into_boxed_slice();
+                let imported_funcrefs = PrimaryMap::new().into_boxed_slice();
+                // Create the `Instance`. The unique, the One.
+                let instance = Instance {
+                    module,
                     context,
-                    &imports,
-                    &instance.functions,
-                    &vmshared_signatures,
-                    &instance.function_call_trampolines,
-                    vmctx_ptr,
-                );
-            }
+                    offsets,
+                    memories: finished_memories,
+                    tables: finished_tables,
+                    tags,
+                    globals: finished_globals,
+                    functions: finished_functions,
+                    function_call_trampolines: finished_function_call_trampolines,
+                    passive_elements: Default::default(),
+                    passive_data,
+                    funcrefs,
+                    imported_funcrefs,
+                    vmctx: VMContext {},
+                };
 
-            instance_handle
-        };
-        let instance = handle.instance();
+                let mut instance_handle = allocator.into_vminstance(instance);
 
-        ptr::copy(
-            vmshared_signatures.values().as_slice().as_ptr(),
-            instance.signature_ids_ptr(),
-            vmshared_signatures.len(),
-        );
-        ptr::copy(
-            imports.functions.values().as_slice().as_ptr(),
-            instance.imported_functions_ptr(),
-            imports.functions.len(),
-        );
-        ptr::copy(
-            imports.tables.values().as_slice().as_ptr(),
-            instance.imported_tables_ptr(),
-            imports.tables.len(),
-        );
-        ptr::copy(
-            imports.memories.values().as_slice().as_ptr(),
-            instance.imported_memories_ptr(),
-            imports.memories.len(),
-        );
-        ptr::copy(
-            imports.globals.values().as_slice().as_ptr(),
-            instance.imported_globals_ptr(),
-            imports.globals.len(),
-        );
-        // these should already be set, add asserts here? for:
-        // - instance.tables_ptr() as *mut VMTableDefinition
-        // - instance.memories_ptr() as *mut VMMemoryDefinition
-        ptr::copy(
-            vmctx_globals.values().as_slice().as_ptr(),
-            instance.globals_ptr() as *mut NonNull<VMGlobalDefinition>,
-            vmctx_globals.len(),
-        );
-        ptr::write(
-            instance.builtin_functions_ptr(),
-            VMBuiltinFunctionsArray::initialized(),
-        );
+                // Set the funcrefs after we've built the instance
+                {
+                    let instance = instance_handle.instance_mut();
+                    let vmctx_ptr = instance.vmctx_ptr();
+                    (instance.funcrefs, instance.imported_funcrefs) = build_funcrefs(
+                        &instance.module,
+                        context,
+                        &imports,
+                        &instance.functions,
+                        &vmshared_signatures,
+                        &instance.function_call_trampolines,
+                        vmctx_ptr,
+                    );
+                }
 
-        // Perform infallible initialization in this constructor, while fallible
-        // initialization is deferred to the `initialize` method.
-        initialize_passive_elements(instance);
-        initialize_globals(instance);
+                instance_handle
+            };
+            let instance = handle.instance();
 
-        Ok(handle)
+            ptr::copy(
+                vmctx_tags.values().as_slice().as_ptr(),
+                instance.shared_tags_ptr(),
+                vmctx_tags.len(),
+            );
+            ptr::copy(
+                vmshared_signatures.values().as_slice().as_ptr(),
+                instance.signature_ids_ptr(),
+                vmshared_signatures.len(),
+            );
+            ptr::copy(
+                imports.functions.values().as_slice().as_ptr(),
+                instance.imported_functions_ptr(),
+                imports.functions.len(),
+            );
+            ptr::copy(
+                imports.tables.values().as_slice().as_ptr(),
+                instance.imported_tables_ptr(),
+                imports.tables.len(),
+            );
+            ptr::copy(
+                imports.memories.values().as_slice().as_ptr(),
+                instance.imported_memories_ptr(),
+                imports.memories.len(),
+            );
+            ptr::copy(
+                imports.globals.values().as_slice().as_ptr(),
+                instance.imported_globals_ptr(),
+                imports.globals.len(),
+            );
+            // these should already be set, add asserts here? for:
+            // - instance.tables_ptr() as *mut VMTableDefinition
+            // - instance.memories_ptr() as *mut VMMemoryDefinition
+            ptr::copy(
+                vmctx_globals.values().as_slice().as_ptr(),
+                instance.globals_ptr() as *mut NonNull<VMGlobalDefinition>,
+                vmctx_globals.len(),
+            );
+            ptr::write(
+                instance.builtin_functions_ptr(),
+                VMBuiltinFunctionsArray::initialized(),
+            );
+
+            // Perform infallible initialization in this constructor, while fallible
+            // initialization is deferred to the `initialize` method.
+            initialize_passive_elements(instance);
+            initialize_globals(instance);
+
+            Ok(handle)
+        }
     }
 
     /// Return a reference to the contained `Instance`.
@@ -1255,6 +1304,11 @@ impl VMInstance {
                 };
                 VMExtern::Global(handle)
             }
+
+            ExportIndex::Tag(index) => {
+                let handle = instance.tags[index];
+                VMExtern::Tag(handle)
+            }
         }
     }
 
@@ -1263,7 +1317,7 @@ impl VMInstance {
     /// Specifically, it provides access to the key-value pairs, where the keys
     /// are export names, and the values are export declarations which can be
     /// resolved `lookup_by_declaration`.
-    pub fn exports(&self) -> indexmap::map::Iter<String, ExportIndex> {
+    pub fn exports(&self) -> indexmap::map::Iter<'_, String, ExportIndex> {
         self.module().exports.iter()
     }
 
@@ -1331,24 +1385,6 @@ impl VMInstance {
     }
 }
 
-/// Compute the offset for a memory data initializer.
-fn get_memory_init_start(init: &DataInitializer<'_>, instance: &Instance) -> usize {
-    let mut start = init.location.offset;
-
-    if let Some(base) = init.location.base {
-        let val = unsafe {
-            if let Some(def_index) = instance.module.local_global_index(base) {
-                instance.global(def_index).val.u32
-            } else {
-                instance.imported_global(base).definition.as_ref().val.u32
-            }
-        };
-        start += usize::try_from(val).unwrap();
-    }
-
-    start
-}
-
 #[allow(clippy::mut_from_ref)]
 #[allow(dead_code)]
 /// Return a byte-slice view of a memory's data.
@@ -1356,59 +1392,152 @@ unsafe fn get_memory_slice<'instance>(
     init: &DataInitializer<'_>,
     instance: &'instance Instance,
 ) -> &'instance mut [u8] {
-    let memory = if let Some(local_memory_index) = instance
-        .module
-        .local_memory_index(init.location.memory_index)
-    {
-        instance.memory(local_memory_index)
-    } else {
-        let import = instance.imported_memory(init.location.memory_index);
-        *import.definition.as_ref()
-    };
-    slice::from_raw_parts_mut(memory.base, memory.current_length)
+    unsafe {
+        let memory = if let Some(local_memory_index) = instance
+            .module
+            .local_memory_index(init.location.memory_index)
+        {
+            instance.memory(local_memory_index)
+        } else {
+            let import = instance.imported_memory(init.location.memory_index);
+            *import.definition.as_ref()
+        };
+        slice::from_raw_parts_mut(memory.base, memory.current_length)
+    }
 }
 
-/// Compute the offset for a table element initializer.
-fn get_table_init_start(init: &TableInitializer, instance: &Instance) -> usize {
-    let mut start = init.offset;
-
-    if let Some(base) = init.base {
-        let val = unsafe {
-            if let Some(def_index) = instance.module.local_global_index(base) {
-                instance.global(def_index).val.u32
-            } else {
-                instance.imported_global(base).definition.as_ref().val.u32
-            }
-        };
-        start += usize::try_from(val).unwrap();
+fn get_global(index: GlobalIndex, instance: &Instance) -> RawValue {
+    unsafe {
+        if let Some(local_global_index) = instance.module.local_global_index(index) {
+            instance.global(local_global_index).val
+        } else {
+            instance.imported_global(index).definition.as_ref().val
+        }
     }
+}
 
-    start
+enum EvaluatedInitExpr {
+    I32(i32),
+    I64(i64),
+}
+
+fn eval_init_expr(expr: &InitExpr, instance: &Instance) -> EvaluatedInitExpr {
+    if expr
+        .ops()
+        .first()
+        .expect("missing expression")
+        .is_32bit_expression()
+    {
+        let mut stack = Vec::with_capacity(expr.ops().len());
+        for op in expr.ops() {
+            match *op {
+                InitExprOp::I32Const(value) => stack.push(value),
+                InitExprOp::GlobalGetI32(global) => {
+                    stack.push(unsafe { get_global(global, instance).i32 })
+                }
+                InitExprOp::I32Add => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i32.add");
+                    let lhs = stack.pop().expect("invalid init expr stack for i32.add");
+                    stack.push(lhs.wrapping_add(rhs));
+                }
+                InitExprOp::I32Sub => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i32.sub");
+                    let lhs = stack.pop().expect("invalid init expr stack for i32.sub");
+                    stack.push(lhs.wrapping_sub(rhs));
+                }
+                InitExprOp::I32Mul => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i32.mul");
+                    let lhs = stack.pop().expect("invalid init expr stack for i32.mul");
+                    stack.push(lhs.wrapping_mul(rhs));
+                }
+                _ => {
+                    panic!("unexpected init expr statement: {op:?}");
+                }
+            }
+        }
+        EvaluatedInitExpr::I32(
+            stack
+                .into_iter()
+                .exactly_one()
+                .expect("invalid init expr stack shape"),
+        )
+    } else {
+        let mut stack = Vec::with_capacity(expr.ops().len());
+        for op in expr.ops() {
+            match *op {
+                InitExprOp::I64Const(value) => stack.push(value),
+                InitExprOp::GlobalGetI64(global) => {
+                    stack.push(unsafe { get_global(global, instance).i64 })
+                }
+                InitExprOp::I64Add => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i64.add");
+                    let lhs = stack.pop().expect("invalid init expr stack for i64.add");
+                    stack.push(lhs.wrapping_add(rhs));
+                }
+                InitExprOp::I64Sub => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i64.sub");
+                    let lhs = stack.pop().expect("invalid init expr stack for i64.sub");
+                    stack.push(lhs.wrapping_sub(rhs));
+                }
+                InitExprOp::I64Mul => {
+                    let rhs = stack.pop().expect("invalid init expr stack for i64.mul");
+                    let lhs = stack.pop().expect("invalid init expr stack for i64.mul");
+                    stack.push(lhs.wrapping_mul(rhs));
+                }
+                _ => {
+                    panic!("unexpected init expr statement: {op:?}");
+                }
+            }
+        }
+        EvaluatedInitExpr::I64(
+            stack
+                .into_iter()
+                .exactly_one()
+                .expect("invalid init expr stack shape"),
+        )
+    }
 }
 
 /// Initialize the table memory from the provided initializers.
 fn initialize_tables(instance: &mut Instance) -> Result<(), Trap> {
     let module = Arc::clone(&instance.module);
     for init in &module.table_initializers {
-        let start = get_table_init_start(init, instance);
+        let EvaluatedInitExpr::I32(start) = eval_init_expr(&init.offset_expr, instance) else {
+            panic!("unexpected expression type, expected i32");
+        };
+        if start < 0 {
+            return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
+        }
+        let start = start as usize;
         let table = instance.get_table_handle(init.table_index);
         let table = unsafe { table.get_mut(&mut *instance.context) };
 
         if start
             .checked_add(init.elements.len())
-            .map_or(true, |end| end > table.size() as usize)
+            .is_none_or(|end| end > table.size() as usize)
         {
             return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
 
-        for (i, func_idx) in init.elements.iter().enumerate() {
-            let anyfunc = instance.func_ref(*func_idx);
-            table
-                .set(
-                    u32::try_from(start + i).unwrap(),
-                    TableElement::FuncRef(anyfunc),
-                )
-                .unwrap();
+        if let wasmer_types::Type::FuncRef = table.ty().ty {
+            for (i, func_idx) in init.elements.iter().enumerate() {
+                let anyfunc = instance.func_ref(*func_idx);
+                table
+                    .set(
+                        u32::try_from(start + i).unwrap(),
+                        TableElement::FuncRef(anyfunc),
+                    )
+                    .unwrap();
+            }
+        } else {
+            for i in 0..init.elements.len() {
+                table
+                    .set(
+                        u32::try_from(start + i).unwrap(),
+                        TableElement::ExternRef(None),
+                    )
+                    .unwrap();
+            }
         }
     }
 
@@ -1425,19 +1554,21 @@ fn initialize_passive_elements(instance: &Instance) {
         "should only be called once, at initialization time"
     );
 
-    passive_elements.extend(
-        instance
-            .module
-            .passive_elements
-            .iter()
-            .filter(|(_, segments)| !segments.is_empty())
-            .map(|(idx, segments)| {
-                (
-                    *idx,
-                    segments.iter().map(|s| instance.func_ref(*s)).collect(),
-                )
-            }),
-    );
+    passive_elements.extend(instance.module.passive_elements.iter().filter_map(
+        |(&idx, segments)| -> Option<(ElemIndex, Box<[Option<VMFuncRef>]>)> {
+            if segments.is_empty() {
+                None
+            } else {
+                Some((
+                    idx,
+                    segments
+                        .iter()
+                        .map(|s| instance.func_ref(*s))
+                        .collect::<Box<[Option<VMFuncRef>]>>(),
+                ))
+            }
+        },
+    ));
 }
 
 /// Initialize the table memory from the provided initializers.
@@ -1448,12 +1579,19 @@ fn initialize_memories(
     for init in data_initializers {
         let memory = instance.get_vmmemory(init.location.memory_index);
 
-        let start = get_memory_init_start(init, instance);
+        let EvaluatedInitExpr::I32(start) = eval_init_expr(&init.location.offset_expr, instance)
+        else {
+            panic!("unexpected expression type, expected i32");
+        };
+        if start < 0 {
+            return Err(Trap::lib(TrapCode::HeapAccessOutOfBounds));
+        }
+        let start = start as usize;
         unsafe {
             let current_length = memory.vmmemory().as_ref().current_length;
             if start
                 .checked_add(init.data.len())
-                .map_or(true, |end| end > current_length)
+                .is_none_or(|end| end > current_length)
             {
                 return Err(Trap::lib(TrapCode::HeapAccessOutOfBounds));
             }
@@ -1489,6 +1627,10 @@ fn initialize_globals(instance: &Instance) {
                     let funcref = instance.func_ref(*func_idx).unwrap();
                     (*to).val = funcref.into_raw();
                 }
+                GlobalInit::Expr(expr) => match eval_init_expr(expr, instance) {
+                    EvaluatedInitExpr::I32(value) => (*to).val.i32 = value,
+                    EvaluatedInitExpr::I64(value) => (*to).val.i64 = value,
+                },
             }
         }
     }

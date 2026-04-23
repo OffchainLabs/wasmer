@@ -1,26 +1,28 @@
 use std::{
-    fs::{read_dir, File, OpenOptions, ReadDir},
+    fs::{self, File, OpenOptions, ReadDir, read_dir},
     future::Future,
     io::{self, Read, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     task::{Context, Poll},
 };
 
+use anyhow::{Context as _, anyhow};
+use fs_extra::dir::{self, copy};
+use tempfile::TempDir;
+use tokio::runtime::Handle;
 use virtual_fs::{
-    host_fs, mem_fs, passthru_fs, tmp_fs, union_fs, AsyncRead, AsyncSeek, AsyncWrite,
-    AsyncWriteExt, FileSystem, Pipe, ReadBuf, RootFileSystemBuilder,
+    AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, FileSystem, Pipe, ReadBuf,
+    RootFileSystemBuilder, host_fs, mem_fs, passthru_fs, tmp_fs, union_fs,
 };
 use wasmer::{FunctionEnv, Imports, Module, Store};
-use wasmer_wasix::runtime::{
-    module_cache::ModuleHash,
-    task_manager::{tokio::TokioTaskManager, InlineWaker},
-};
+use wasmer_types::ModuleHash;
+use wasmer_wasix::runtime::task_manager::{block_on, tokio::TokioTaskManager};
 use wasmer_wasix::types::wasi::{Filesize, Timestamp};
 use wasmer_wasix::{
-    generate_import_object_from_env, get_wasi_version, FsError, PluggableRuntime, VirtualFile,
-    WasiEnv, WasiEnvBuilder, WasiVersion,
+    FsError, PluggableRuntime, VirtualFile, WasiEnv, WasiEnvBuilder, WasiVersion,
+    generate_import_object_from_env, get_wasi_version,
 };
 use wast::parser::{self, Parse, ParseBuffer, Parser};
 
@@ -62,6 +64,7 @@ pub struct WasiTest<'a> {
 }
 
 // TODO: add `test_fs` here to sandbox better
+const TEMP_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp/");
 const BASE_TEST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../wasi-wast/wasi/");
 
 fn get_stdio_output(rx: &mpsc::Receiver<Vec<u8>>) -> anyhow::Result<String> {
@@ -111,7 +114,7 @@ impl<'a> WasiTest<'a> {
         let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
         #[cfg(target_arch = "wasm32")]
         let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::default()));
-        rt.set_engine(Some(store.engine().clone()));
+        rt.set_engine(store.engine().clone());
 
         let mut pb = PathBuf::from(base_path);
         pb.push(self.wasm_path);
@@ -121,11 +124,11 @@ impl<'a> WasiTest<'a> {
             wasm_module.read_to_end(&mut out)?;
             out
         };
-        let module_hash = ModuleHash::hash(&wasm_bytes);
+        let module_hash = ModuleHash::new(&wasm_bytes);
 
         let module = Module::new(store, wasm_bytes)?;
         let (builder, _tempdirs, mut stdin_tx, stdout_rx, stderr_rx) =
-            { InlineWaker::block_on(async { self.create_wasi_env(filesystem_kind).await }) }?;
+            { block_on(async { self.create_wasi_env(filesystem_kind).await }) }?;
 
         let (instance, _wasi_env) =
             builder
@@ -138,7 +141,7 @@ impl<'a> WasiTest<'a> {
             // let mut wasi_stdin = { wasi_env.data(store).stdin().unwrap().unwrap() };
             // Then we can write to it!
             let data = stdin.stream.to_string();
-            InlineWaker::block_on(async move {
+            block_on(async move {
                 stdin_tx.write_all(data.as_bytes()).await?;
                 stdin_tx.shutdown().await?;
 
@@ -156,9 +159,7 @@ impl<'a> WasiTest<'a> {
                 let stderr_str = get_stdio_output(&stderr_rx)?;
                 Err(e).with_context(|| {
                     format!(
-                        "failed to run WASI `_start` function: failed with stdout: \"{}\"\nstderr: \"{}\"",
-                        stdout_str,
-                        stderr_str,
+                        "failed to run WASI `_start` function: failed with stdout: \"{stdout_str}\"\nstderr: \"{stderr_str}\"",
                     )
                 })?;
             }
@@ -166,7 +167,7 @@ impl<'a> WasiTest<'a> {
 
         if let Some(expected_stdout) = &self.assert_stdout {
             let stdout_str = get_stdio_output(&stdout_rx)?;
-            dbg!(&expected_stdout, &stdout_str);
+            //dbg!(&expected_stdout, &stdout_str);
             assert_eq!(stdout_str, expected_stdout.expected);
         }
 
@@ -203,40 +204,54 @@ impl<'a> WasiTest<'a> {
 
         match filesystem_kind {
             WasiFileSystemKind::Host => {
-                let fs = host_fs::FileSystem::default();
+                // Use a temporary folder, otherwise other file systems will spot the artifacts of this FS.
+                let mut source = PathBuf::from(BASE_TEST_DIR);
+                source.push("test_fs");
+
+                fs::create_dir_all(TEMP_ROOT)
+                    .with_context(|| anyhow!("cannot create root tmp folder for WASI tests"))?;
+
+                let root_dir = TempDir::with_prefix_in("host_fs_copy-", TEMP_ROOT)
+                    .with_context(|| anyhow!("cannot create temporary directory"))?;
+                copy(source.as_path(), root_dir.path(), &dir::CopyOptions::new())
+                    .with_context(|| anyhow!("cannot copy to the temporary directory"))?;
+                let base_dir = root_dir.path().to_path_buf();
+                host_temp_dirs_to_not_drop.push(root_dir);
+
+                let fs = host_fs::FileSystem::new(Handle::current(), base_dir.clone()).unwrap();
 
                 for (alias, real_dir) in &self.mapped_dirs {
-                    let mut dir = PathBuf::from(BASE_TEST_DIR);
+                    let mut dir = base_dir.clone();
                     dir.push(real_dir);
                     builder.add_map_dir(alias, dir)?;
                 }
 
                 // due to the structure of our code, all preopen dirs must be mapped now
                 for dir in &self.dirs {
-                    let mut new_dir = PathBuf::from(BASE_TEST_DIR);
+                    let mut new_dir = base_dir.clone();
                     new_dir.push(dir);
                     builder.add_map_dir(dir, new_dir)?;
                 }
 
                 for alias in &self.temp_dirs {
-                    let temp_dir = tempfile::tempdir()?;
+                    let temp_dir = tempfile::tempdir_in(&base_dir)?;
                     builder.add_map_dir(alias, temp_dir.path())?;
                     host_temp_dirs_to_not_drop.push(temp_dir);
                 }
 
-                builder.set_fs(Box::new(fs));
+                builder.set_fs(Arc::new(fs) as Arc<dyn FileSystem + Send + Sync>);
             }
 
             other => {
-                let fs: Box<dyn FileSystem + Send + Sync> = match other {
-                    WasiFileSystemKind::InMemory => Box::<mem_fs::FileSystem>::default(),
-                    WasiFileSystemKind::Tmp => Box::<tmp_fs::TmpFileSystem>::default(),
+                let fs: Arc<dyn FileSystem + Send + Sync> = match other {
+                    WasiFileSystemKind::InMemory => Arc::<mem_fs::FileSystem>::default(),
+                    WasiFileSystemKind::Tmp => Arc::<tmp_fs::TmpFileSystem>::default(),
                     WasiFileSystemKind::PassthruMemory => {
-                        let fs = Box::<mem_fs::FileSystem>::default();
-                        Box::new(passthru_fs::PassthruFileSystem::new(fs))
+                        let fs = Arc::<mem_fs::FileSystem>::default();
+                        Arc::new(passthru_fs::PassthruFileSystem::new_arc(fs))
                     }
                     WasiFileSystemKind::RootFileSystemBuilder => {
-                        Box::new(RootFileSystemBuilder::new().build())
+                        Arc::new(RootFileSystemBuilder::new().build())
                     }
                     WasiFileSystemKind::UnionHostMemory => {
                         let a = mem_fs::FileSystem::default();
@@ -246,19 +261,43 @@ impl<'a> WasiTest<'a> {
                         let e = mem_fs::FileSystem::default();
                         let f = mem_fs::FileSystem::default();
 
-                        let mut union = union_fs::UnionFileSystem::new();
+                        let union = union_fs::UnionFileSystem::new();
 
-                        union.mount("mem_fs", "/test_fs", false, Box::new(a), None);
-                        union.mount("mem_fs_2", "/snapshot1", false, Box::new(b), None);
-                        union.mount("mem_fs_3", "/tests", false, Box::new(c), None);
-                        union.mount("mem_fs_4", "/nightly_2022_10_18", false, Box::new(d), None);
-                        union.mount("mem_fs_5", "/unstable", false, Box::new(e), None);
-                        union.mount("mem_fs_6", "/.tmp_wasmer_wast_0", false, Box::new(f), None);
+                        union.mount(
+                            "mem_fs".to_string(),
+                            PathBuf::from("/test_fs").as_ref(),
+                            Box::new(a),
+                        )?;
+                        union.mount(
+                            "mem_fs_2".to_string(),
+                            PathBuf::from("/snapshot1").as_ref(),
+                            Box::new(b),
+                        )?;
+                        union.mount(
+                            "mem_fs_3".to_string(),
+                            PathBuf::from("/tests").as_ref(),
+                            Box::new(c),
+                        )?;
+                        union.mount(
+                            "mem_fs_4".to_string(),
+                            PathBuf::from("/nightly_2022_10_18").as_ref(),
+                            Box::new(d),
+                        )?;
+                        union.mount(
+                            "mem_fs_5".to_string(),
+                            PathBuf::from("/unstable").as_ref(),
+                            Box::new(e),
+                        )?;
+                        union.mount(
+                            "mem_fs_6".to_string(),
+                            PathBuf::from("/.tmp_wasmer_wast_0").as_ref(),
+                            Box::new(f),
+                        )?;
 
-                        Box::new(union)
+                        Arc::new(union)
                     }
                     _ => {
-                        panic!("unexpected filesystem type {:?}", other);
+                        panic!("unexpected filesystem type {other:?}");
                     }
                 };
 
@@ -283,7 +322,7 @@ impl<'a> WasiTest<'a> {
 
                 for alias in &self.temp_dirs {
                     let temp_dir_name =
-                        PathBuf::from(format!("/.tmp_wasmer_wast_{}", temp_dir_index));
+                        PathBuf::from(format!("/.tmp_wasmer_wast_{temp_dir_index}"));
                     fs.create_dir(temp_dir_name.as_path())?;
                     builder.add_map_dir(alias, temp_dir_name)?;
                     temp_dir_index += 1;
@@ -354,55 +393,55 @@ impl<'a> Parse<'a> for WasiTest<'a> {
             let wasm_path = parser.parse::<&'a str>()?;
 
             // TODO: allow these to come in any order
-            let envs = if parser.peek2::<wasi_kw::envs>() {
+            let envs = if parser.peek2::<wasi_kw::envs>()? {
                 parser.parens(|p| p.parse::<Envs>())?.envs
             } else {
                 vec![]
             };
 
-            let args = if parser.peek2::<wasi_kw::args>() {
+            let args = if parser.peek2::<wasi_kw::args>()? {
                 parser.parens(|p| p.parse::<Args>())?.args
             } else {
                 vec![]
             };
 
-            let dirs = if parser.peek2::<wasi_kw::preopens>() {
+            let dirs = if parser.peek2::<wasi_kw::preopens>()? {
                 parser.parens(|p| p.parse::<Preopens>())?.preopens
             } else {
                 vec![]
             };
 
-            let mapped_dirs = if parser.peek2::<wasi_kw::map_dirs>() {
+            let mapped_dirs = if parser.peek2::<wasi_kw::map_dirs>()? {
                 parser.parens(|p| p.parse::<MapDirs>())?.map_dirs
             } else {
                 vec![]
             };
 
-            let temp_dirs = if parser.peek2::<wasi_kw::temp_dirs>() {
+            let temp_dirs = if parser.peek2::<wasi_kw::temp_dirs>()? {
                 parser.parens(|p| p.parse::<TempDirs>())?.temp_dirs
             } else {
                 vec![]
             };
 
-            let assert_return = if parser.peek2::<wasi_kw::assert_return>() {
+            let assert_return = if parser.peek2::<wasi_kw::assert_return>()? {
                 Some(parser.parens(|p| p.parse::<AssertReturn>())?)
             } else {
                 None
             };
 
-            let stdin = if parser.peek2::<wasi_kw::stdin>() {
+            let stdin = if parser.peek2::<wasi_kw::stdin>()? {
                 Some(parser.parens(|p| p.parse::<Stdin>())?)
             } else {
                 None
             };
 
-            let assert_stdout = if parser.peek2::<wasi_kw::assert_stdout>() {
+            let assert_stdout = if parser.peek2::<wasi_kw::assert_stdout>()? {
                 Some(parser.parens(|p| p.parse::<AssertStdout>())?)
             } else {
                 None
             };
 
-            let assert_stderr = if parser.peek2::<wasi_kw::assert_stderr>() {
+            let assert_stderr = if parser.peek2::<wasi_kw::assert_stderr>()? {
                 Some(parser.parens(|p| p.parse::<AssertStderr>())?)
             } else {
                 None
@@ -434,7 +473,7 @@ impl<'a> Parse<'a> for Envs<'a> {
         let mut envs = vec![];
         parser.parse::<wasi_kw::envs>()?;
 
-        while parser.peek::<&'a str>() {
+        while parser.peek::<&'a str>()? {
             let res = parser.parse::<&'a str>()?;
             let mut strs = res.split('=');
             let first = strs.next().unwrap();
@@ -456,7 +495,7 @@ impl<'a> Parse<'a> for Args<'a> {
         let mut args = vec![];
         parser.parse::<wasi_kw::args>()?;
 
-        while parser.peek::<&'a str>() {
+        while parser.peek::<&'a str>()? {
             let res = parser.parse::<&'a str>()?;
             args.push(res);
         }
@@ -474,7 +513,7 @@ impl<'a> Parse<'a> for Preopens<'a> {
         let mut preopens = vec![];
         parser.parse::<wasi_kw::preopens>()?;
 
-        while parser.peek::<&'a str>() {
+        while parser.peek::<&'a str>()? {
             let res = parser.parse::<&'a str>()?;
             preopens.push(res);
         }
@@ -492,7 +531,7 @@ impl<'a> Parse<'a> for MapDirs<'a> {
         let mut map_dirs = vec![];
         parser.parse::<wasi_kw::map_dirs>()?;
 
-        while parser.peek::<&'a str>() {
+        while parser.peek::<&'a str>()? {
             let res = parser.parse::<&'a str>()?;
             let mut iter = res.split(':');
             let dir = iter.next().unwrap();
@@ -513,7 +552,7 @@ impl<'a> Parse<'a> for TempDirs<'a> {
         let mut temp_dirs = vec![];
         parser.parse::<wasi_kw::temp_dirs>()?;
 
-        while parser.peek::<&'a str>() {
+        while parser.peek::<&'a str>()? {
             let alias = parser.parse::<&'a str>()?;
             temp_dirs.push(alias);
         }
@@ -664,16 +703,10 @@ impl VirtualFile for OutputCapturerer {
 
 impl AsyncSeek for OutputCapturerer {
     fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "can not seek logging wrapper",
-        ))
+        Err(io::Error::other("can not seek logging wrapper"))
     }
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::Other,
-            "can not seek logging wrapper",
-        )))
+        Poll::Ready(Err(io::Error::other("can not seek logging wrapper")))
     }
 }
 
@@ -704,10 +737,7 @@ impl AsyncRead for OutputCapturerer {
         _cx: &mut Context<'_>,
         _buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::Other,
-            "can not read from logging wrapper",
-        )))
+        Poll::Ready(Err(io::Error::other("can not read from logging wrapper")))
     }
 }
 

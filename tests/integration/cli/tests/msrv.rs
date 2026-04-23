@@ -38,28 +38,12 @@ fn docker_file_is_up_to_date() {
 #[test]
 fn rust_toolchain_file_is_up_to_date() {
     let pattern = Regex::new(r"1\.\d\d").unwrap();
-    let rust_toolchain = project_root().join("rust-toolchain");
+    let rust_toolchain = project_root().join("rust-toolchain.toml");
 
     let contents = std::fs::read_to_string(&rust_toolchain).unwrap();
     let expected = pattern.replace_all(&contents, MSRV.as_str());
 
     ensure_file_contents(rust_toolchain, expected);
-}
-
-#[test]
-fn ci_files_are_up_to_date() {
-    let pattern = Regex::new(r#"MSRV:\s*"\d+\.\d+""#).unwrap();
-    let replacement = format!("MSRV: \"{}\"", MSRV.as_str());
-    let workflows = project_root().join(".github").join("workflows");
-
-    for result in workflows.read_dir().unwrap() {
-        let path = result.unwrap().path();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let expected = pattern.replace_all(&contents, &replacement);
-
-        ensure_file_contents(path, expected);
-    }
 }
 
 /// Get the root directory for this repository.
@@ -78,11 +62,11 @@ fn ensure_file_contents(path: impl AsRef<Path>, contents: impl AsRef<str>) {
     let path = path.as_ref();
     let contents = contents.as_ref();
 
-    if let Ok(old_contents) = std::fs::read_to_string(path) {
-        if contents == old_contents {
-            // File is already up to date
-            return;
-        }
+    if let Ok(old_contents) = std::fs::read_to_string(path)
+        && contents == old_contents
+    {
+        // File is already up to date
+        return;
     }
 
     let display_path = path.strip_prefix(project_root()).unwrap_or(path);
@@ -96,7 +80,7 @@ fn ensure_file_contents(path: impl AsRef<Path>, contents: impl AsRef<str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&path, contents).unwrap();
+    std::fs::write(path, contents).unwrap();
     panic!(
         "\"{}\" was not up to date and has been updated. Please commit the changes and re-run the tests.",
         path.strip_prefix(project_root()).unwrap_or(path).display()

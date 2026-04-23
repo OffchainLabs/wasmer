@@ -1,6 +1,6 @@
-use std::sync::mpsc::TryRecvError;
 use std::sync::Mutex;
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, mpsc};
 
 use super::*;
 
@@ -75,13 +75,17 @@ impl WritableJournal for PipeJournalTx {
                 record: entry,
             })
             .map_err(|err| {
-                anyhow::format_err!("failed to send journal event through the pipe - {}", err)
+                anyhow::format_err!("failed to send journal event through the pipe - {err}")
             })?;
         sender.offset += entry_size;
         Ok(LogWriteResult {
             record_start: sender.offset,
             record_end: sender.offset + entry_size,
         })
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -107,6 +111,18 @@ impl ReadableJournal for PipeJournalRx {
 impl WritableJournal for PipeJournal {
     fn write<'a>(&'a self, entry: JournalEntry<'a>) -> anyhow::Result<LogWriteResult> {
         self.tx.write(entry)
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        self.tx.flush()
+    }
+
+    fn commit(&self) -> anyhow::Result<usize> {
+        self.tx.commit()
+    }
+
+    fn rollback(&self) -> anyhow::Result<usize> {
+        self.tx.rollback()
     }
 }
 

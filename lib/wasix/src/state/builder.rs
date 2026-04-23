@@ -1,31 +1,31 @@
 //! Builder system for configuring a [`WasiState`] and creating it.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use rand::Rng;
+use rand::RngExt;
 use thiserror::Error;
 use virtual_fs::{ArcFile, FileSystem, FsError, TmpFileSystem, VirtualFile};
-use wasmer::{AsStoreMut, Extern, Imports, Instance, Module, Store};
+use wasmer::{AsStoreMut, Engine, Instance, Module};
+use wasmer_config::package::PackageId;
 
 #[cfg(feature = "journal")]
-use crate::journal::{DynJournal, SnapshotTrigger};
+use crate::journal::{DynJournal, DynReadableJournal, SnapshotTrigger};
 use crate::{
+    Runtime, WasiEnv, WasiFunctionEnv, WasiRuntimeError, WasiThreadError,
     bin_factory::{BinFactory, BinaryPackage},
     capabilities::Capabilities,
     fs::{WasiFs, WasiFsRoot, WasiInodes},
+    os::command::VirtualCommand,
     os::task::control_plane::{ControlPlaneConfig, ControlPlaneError, WasiControlPlane},
-    runtime::module_cache::ModuleHash,
     state::WasiState,
-    syscalls::{
-        rewind_ext2,
-        types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
-    },
-    Runtime, WasiEnv, WasiError, WasiFunctionEnv, WasiRuntimeError,
+    syscalls::types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
 };
+use wasmer_types::ModuleHash;
+use wasmer_wasix_types::wasi::SignalDisposition;
 
 use super::env::WasiEnvInit;
 
@@ -47,10 +47,14 @@ use super::env::WasiEnvInit;
 /// ```
 #[derive(Default)]
 pub struct WasiEnvBuilder {
+    /// Name of entry function. Defaults to running `_start` if not specified.
+    pub(super) entry_function: Option<String>,
     /// Command line arguments.
     pub(super) args: Vec<String>,
     /// Environment variables.
     pub(super) envs: Vec<(String, Vec<u8>)>,
+    /// Signals that should get their handler overridden.
+    pub(super) signals: Vec<SignalDisposition>,
     /// Pre-opened directories that will be accessible from WASI.
     pub(super) preopens: Vec<PreopenedDir>,
     /// Pre-opened virtual directories that will be accessible from WASI.
@@ -62,19 +66,25 @@ pub struct WasiEnvBuilder {
     pub(super) stderr: Option<Box<dyn VirtualFile + Send + Sync + 'static>>,
     pub(super) stdin: Option<Box<dyn VirtualFile + Send + Sync + 'static>>,
     pub(super) fs: Option<WasiFsRoot>,
+    pub(super) engine: Option<Engine>,
     pub(super) runtime: Option<Arc<dyn crate::Runtime + Send + Sync + 'static>>,
     pub(super) current_dir: Option<PathBuf>,
 
     /// List of webc dependencies to be injected.
     pub(super) uses: Vec<BinaryPackage>,
 
+    pub(super) included_packages: HashSet<PackageId>,
+
     pub(super) module_hash: Option<ModuleHash>,
 
     /// List of host commands to map into the WASI instance.
     pub(super) map_commands: HashMap<String, PathBuf>,
+    /// Indicates if internal builtin commands should be disabled.
+    pub(super) disable_default_builtins: bool,
+    /// List of builtin commands to register in the WASI instance.
+    pub(super) builtin_commands: Vec<(String, Arc<dyn VirtualCommand + Send + Sync + 'static>)>,
 
     pub(super) capabilites: Capabilities,
-    pub(super) additional_imports: Imports,
 
     #[cfg(feature = "journal")]
     pub(super) snapshot_on: Vec<SnapshotTrigger>,
@@ -83,21 +93,37 @@ pub struct WasiEnvBuilder {
     pub(super) snapshot_interval: Option<std::time::Duration>,
 
     #[cfg(feature = "journal")]
-    pub(super) journals: Vec<Arc<DynJournal>>,
+    pub(super) stop_running_after_snapshot: bool,
+
+    #[cfg(feature = "journal")]
+    pub(super) read_only_journals: Vec<Arc<DynReadableJournal>>,
+
+    #[cfg(feature = "journal")]
+    pub(super) writable_journals: Vec<Arc<DynJournal>>,
+
+    pub(super) skip_stdio_during_bootstrap: bool,
+
+    #[cfg(feature = "ctrlc")]
+    pub(super) attach_ctrl_c: bool,
 }
 
 impl std::fmt::Debug for WasiEnvBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO: update this when stable
         f.debug_struct("WasiEnvBuilder")
+            .field("entry_function", &self.entry_function)
             .field("args", &self.args)
             .field("envs", &self.envs)
+            .field("signals", &self.signals)
             .field("preopens", &self.preopens)
             .field("uses", &self.uses)
             .field("setup_fs_fn exists", &self.setup_fs_fn.is_some())
             .field("stdout_override exists", &self.stdout.is_some())
             .field("stderr_override exists", &self.stderr.is_some())
             .field("stdin_override exists", &self.stdin.is_some())
+            .field("disable_default_builtins", &self.disable_default_builtins)
+            .field("builtin_commands_count", &self.builtin_commands.len())
+            .field("engine_override_exists", &self.engine.is_some())
             .field("runtime_override_exists", &self.runtime.is_some())
             .finish()
     }
@@ -133,7 +159,7 @@ pub enum WasiStateCreationError {
 fn validate_mapped_dir_alias(alias: &str) -> Result<(), WasiStateCreationError> {
     if !alias.bytes().all(|b| b != b'\0') {
         return Err(WasiStateCreationError::MappedDirAliasFormattingError(
-            format!("Alias \"{}\" contains a nul byte", alias),
+            format!("Alias \"{alias}\" contains a nul byte"),
         ));
     }
 
@@ -151,6 +177,14 @@ impl WasiEnvBuilder {
             args: vec![program_name.into()],
             ..WasiEnvBuilder::default()
         }
+    }
+
+    /// Attaches a ctrl-c handler which will send signals to the
+    /// process rather than immediately termiante it
+    #[cfg(feature = "ctrlc")]
+    pub fn attach_ctrl_c(mut self) -> Self {
+        self.attach_ctrl_c = true;
+        self
     }
 
     /// Add an environment variable pair.
@@ -223,6 +257,62 @@ impl WasiEnvBuilder {
     /// Get a mutable reference to the configured environment variables.
     pub fn get_env_mut(&mut self) -> &mut Vec<(String, Vec<u8>)> {
         &mut self.envs
+    }
+
+    /// Add a signal handler override.
+    pub fn signal(mut self, sig_action: SignalDisposition) -> Self {
+        self.add_signal(sig_action);
+        self
+    }
+
+    /// Add a signal handler override.
+    pub fn add_signal(&mut self, sig_action: SignalDisposition) {
+        self.signals.push(sig_action);
+    }
+
+    /// Add multiple signal handler overrides.
+    pub fn signals<I>(mut self, signal_pairs: I) -> Self
+    where
+        I: IntoIterator<Item = SignalDisposition>,
+    {
+        self.add_signals(signal_pairs);
+
+        self
+    }
+
+    /// Add multiple signal handler overrides.
+    pub fn add_signals<I>(&mut self, signal_pairs: I)
+    where
+        I: IntoIterator<Item = SignalDisposition>,
+    {
+        for sig in signal_pairs {
+            self.add_signal(sig);
+        }
+    }
+
+    /// Get a reference to the configured signal handler overrides.
+    pub fn get_signals(&self) -> &[SignalDisposition] {
+        &self.signals
+    }
+
+    /// Get a mutable reference to the configured signalironment variables.
+    pub fn get_signals_mut(&mut self) -> &mut Vec<SignalDisposition> {
+        &mut self.signals
+    }
+
+    pub fn entry_function<S>(mut self, entry_function: S) -> Self
+    where
+        S: AsRef<str>,
+    {
+        self.set_entry_function(entry_function);
+        self
+    }
+
+    pub fn set_entry_function<S>(&mut self, entry_function: S)
+    where
+        S: AsRef<str>,
+    {
+        self.entry_function = Some(entry_function.as_ref().to_owned());
     }
 
     /// Add an argument.
@@ -311,6 +401,21 @@ impl WasiEnvBuilder {
         self
     }
 
+    /// Adds a package that is already included in the [`WasiEnvBuilder`] filesystem.
+    /// These packages will not be merged to the final filesystem since they are already included.
+    pub fn include_package(&mut self, pkg_id: PackageId) -> &mut Self {
+        self.included_packages.insert(pkg_id);
+        self
+    }
+
+    /// Adds packages that is already included in the [`WasiEnvBuilder`] filesystem.
+    /// These packages will not be merged to the final filesystem since they are already included.
+    pub fn include_packages(&mut self, pkg_ids: impl IntoIterator<Item = PackageId>) -> &mut Self {
+        self.included_packages.extend(pkg_ids);
+
+        self
+    }
+
     /// Adds a list of other containers this module inherits from.
     ///
     /// This will make all of the container's files and commands available to the
@@ -323,6 +428,65 @@ impl WasiEnvBuilder {
             self.add_webc(pkg);
         }
         self
+    }
+
+    /// Disable or enable internal builtin commands.
+    pub fn disable_default_builtins(mut self, disable_default_builtins: bool) -> Self {
+        self.set_disable_default_builtins(disable_default_builtins);
+        self
+    }
+
+    /// Disable or enable internal builtin commands.
+    pub fn set_disable_default_builtins(&mut self, disable_default_builtins: bool) {
+        self.disable_default_builtins = disable_default_builtins;
+    }
+
+    /// Add a builtin command at its canonical path (`/bin/<name>`).
+    pub fn builtin_command<C>(mut self, command: C) -> Self
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+    {
+        self.add_builtin_command(command);
+        self
+    }
+
+    /// Add a builtin command at its canonical path (`/bin/<name>`).
+    pub fn add_builtin_command<C>(&mut self, command: C)
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+    {
+        let path = format!("/bin/{}", command.name());
+        self.add_builtin_command_with_path(command, path);
+    }
+
+    /// Add a builtin command at a custom path.
+    pub fn builtin_command_with_path<C, P>(mut self, command: C, path: P) -> Self
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+        P: Into<String>,
+    {
+        self.add_builtin_command_with_path(command, path);
+        self
+    }
+
+    /// Add a builtin command at a custom path.
+    pub fn add_builtin_command_with_path<C, P>(&mut self, command: C, path: P)
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+        P: Into<String>,
+    {
+        self.add_builtin_command_with_path_shared(Arc::new(command), path);
+    }
+
+    /// Add a builtin command behind an [`Arc`] at a custom path.
+    fn add_builtin_command_with_path_shared<P>(
+        &mut self,
+        command: Arc<dyn VirtualCommand + Send + Sync + 'static>,
+        path: P,
+    ) where
+        P: Into<String>,
+    {
+        self.builtin_commands.push((path.into(), command));
     }
 
     /// Map an atom to a local binary
@@ -522,13 +686,27 @@ impl WasiEnvBuilder {
     ///
     /// The state of the WASM process and its sandbox will be reapplied use
     /// the journals in the order that you specify here.
+    #[cfg(feature = "journal")]
+    pub fn add_read_only_journal(&mut self, journal: Arc<DynReadableJournal>) {
+        self.read_only_journals.push(journal);
+    }
+
+    /// Specifies one or more journal files that Wasmer will use to restore
+    /// the state of the WASM process.
+    ///
+    /// The state of the WASM process and its sandbox will be reapplied use
+    /// the journals in the order that you specify here.
     ///
     /// The last journal file specified will be created if it does not exist
     /// and opened for read and write. New journal events will be written to this
     /// file
     #[cfg(feature = "journal")]
-    pub fn add_journal(&mut self, journal: Arc<DynJournal>) {
-        self.journals.push(journal);
+    pub fn add_writable_journal(&mut self, journal: Arc<DynJournal>) {
+        self.writable_journals.push(journal);
+    }
+
+    pub fn get_current_dir(&mut self) -> Option<PathBuf> {
+        self.current_dir.clone()
     }
 
     pub fn set_current_dir(&mut self, dir: impl Into<PathBuf>) {
@@ -584,20 +762,24 @@ impl WasiEnvBuilder {
     /// Sets the FileSystem to be used with this WASI instance.
     ///
     /// This is usually used in case a custom `virtual_fs::FileSystem` is needed.
-    pub fn fs(mut self, fs: Box<dyn virtual_fs::FileSystem + Send + Sync>) -> Self {
+    pub fn fs(mut self, fs: impl Into<Arc<dyn virtual_fs::FileSystem + Send + Sync>>) -> Self {
         self.set_fs(fs);
         self
     }
 
-    pub fn set_fs(&mut self, fs: Box<dyn virtual_fs::FileSystem + Send + Sync>) {
-        self.fs = Some(WasiFsRoot::Backing(Arc::new(fs)));
+    pub fn set_fs(&mut self, fs: impl Into<Arc<dyn virtual_fs::FileSystem + Send + Sync>>) {
+        self.fs = Some(WasiFsRoot::Backing(fs.into()));
+    }
+
+    pub(crate) fn set_fs_root(&mut self, fs: WasiFsRoot) {
+        self.fs = Some(fs);
     }
 
     /// Sets a new sandbox FileSystem to be used with this WASI instance.
     ///
     /// This is usually used in case a custom `virtual_fs::FileSystem` is needed.
     pub fn sandbox_fs(mut self, fs: TmpFileSystem) -> Self {
-        self.fs = Some(WasiFsRoot::Sandbox(Arc::new(fs)));
+        self.fs = Some(WasiFsRoot::Sandbox(fs));
         self
     }
 
@@ -607,6 +789,17 @@ impl WasiEnvBuilder {
         self.setup_fs_fn = Some(setup_fs_fn);
 
         self
+    }
+
+    /// Sets the wasmer engine and overrides the default; only used if
+    /// a runtime override is not provided.
+    pub fn engine(mut self, engine: Engine) -> Self {
+        self.set_engine(engine);
+        self
+    }
+
+    pub fn set_engine(&mut self, engine: Engine) {
+        self.engine = Some(engine);
     }
 
     /// Sets the WASI runtime implementation and overrides the default
@@ -643,49 +836,13 @@ impl WasiEnvBuilder {
         self.snapshot_interval.replace(interval);
     }
 
-    /// Add an item to the list of importable items provided to the instance.
-    pub fn import(
-        mut self,
-        namespace: impl Into<String>,
-        name: impl Into<String>,
-        value: impl Into<Extern>,
-    ) -> Self {
-        self.add_imports([((namespace, name), value)]);
-        self
+    #[cfg(feature = "journal")]
+    pub fn with_stop_running_after_snapshot(&mut self, stop_running: bool) {
+        self.stop_running_after_snapshot = stop_running;
     }
 
-    /// Add an item to the list of importable items provided to the instance.
-    pub fn add_import(
-        &mut self,
-        namespace: impl Into<String>,
-        name: impl Into<String>,
-        value: impl Into<Extern>,
-    ) {
-        self.add_imports([((namespace, name), value)]);
-    }
-
-    pub fn add_imports<I, S1, S2, E>(&mut self, imports: I)
-    where
-        I: IntoIterator<Item = ((S1, S2), E)>,
-        S1: Into<String>,
-        S2: Into<String>,
-        E: Into<Extern>,
-    {
-        let imports = imports
-            .into_iter()
-            .map(|((ns, n), e)| ((ns.into(), n.into()), e.into()));
-        self.additional_imports.extend(imports);
-    }
-
-    pub fn imports<I, S1, S2, E>(mut self, imports: I) -> Self
-    where
-        I: IntoIterator<Item = ((S1, S2), E)>,
-        S1: Into<String>,
-        S2: Into<String>,
-        E: Into<Extern>,
-    {
-        self.add_imports(imports);
-        self
+    pub fn with_skip_stdio_during_bootstrap(&mut self, skip: bool) {
+        self.skip_stdio_during_bootstrap = skip;
     }
 
     /// Consumes the [`WasiEnvBuilder`] and produces a [`WasiEnvInit`], which
@@ -694,7 +851,7 @@ impl WasiEnvBuilder {
     /// Returns the error from `WasiFs::new` if there's an error
     ///
     /// NOTE: You should prefer to not work directly with [`WasiEnvInit`].
-    /// Use [`WasiEnvBuilder::run`] or [`WasiEnvBuilder::run_with_store`] instead
+    /// Use [`WasiEnvBuilder::build`] or [`WasiEnvBuilder::instantiate`] instead
     /// to ensure proper invokation of WASI modules.
     pub fn build_init(mut self) -> Result<WasiEnvInit, WasiStateCreationError> {
         for arg in self.args.iter() {
@@ -722,23 +879,20 @@ impl WasiEnvBuilder {
             }) {
                 Some(InvalidCharacter::Nul) => {
                     return Err(WasiStateCreationError::EnvironmentVariableFormatError(
-                        format!("found nul byte in env var key \"{}\" (key=value)", env_key),
-                    ))
+                        format!("found nul byte in env var key \"{env_key}\" (key=value)"),
+                    ));
                 }
 
                 Some(InvalidCharacter::Equal) => {
                     return Err(WasiStateCreationError::EnvironmentVariableFormatError(
-                        format!(
-                            "found equal sign in env var key \"{}\" (key=value)",
-                            env_key
-                        ),
-                    ))
+                        format!("found equal sign in env var key \"{env_key}\" (key=value)"),
+                    ));
                 }
 
                 None => (),
             }
 
-            if env_value.iter().any(|&ch| ch == 0) {
+            if env_value.contains(&0) {
                 return Err(WasiStateCreationError::EnvironmentVariableFormatError(
                     format!(
                         "found nul byte in env var value \"{}\" (key=value)",
@@ -747,13 +901,6 @@ impl WasiEnvBuilder {
                 ));
             }
         }
-
-        // TODO: must be used! (runtime was removed from env, must ensure configured runtime is used)
-        // // Get a reference to the runtime
-        // let runtime = self
-        //     .runtime
-        //     .clone()
-        //     .unwrap_or_else(|| Arc::new(PluggableRuntimeImplementation::default()));
 
         // Determine the STDIN
         let stdin: Box<dyn VirtualFile + Send + Sync + 'static> = self
@@ -764,7 +911,7 @@ impl WasiEnvBuilder {
         let fs_backing = self
             .fs
             .take()
-            .unwrap_or_else(|| WasiFsRoot::Sandbox(Arc::new(TmpFileSystem::new())));
+            .unwrap_or_else(|| WasiFsRoot::Sandbox(TmpFileSystem::new()));
 
         if let Some(dir) = &self.current_dir {
             match fs_backing.read_dir(dir) {
@@ -781,7 +928,7 @@ impl WasiEnvBuilder {
                 }
                 Err(err) => {
                     return Err(WasiStateCreationError::WasiFsSetupError(format!(
-                        "Could check specified current directory at '{}': {err}",
+                        "Could not check specified current directory at '{}': {err}",
                         dir.display()
                     )));
                 }
@@ -829,15 +976,20 @@ impl WasiEnvBuilder {
             wasi_fs.set_current_dir(s);
         }
 
+        for id in &self.included_packages {
+            wasi_fs.has_unioned.lock().unwrap().insert(id.clone());
+        }
+
         let state = WasiState {
             fs: wasi_fs,
-            secret: rand::thread_rng().gen::<[u8; 32]>(),
+            secret: rand::rng().random::<[u8; 32]>(),
             inodes,
-            args: self.args.clone(),
+            args: std::sync::Mutex::new(self.args.clone()),
             preopen: self.vfs_preopens.clone(),
             futexs: Default::default(),
             clock_offset: Default::default(),
             envs: std::sync::Mutex::new(conv_env_vars(self.envs)),
+            signals: std::sync::Mutex::new(self.signals.iter().map(|s| (s.sig, s.disp)).collect()),
         };
 
         let runtime = self.runtime.unwrap_or_else(|| {
@@ -845,9 +997,26 @@ impl WasiEnvBuilder {
             {
                 #[allow(unused_mut)]
                 let mut runtime = crate::runtime::PluggableRuntime::new(Arc::new(crate::runtime::task_manager::tokio::TokioTaskManager::default()));
+                runtime.set_engine(
+                    self
+                        .engine
+                        .as_ref()
+                        .expect(
+                            "Neither a runtime nor an engine was provided to WasiEnvBuilder. \
+                            This is not supported because it means the module that's going to \
+                            run with the resulting WasiEnv will have been loaded using a \
+                            different engine than the one that will exist within the WasiEnv. \
+                            Use either `set_runtime` or `set_engine` before calling `build_init`.",
+                        )
+                        .clone()
+                );
                 #[cfg(feature = "journal")]
-                for journal in self.journals.clone() {
-                    runtime.add_journal(journal);
+                for journal in self.read_only_journals.clone() {
+                    runtime.add_read_only_journal(journal);
+                }
+                #[cfg(feature = "journal")]
+                for journal in self.writable_journals.clone() {
+                    runtime.add_writable_journal(journal);
                 }
                 Arc::new(runtime)
             }
@@ -860,8 +1029,16 @@ impl WasiEnvBuilder {
 
         let uses = self.uses;
         let map_commands = self.map_commands;
+        let disable_default_builtins = self.disable_default_builtins;
+        let builtin_commands = self.builtin_commands;
 
-        let bin_factory = BinFactory::new(runtime.clone());
+        let mut bin_factory = BinFactory::new(runtime.clone());
+        if disable_default_builtins {
+            bin_factory.clear_builtin_commands();
+        }
+        for (path, command) in builtin_commands {
+            bin_factory.register_builtin_command_with_path_shared(command, path);
+        }
 
         let capabilities = self.capabilites;
 
@@ -884,14 +1061,17 @@ impl WasiEnvBuilder {
             process: None,
             thread: None,
             #[cfg(feature = "journal")]
-            call_initialize: self.journals.is_empty(),
+            call_initialize: self.read_only_journals.is_empty()
+                && self.writable_journals.is_empty(),
             #[cfg(not(feature = "journal"))]
             call_initialize: true,
             can_deep_sleep: false,
             extra_tracing: true,
             #[cfg(feature = "journal")]
             snapshot_on: self.snapshot_on,
-            additional_imports: self.additional_imports,
+            #[cfg(feature = "journal")]
+            stop_running_after_snapshot: self.stop_running_after_snapshot,
+            skip_stdio_during_bootstrap: self.skip_stdio_during_bootstrap,
         };
 
         Ok(init)
@@ -943,98 +1123,18 @@ impl WasiEnvBuilder {
         store: &mut impl AsStoreMut,
     ) -> Result<(Instance, WasiFunctionEnv), WasiRuntimeError> {
         let init = self.build_init()?;
-        WasiEnv::instantiate(init, module, module_hash, store)
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn run(self, module: Module) -> Result<(), WasiRuntimeError> {
-        self.run_ext(module, ModuleHash::random())
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn run_ext(self, module: Module, module_hash: ModuleHash) -> Result<(), WasiRuntimeError> {
-        let mut store = wasmer::Store::default();
-        self.run_with_store_ext(module, module_hash, &mut store)
-    }
-
-    #[allow(clippy::result_large_err)]
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub fn run_with_store(self, module: Module, store: &mut Store) -> Result<(), WasiRuntimeError> {
-        self.run_with_store_ext(module, ModuleHash::random(), store)
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn run_with_store_ext(
-        self,
-        module: Module,
-        module_hash: ModuleHash,
-        store: &mut Store,
-    ) -> Result<(), WasiRuntimeError> {
-        // If no handle or runtime exists then create one
-        #[cfg(feature = "sys-thread")]
-        let _guard = if tokio::runtime::Handle::try_current().is_err() {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            Some(runtime)
-        } else {
-            None
-        };
-        #[cfg(feature = "sys-thread")]
-        let _guard = _guard.as_ref().map(|r| r.enter());
-
-        if self.capabilites.threading.enable_asynchronous_threading {
-            tracing::warn!(
-                "The enable_asynchronous_threading capability is enabled. Use WasiEnvBuilder::run_with_store_async() to avoid spurious errors.",
-            );
-        }
-
-        let (instance, env) = self.instantiate_ext(module, module_hash, store)?;
-
-        // Bootstrap the process
-        // Unsafe: The bootstrap must be executed in the same thread that runs the
-        //         actual WASM code
-        let rewind_state = unsafe { env.bootstrap(store)? };
-        if rewind_state.is_some() {
-            let mut ctx = env.env.clone().into_mut(store);
-            rewind_ext2(&mut ctx, rewind_state)
-                .map_err(|exit| WasiRuntimeError::Wasi(WasiError::Exit(exit)))?;
-        }
-
-        let start = instance.exports.get_function("_start")?;
-        env.data(&store).thread.set_status_running();
-
-        let result = crate::run_wasi_func_start(start, store);
-        let (result, exit_code) = super::wasi_exit_code(result);
-
-        let pid = env.data(&store).pid();
-        let tid = env.data(&store).tid();
-        tracing::trace!(
-            %pid,
-            %tid,
-            %exit_code,
-            error=result.as_ref().err().map(|e| e as &dyn std::error::Error),
-            "main exit",
-        );
-
-        env.on_exit(store, Some(exit_code));
-
-        result
-    }
-
-    /// Start the WASI executable with async threads enabled.
-    #[allow(clippy::result_large_err)]
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub fn run_with_store_async(
-        self,
-        module: Module,
-        module_hash: ModuleHash,
-        mut store: Store,
-    ) -> Result<(), WasiRuntimeError> {
-        let (_, env) = self.instantiate_ext(module, module_hash, &mut store)?;
-        env.run_async(store)?;
-        Ok(())
+        let call_init = init.call_initialize;
+        let env = WasiEnv::from_init(init, module_hash)?;
+        let memory = module
+            .imports()
+            .find_map(|i| match i.ty() {
+                wasmer::ExternType::Memory(ty) => Some(*ty),
+                _ => None,
+            })
+            .map(|ty| wasmer::Memory::new(store, ty))
+            .transpose()
+            .map_err(WasiThreadError::MemoryCreateFailed)?;
+        Ok(env.instantiate(module, store, memory, true, call_init, None)?)
     }
 }
 
@@ -1160,6 +1260,62 @@ impl PreopenDirBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{
+        SpawnError,
+        os::{
+            command::{BuiltinCommand, VirtualCommand},
+            task::{OwnedTaskStatus, TaskJoinHandle},
+        },
+    };
+    use wasmer::FunctionEnvMut;
+    use wasmer_wasix_types::wasi::Errno;
+
+    fn enter_tokio_runtime() -> Option<tokio::runtime::Runtime> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            return Some(runtime);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestBuiltinCommand {
+        name: &'static str,
+    }
+
+    impl TestBuiltinCommand {
+        fn new(name: &'static str) -> Self {
+            Self { name }
+        }
+    }
+
+    impl VirtualCommand for TestBuiltinCommand {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn exec(
+            &self,
+            _parent_ctx: &FunctionEnvMut<'_, WasiEnv>,
+            _path: &str,
+            _config: &mut Option<WasiEnv>,
+        ) -> Result<TaskJoinHandle, SpawnError> {
+            let handle = OwnedTaskStatus::new_finished_with_code(Errno::Success.into()).handle();
+            Ok(handle)
+        }
+    }
 
     #[test]
     fn env_var_errors() {
@@ -1191,15 +1347,6 @@ mod test {
             "nul in key must be invalid"
         );
 
-        // `=` in the value is valid.
-        assert!(
-            WasiEnvBuilder::new("test_prog")
-                .env("HOME", "/home/home=home")
-                .build_init()
-                .is_ok(),
-            "equal sign in the value must be valid"
-        );
-
         // `\0` in the value is invalid.
         assert!(
             WasiEnvBuilder::new("test_prog")
@@ -1207,6 +1354,16 @@ mod test {
                 .build_init()
                 .is_err(),
             "nul in value must be invalid"
+        );
+
+        // `=` in the value is valid.
+        assert!(
+            WasiEnvBuilder::new("test_prog")
+                .env("HOME", "/home/home=home")
+                .engine(Engine::default())
+                .build_init()
+                .is_ok(),
+            "equal sign in the value must be valid"
         );
     }
 
@@ -1229,5 +1386,82 @@ mod test {
             err,
             WasiStateCreationError::ArgumentContainsNulByte(_)
         ));
+    }
+
+    #[test]
+    fn custom_builtin_command_uses_default_bin_path() {
+        let runtime = enter_tokio_runtime();
+        let _guard = runtime.as_ref().map(|rt| rt.enter());
+
+        let init = WasiEnvBuilder::new("test_prog")
+            .engine(Engine::default())
+            .builtin_command(TestBuiltinCommand::new("custom"))
+            .build_init()
+            .unwrap();
+
+        assert!(init.bin_factory.commands.exists("/bin/custom"));
+    }
+
+    #[test]
+    fn custom_builtin_command_supports_custom_path() {
+        let runtime = enter_tokio_runtime();
+        let _guard = runtime.as_ref().map(|rt| rt.enter());
+
+        let init = WasiEnvBuilder::new("test_prog")
+            .engine(Engine::default())
+            .builtin_command_with_path(TestBuiltinCommand::new("custom"), "/custom/bin/custom")
+            .build_init()
+            .unwrap();
+
+        assert!(init.bin_factory.commands.exists("/custom/bin/custom"));
+    }
+
+    #[test]
+    fn can_disable_default_builtin_commands() {
+        let runtime = enter_tokio_runtime();
+        let _guard = runtime.as_ref().map(|rt| rt.enter());
+
+        let init = WasiEnvBuilder::new("test_prog")
+            .engine(Engine::default())
+            .disable_default_builtins(true)
+            .build_init()
+            .unwrap();
+
+        assert!(!init.bin_factory.commands.exists("/bin/wasmer"));
+    }
+
+    #[test]
+    fn builtin_command_registration_overwrites_existing_path() {
+        let runtime = enter_tokio_runtime();
+        let _guard = runtime.as_ref().map(|rt| rt.enter());
+
+        let init = WasiEnvBuilder::new("test_prog")
+            .engine(Engine::default())
+            .builtin_command_with_path(TestBuiltinCommand::new("first"), "/bin/custom")
+            .builtin_command_with_path(TestBuiltinCommand::new("second"), "/bin/custom")
+            .build_init()
+            .unwrap();
+
+        let command = init.bin_factory.commands.get("/bin/custom").unwrap();
+        assert_eq!(command.name(), "second");
+    }
+
+    #[test]
+    fn closure_based_builtin_command_can_be_registered() {
+        let runtime = enter_tokio_runtime();
+        let _guard = runtime.as_ref().map(|rt| rt.enter());
+
+        let command = BuiltinCommand::new("closure", |_parent_ctx, _path, _config| {
+            let handle = OwnedTaskStatus::new_finished_with_code(Errno::Success.into()).handle();
+            Ok(handle)
+        });
+
+        let init = WasiEnvBuilder::new("test_prog")
+            .engine(Engine::default())
+            .builtin_command(command)
+            .build_init()
+            .unwrap();
+
+        assert!(init.bin_factory.commands.exists("/bin/closure"));
     }
 }

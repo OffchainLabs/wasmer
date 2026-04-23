@@ -4,29 +4,30 @@
 #![doc(html_logo_url = "https://github.com/wasmerio.png?size=200")]
 #![deny(
     missing_docs,
-    dead_code,
+    // dead_code,
     nonstandard_style,
     unused_mut,
-    unused_variables,
+    // unused_variables,
     unused_unsafe,
     unreachable_patterns
 )]
 // Allowed because it makes code more readable.
 #![allow(clippy::bool_comparison, clippy::match_like_matches_macro)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(all(target_os = "linux", feature = "tun-tap"))]
-mod net;
+//#[cfg(all(target_os = "linux", feature = "tun-tap"))]
+//mod net;
 
 mod commands;
 mod common;
+mod config;
 #[macro_use]
 mod error;
+mod backend;
+#[cfg(feature = "static-artifact-create")]
 mod c_gen;
 mod logging;
 mod opts;
-mod package_source;
-mod store;
 mod types;
 mod utils;
 

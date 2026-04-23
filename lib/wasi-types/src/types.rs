@@ -4,7 +4,7 @@
 //! Wasmer's WASI types implementation.
 //!
 //! Those types aim at being used by [the `wasmer-wasi`
-//! crate](https://github.com/wasmerio/wasmer/blob/master/lib/wasi).
+//! crate](https://github.com/wasmerio/wasmer/blob/main/lib/wasi).
 
 // Needed for #[derive(ValueType)]
 extern crate wasmer_types as wasmer;
@@ -41,7 +41,7 @@ pub mod file {
                 right_set.insert(cur_right.to_str().unwrap_or("INVALID RIGHT"));
             }
         }
-        println!("{:#?}", right_set);
+        println!("{right_set:#?}");
     }
 }
 
@@ -280,6 +280,9 @@ pub mod net {
     pub const __WASI_SOCK_RECV_INPUT_PEEK: RiFlags = 1 << 0;
     pub const __WASI_SOCK_RECV_INPUT_WAITALL: RiFlags = 1 << 1;
     pub const __WASI_SOCK_RECV_INPUT_DATA_TRUNCATED: RiFlags = 1 << 2;
+    pub const __WASI_SOCK_RECV_INPUT_DONT_WAIT: RiFlags = 1 << 3;
+
+    pub const __WASI_SOCK_SEND_INPUT_DONT_WAIT: SiFlags = 1 << 0;
 
     pub const __WASI_SOCK_RECV_OUTPUT_DATA_TRUNCATED: RoFlags = 1 << 0;
 

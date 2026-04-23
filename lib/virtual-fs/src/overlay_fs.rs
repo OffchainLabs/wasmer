@@ -13,8 +13,8 @@ use replace_with::replace_with_or_abort;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 use crate::{
-    ops, FileOpener, FileSystem, FileSystems, FsError, Metadata, OpenOptions, OpenOptionsConfig,
-    ReadDir, VirtualFile,
+    FileOpener, FileSystem, FileSystems, FsError, Metadata, OpenOptions, OpenOptionsConfig,
+    ReadDir, VirtualFile, ops,
 };
 
 /// A primary filesystem and chain of secondary filesystems that are overlayed
@@ -48,9 +48,9 @@ use crate::{
 ///     .enable_all()
 ///     .build()
 ///     .unwrap();
-///     let _guard = runtime.enter();
+/// let _guard = runtime.enter();
 ///
-/// let fs = OverlayFileSystem::new(MemFS::default(), [HostFS::default()]);
+/// let fs = OverlayFileSystem::new(MemFS::default(), [HostFS::new(tokio::runtime::Handle::current(), "/").unwrap()]);
 ///
 /// // This also has the benefit of storing the two values in-line with no extra
 /// // overhead or indirection.
@@ -113,6 +113,35 @@ where
     S: for<'a> FileSystems<'a> + Send + Sync + 'static,
     for<'a> <<S as FileSystems<'a>>::Iter as IntoIterator>::IntoIter: Send,
 {
+    fn readlink(&self, path: &Path) -> crate::Result<PathBuf> {
+        // Whiteout files can not be read, they are just markers
+        if ops::is_white_out(path).is_some() {
+            return Err(FsError::EntryNotFound);
+        }
+
+        // Check if the file is in the primary
+        match self.primary.readlink(path) {
+            Ok(meta) => return Ok(meta),
+            Err(e) if should_continue(e) => {}
+            Err(e) => return Err(e),
+        }
+
+        // There might be a whiteout, search for this
+        if ops::has_white_out(&self.primary, path) {
+            return Err(FsError::EntryNotFound);
+        }
+
+        // Otherwise scan the secondaries
+        for fs in self.secondaries.filesystems() {
+            match fs.readlink(path) {
+                Err(e) if should_continue(e) => continue,
+                other => return other,
+            }
+        }
+
+        Err(FsError::EntryNotFound)
+    }
+
     fn read_dir(&self, path: &Path) -> Result<ReadDir, FsError> {
         let mut entries = Vec::new();
         let mut had_at_least_one_success = false;
@@ -181,10 +210,10 @@ where
         // Make sure the parent tree is in place on the primary, this is to cover the
         // scenario where the secondaries has a parent structure that is not yet in the
         // primary and the primary needs it to create a sub-directory
-        if let Some(parent) = path.parent() {
-            if self.read_dir(parent).is_ok() {
-                ops::create_dir_all(&self.primary, parent).ok();
-            }
+        if let Some(parent) = path.parent()
+            && self.read_dir(parent).is_ok()
+        {
+            ops::create_dir_all(&self.primary, parent).ok();
         }
 
         // Create the directory in the primary
@@ -328,6 +357,35 @@ where
         Err(FsError::EntryNotFound)
     }
 
+    fn symlink_metadata(&self, path: &Path) -> crate::Result<Metadata> {
+        // Whiteout files can not be read, they are just markers
+        if ops::is_white_out(path).is_some() {
+            return Err(FsError::EntryNotFound);
+        }
+
+        // Check if the file is in the primary
+        match self.primary.symlink_metadata(path) {
+            Ok(meta) => return Ok(meta),
+            Err(e) if should_continue(e) => {}
+            Err(e) => return Err(e),
+        }
+
+        // There might be a whiteout, search for this
+        if ops::has_white_out(&self.primary, path) {
+            return Err(FsError::EntryNotFound);
+        }
+
+        // Otherwise scan the secondaries
+        for fs in self.secondaries.filesystems() {
+            match fs.symlink_metadata(path) {
+                Err(e) if should_continue(e) => continue,
+                other => return other,
+            }
+        }
+
+        Err(FsError::EntryNotFound)
+    }
+
     fn remove_file(&self, path: &Path) -> Result<(), FsError> {
         // It is not possible to delete whiteout files directly, instead
         // one must delete the original file
@@ -355,6 +413,15 @@ where
 
     fn new_open_options(&self) -> OpenOptions<'_> {
         OpenOptions::new(self)
+    }
+
+    fn mount(
+        &self,
+        _name: String,
+        _path: &Path,
+        _fs: Box<dyn FileSystem + Send + Sync>,
+    ) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
     }
 }
 
@@ -459,10 +526,10 @@ where
         // If we are creating the file then do so
         if conf.create {
             // Create the parent structure and remove any whiteouts
-            if let Some(parent) = path.parent() {
-                if ops::exists(self, parent) {
-                    ops::create_dir_all(&self.primary, parent)?;
-                }
+            if let Some(parent) = path.parent()
+                && ops::exists(self, parent)
+            {
+                ops::create_dir_all(&self.primary, parent)?;
             }
             ops::remove_white_out(&self.primary, path);
 
@@ -712,7 +779,7 @@ where
                             };
                         }
                     }
-                    // Now once the the restoration of the seek position completes we set the copied state
+                    // Now once the restoration of the seek position completes we set the copied state
                     CowState::SeekingRestore { mut dst } => {
                         match Pin::new(dst.as_mut()).poll_complete(cx) {
                             Poll::Ready(_) => {
@@ -755,7 +822,10 @@ where
 
         fn poll_copy_start_and_progress(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
             replace_with_or_abort(&mut self.state, |state| match state {
-                CowState::ReadOnly(inner) => CowState::SeekingGet(inner),
+                CowState::ReadOnly(inner) => {
+                    tracing::trace!("COW file touched, starting file clone");
+                    CowState::SeekingGet(inner)
+                }
                 state => state,
             });
             self.poll_copy_progress(cx)
@@ -900,22 +970,33 @@ where
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> Poll<Result<(), std::io::Error>> {
-            match self.poll_copy_start_and_progress(cx) {
+            match self.poll_copy_progress(cx) {
                 Poll::Ready(Ok(())) => {}
-                p => return p,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
-            Pin::new(self.state.as_mut()).poll_flush(cx)
+            // The file may actually be read-only and not support flush operations
+            // at all, and there's nothing to flush in read-only state anyway.
+            match self.state {
+                CowState::ReadOnly(_) => Poll::Ready(Ok(())),
+                _ => Pin::new(self.state.as_mut()).poll_flush(cx),
+            }
         }
 
         fn poll_shutdown(
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> Poll<Result<(), std::io::Error>> {
-            match self.poll_copy_start_and_progress(cx) {
+            match self.poll_copy_progress(cx) {
                 Poll::Ready(Ok(())) => {}
-                p => return p,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
-            Pin::new(self.state.as_mut()).poll_shutdown(cx)
+            // Same deal as flush above
+            match self.state {
+                CowState::ReadOnly(_) => Poll::Ready(Ok(())),
+                _ => Pin::new(self.state.as_mut()).poll_shutdown(cx),
+            }
         }
     }
 
@@ -1012,7 +1093,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         struct IterFilesystems<'a, S>(&'a S);
-        impl<'a, S> Debug for IterFilesystems<'a, S>
+        impl<S> Debug for IterFilesystems<'_, S>
         where
             S: for<'b> FileSystems<'b>,
         {
@@ -1047,17 +1128,46 @@ fn should_continue(e: FsError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
-
-    use bytes::Bytes;
-    use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    use webc::v1::{ParseOptions, WebCOwned};
+    use std::path::PathBuf;
 
     use super::*;
-    use crate::{mem_fs::FileSystem as MemFS, webc_fs::WebcFileSystem, RootFileSystemBuilder};
+    use crate::{TmpFileSystem, mem_fs::FileSystem as MemFS};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-    const PYTHON: &[u8] = include_bytes!("../../c-api/examples/assets/python-0.1.0.wasmer");
+    #[test]
+    fn overlay_read_dir_rebases_mounted_entries() {
+        let primary = TmpFileSystem::new();
+        ops::create_dir_all(&primary, "/app").unwrap();
+
+        let volume = MemFS::default();
+        ops::create_dir_all(&volume, "/themes/twentytwentyfour").unwrap();
+
+        let container = MemFS::default();
+        ops::create_dir_all(&container, "/app/wp-content/themes/twentytwentyfour").unwrap();
+
+        let volume: Arc<dyn FileSystem + Send + Sync> = Arc::new(volume);
+        primary
+            .mount(
+                PathBuf::from("/app/wp-content"),
+                &volume,
+                PathBuf::from("/"),
+            )
+            .unwrap();
+
+        let overlay = OverlayFileSystem::new(primary, [container]);
+
+        let mut entries: Vec<_> = overlay
+            .read_dir(Path::new("/app/wp-content/themes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path)
+            .collect();
+        entries.sort();
+
+        assert_eq!(
+            entries,
+            vec![PathBuf::from("/app/wp-content/themes/twentytwentyfour")],
+        );
+    }
 
     #[tokio::test]
     async fn remove_directory() {
@@ -1196,160 +1306,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wasi_runner_use_case() {
-        // Set up some dummy files on the host
-        let temp = TempDir::new().unwrap();
-        let first = temp.path().join("first");
-        let file_txt = first.join("file.txt");
-        let second = temp.path().join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::write(&file_txt, b"First!").unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        // configure the union FS so things are saved in memory by default
-        // (initialized with a set of unix-like folders), but certain folders
-        // are first to the host.
-        let primary = RootFileSystemBuilder::new().build();
-        let host_fs: Arc<dyn FileSystem + Send + Sync> =
-            Arc::new(crate::host_fs::FileSystem::default());
-        let first_dirs = [(&first, "/first"), (&second, "/second")];
-        for (host, guest) in first_dirs {
-            primary
-                .mount(PathBuf::from(guest), &host_fs, host.clone())
-                .unwrap();
-        }
-        // Set up the secondary file systems
-        let webc = WebCOwned::parse(Bytes::from_static(PYTHON), &ParseOptions::default()).unwrap();
-        let webc = WebcFileSystem::init_all(Arc::new(webc));
-
-        let fs = OverlayFileSystem::new(primary, [webc]);
-
-        // We should get all the normal directories from rootfs (primary)
-        assert!(ops::is_dir(&fs, "/lib"));
-        assert!(ops::is_dir(&fs, "/bin"));
-        assert!(ops::is_file(&fs, "/dev/stdin"));
-        assert!(ops::is_file(&fs, "/dev/stdout"));
-        // We also want to see files from the WEBC volumes (secondary)
-        assert!(ops::is_dir(&fs, "/lib/python3.6"));
-        assert!(ops::is_file(&fs, "/lib/python3.6/collections/__init__.py"));
-        #[cfg(never)]
-        {
-            // files on a secondary fs aren't writable
-            // TODO(Michael-F-Bryan): re-enable this if/when we fix
-            // open_readonly_file_hack()
-            assert_eq!(
-                fs.new_open_options()
-                    .append(true)
-                    .open("/lib/python3.6/collections/__init__.py")
-                    .unwrap_err(),
-                FsError::PermissionDenied,
-            );
-        }
-        // you are allowed to create files that look like they are in a secondary
-        // folder, though
-        ops::touch(&fs, "/lib/python3.6/collections/something-else.py").unwrap();
-        // But it'll be on the primary filesystem, not the secondary one
-        assert!(ops::is_file(
-            &fs.primary,
-            "/lib/python3.6/collections/something-else.py"
-        ));
-        assert!(!ops::is_file(
-            &fs.secondaries[0],
-            "/lib/python3.6/collections/something-else.py"
-        ));
-        // You can do the same thing with folders
-        fs.create_dir("/lib/python3.6/something-else".as_ref())
-            .unwrap();
-        assert!(ops::is_dir(&fs.primary, "/lib/python3.6/something-else"));
-        assert!(!ops::is_dir(
-            &fs.secondaries[0],
-            "/lib/python3.6/something-else"
-        ));
-        // It only works when you are directly inside an existing directory
-        // on the secondary filesystem, though
-        assert_eq!(
-            ops::touch(&fs, "/lib/python3.6/collections/this/doesnt/exist.txt").unwrap_err(),
-            FsError::EntryNotFound
-        );
-        // you should also be able to read files mounted from the host
-        assert!(ops::is_dir(&fs, "/first"));
-        assert!(ops::is_file(&fs, "/first/file.txt"));
-        assert_eq!(
-            ops::read_to_string(&fs, "/first/file.txt").await.unwrap(),
-            "First!"
-        );
-        // Overwriting them is fine and we'll see the changes on the host
-        ops::write(&fs, "/first/file.txt", "Updated").await.unwrap();
-        assert_eq!(std::fs::read_to_string(&file_txt).unwrap(), "Updated");
-        // The filesystem will see changes on the host that happened after it was
-        // set up
-        let another = second.join("another.txt");
-        std::fs::write(&another, "asdf").unwrap();
-        assert_eq!(
-            ops::read_to_string(&fs, "/second/another.txt")
-                .await
-                .unwrap(),
-            "asdf"
-        );
-    }
-
-    fn load_webc(bytes: &'static [u8]) -> WebcFileSystem<WebCOwned> {
-        let options = ParseOptions::default();
-        let webc = WebCOwned::parse(bytes, &options).unwrap();
-        WebcFileSystem::init_all(Arc::new(webc))
-    }
-
-    #[track_caller]
-    fn assert_same_directory_contents(
-        original: &dyn FileSystem,
-        path: impl AsRef<Path>,
-        candidate: &dyn FileSystem,
-    ) {
-        let path = path.as_ref();
-
-        let original_entries: Vec<_> = original
-            .read_dir(path)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        let candidate_entries: Vec<_> = candidate
-            .read_dir(path)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-
-        assert_eq!(original_entries, candidate_entries);
-    }
-
-    #[tokio::test]
-    async fn absolute_and_relative_paths_are_passed_through() {
-        let python = Arc::new(load_webc(PYTHON));
-
-        // The underlying filesystem doesn't care about absolute/relative paths
-        assert_eq!(python.read_dir("/lib".as_ref()).unwrap().count(), 4);
-        assert_eq!(python.read_dir("lib".as_ref()).unwrap().count(), 4);
-
-        // read_dir() should be passed through to the primary
-        let webc_primary =
-            OverlayFileSystem::new(Arc::clone(&python), [crate::EmptyFileSystem::default()]);
-        assert_same_directory_contents(&python, "/lib", &webc_primary);
-        assert_same_directory_contents(&python, "lib", &webc_primary);
-
-        // read_dir() should also be passed through to the secondary
-        let webc_secondary =
-            OverlayFileSystem::new(crate::EmptyFileSystem::default(), [Arc::clone(&python)]);
-        assert_same_directory_contents(&python, "/lib", &webc_secondary);
-        assert_same_directory_contents(&python, "lib", &webc_secondary);
-
-        // It should be fine to overlay the root fs on top of our webc file
-        let overlay_rootfs = OverlayFileSystem::new(
-            RootFileSystemBuilder::default().build(),
-            [Arc::clone(&python)],
-        );
-        assert_same_directory_contents(&python, "/lib", &overlay_rootfs);
-        assert_same_directory_contents(&python, "lib", &overlay_rootfs);
-    }
-
-    #[tokio::test]
     async fn open_secondary_fs_files_in_write_mode() {
         let primary = MemFS::default();
         let secondary = MemFS::default();
@@ -1375,7 +1331,7 @@ mod tests {
         f.set_len(0).unwrap();
         assert_eq!(f.write(b"Hi").await.unwrap(), 2);
         // Same with flushing
-        assert_eq!(f.flush().await.unwrap(), (),);
+        assert_eq!(f.flush().await.unwrap(), ());
 
         // if we now read it then the data should be different
         buf = String::new();
@@ -1627,4 +1583,186 @@ mod tests {
             FsError::EntryNotFound
         )
     }
+
+    /// Make sure files that are never written are not copied to the primary,
+    /// even when opened with write permissions.
+    /// Regression test for https://github.com/wasmerio/wasmer/issues/5445
+    #[tokio::test]
+    async fn test_overlayfs_readonly_files_not_copied() {
+        let primary = MemFS::default();
+        let secondary = MemFS::default();
+        ops::create_dir_all(&secondary, "/secondary").unwrap();
+        ops::write(&secondary, "/secondary/file.txt", b"Hello, World!")
+            .await
+            .unwrap();
+
+        let fs = OverlayFileSystem::new(primary, [secondary]);
+
+        {
+            let mut f = fs
+                .new_open_options()
+                .read(true)
+                .write(true)
+                .open(Path::new("/secondary/file.txt"))
+                .unwrap();
+            let mut s = String::new();
+            f.read_to_string(&mut s).await.unwrap();
+            assert_eq!(s, "Hello, World!");
+
+            f.flush().await.unwrap();
+            f.shutdown().await.unwrap();
+        }
+
+        // Primary should not have the file
+        assert!(!ops::is_file(&fs.primary, "/secondary/file.txt"));
+    }
+
+    // OLD tests that used WebcFileSystem.
+    // Should be re-implemented with WebcVolumeFs
+    // #[tokio::test]
+    // async fn wasi_runner_use_case() {
+    //     // Set up some dummy files on the host
+    //     let temp = TempDir::new().unwrap();
+    //     let first = temp.path().join("first");
+    //     let file_txt = first.join("file.txt");
+    //     let second = temp.path().join("second");
+    //     std::fs::create_dir_all(&first).unwrap();
+    //     std::fs::write(&file_txt, b"First!").unwrap();
+    //     std::fs::create_dir_all(&second).unwrap();
+    //     // configure the union FS so things are saved in memory by default
+    //     // (initialized with a set of unix-like folders), but certain folders
+    //     // are first to the host.
+    //     let primary = RootFileSystemBuilder::new().build();
+    //     let host_fs: Arc<dyn FileSystem + Send + Sync> =
+    //         Arc::new(crate::host_fs::FileSystem::default());
+    //     let first_dirs = [(&first, "/first"), (&second, "/second")];
+    //     for (host, guest) in first_dirs {
+    //         primary
+    //             .mount(PathBuf::from(guest), &host_fs, host.clone())
+    //             .unwrap();
+    //     }
+    //     // Set up the secondary file systems
+    //     let webc = WebCOwned::parse(Bytes::from_static(PYTHON), &ParseOptions::default()).unwrap();
+    //     let webc = WebcFileSystem::init_all(Arc::new(webc));
+    //
+    //     let fs = OverlayFileSystem::new(primary, [webc]);
+    //
+    //     // We should get all the normal directories from rootfs (primary)
+    //     assert!(ops::is_dir(&fs, "/lib"));
+    //     assert!(ops::is_dir(&fs, "/bin"));
+    //     assert!(ops::is_file(&fs, "/dev/stdin"));
+    //     assert!(ops::is_file(&fs, "/dev/stdout"));
+    //     // We also want to see files from the WEBC volumes (secondary)
+    //     assert!(ops::is_dir(&fs, "/lib/python3.6"));
+    //     assert!(ops::is_file(&fs, "/lib/python3.6/collections/__init__.py"));
+    //     #[cfg(never)]
+    //     {
+    //         // files on a secondary fs aren't writable
+    //         // TODO(Michael-F-Bryan): re-enable this if/when we fix
+    //         // open_readonly_file_hack()
+    //         assert_eq!(
+    //             fs.new_open_options()
+    //                 .append(true)
+    //                 .open("/lib/python3.6/collections/__init__.py")
+    //                 .unwrap_err(),
+    //             FsError::PermissionDenied,
+    //         );
+    //     }
+    //     // you are allowed to create files that look like they are in a secondary
+    //     // folder, though
+    //     ops::touch(&fs, "/lib/python3.6/collections/something-else.py").unwrap();
+    //     // But it'll be on the primary filesystem, not the secondary one
+    //     assert!(ops::is_file(
+    //         &fs.primary,
+    //         "/lib/python3.6/collections/something-else.py"
+    //     ));
+    //     assert!(!ops::is_file(
+    //         &fs.secondaries[0],
+    //         "/lib/python3.6/collections/something-else.py"
+    //     ));
+    //     // You can do the same thing with folders
+    //     fs.create_dir("/lib/python3.6/something-else".as_ref())
+    //         .unwrap();
+    //     assert!(ops::is_dir(&fs.primary, "/lib/python3.6/something-else"));
+    //     assert!(!ops::is_dir(
+    //         &fs.secondaries[0],
+    //         "/lib/python3.6/something-else"
+    //     ));
+    //     // It only works when you are directly inside an existing directory
+    //     // on the secondary filesystem, though
+    //     assert_eq!(
+    //         ops::touch(&fs, "/lib/python3.6/collections/this/doesnt/exist.txt").unwrap_err(),
+    //         FsError::EntryNotFound
+    //     );
+    //     // you should also be able to read files mounted from the host
+    //     assert!(ops::is_dir(&fs, "/first"));
+    //     assert!(ops::is_file(&fs, "/first/file.txt"));
+    //     assert_eq!(
+    //         ops::read_to_string(&fs, "/first/file.txt").await.unwrap(),
+    //         "First!"
+    //     );
+    //     // Overwriting them is fine and we'll see the changes on the host
+    //     ops::write(&fs, "/first/file.txt", "Updated").await.unwrap();
+    //     assert_eq!(std::fs::read_to_string(&file_txt).unwrap(), "Updated");
+    //     // The filesystem will see changes on the host that happened after it was
+    //     // set up
+    //     let another = second.join("another.txt");
+    //     std::fs::write(&another, "asdf").unwrap();
+    //     assert_eq!(
+    //         ops::read_to_string(&fs, "/second/another.txt")
+    //             .await
+    //             .unwrap(),
+    //         "asdf"
+    //     );
+    // }
+    //
+    // #[tokio::test]
+    // async fn absolute_and_relative_paths_are_passed_through() {
+    //     let python = Arc::new(load_webc(PYTHON));
+    //
+    //     // The underlying filesystem doesn't care about absolute/relative paths
+    //     assert_eq!(python.read_dir("/lib".as_ref()).unwrap().count(), 4);
+    //     assert_eq!(python.read_dir("lib".as_ref()).unwrap().count(), 4);
+    //
+    //     // read_dir() should be passed through to the primary
+    //     let webc_primary =
+    //         OverlayFileSystem::new(Arc::clone(&python), [crate::EmptyFileSystem::default()]);
+    //     assert_same_directory_contents(&python, "/lib", &webc_primary);
+    //     assert_same_directory_contents(&python, "lib", &webc_primary);
+    //
+    //     // read_dir() should also be passed through to the secondary
+    //     let webc_secondary =
+    //         OverlayFileSystem::new(crate::EmptyFileSystem::default(), [Arc::clone(&python)]);
+    //     assert_same_directory_contents(&python, "/lib", &webc_secondary);
+    //     assert_same_directory_contents(&python, "lib", &webc_secondary);
+    //
+    //     // It should be fine to overlay the root fs on top of our webc file
+    //     let overlay_rootfs = OverlayFileSystem::new(
+    //         RootFileSystemBuilder::default().build(),
+    //         [Arc::clone(&python)],
+    //     );
+    //     assert_same_directory_contents(&python, "/lib", &overlay_rootfs);
+    //     assert_same_directory_contents(&python, "lib", &overlay_rootfs);
+    // }
+    // #[track_caller]
+    // fn assert_same_directory_contents(
+    //     original: &dyn FileSystem,
+    //     path: impl AsRef<Path>,
+    //     candidate: &dyn FileSystem,
+    // ) {
+    //     let path = path.as_ref();
+    //
+    //     let original_entries: Vec<_> = original
+    //         .read_dir(path)
+    //         .unwrap()
+    //         .map(|r| r.unwrap())
+    //         .collect();
+    //     let candidate_entries: Vec<_> = candidate
+    //         .read_dir(path)
+    //         .unwrap()
+    //         .map(|r| r.unwrap())
+    //         .collect();
+    //
+    //     assert_eq!(original_entries, candidate_entries);
+    // }
 }

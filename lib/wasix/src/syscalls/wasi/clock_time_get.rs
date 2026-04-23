@@ -1,23 +1,35 @@
 use super::*;
 use crate::syscalls::*;
 
+// NOTE: This syscall is not instrumented since it will be logged too much,
+// hence introducing too much noise to the logs.
+
 /// ### `clock_time_get()`
 /// Get the time of the specified clock
+///
 /// Inputs:
+///
 /// - `Clockid clock_id`
-///     The ID of the clock to query
+///   The ID of the clock to query
 /// - `Timestamp precision`
-///     The maximum amount of error the reading may have
+///   The maximum amount of error the reading may have
+///
 /// Output:
+///
 /// - `Timestamp *time`
-///     The value of the clock in nanoseconds
-//#[instrument(level = "trace", skip_all, fields(?clock_id, %precision), ret)]
+///   The value of the clock in nanoseconds
+#[cfg_attr(
+    feature = "extra-logging",
+    tracing::instrument(level = "trace", skip_all, ret)
+)]
 pub fn clock_time_get<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     clock_id: Snapshot0Clockid,
     precision: Timestamp,
     time: WasmPtr<Timestamp, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
 
     let env = ctx.data();

@@ -1,12 +1,18 @@
 use std::{fmt::Debug, ops::Deref};
 
 use anyhow::Error;
-use webc::compat::Container;
+use webc::Container;
 
 use crate::{
     bin_factory::BinaryPackage,
     runtime::resolver::{PackageSummary, Resolution},
 };
+
+pub fn to_module_hash(value: webc::metadata::AtomSignature) -> wasmer_types::ModuleHash {
+    match value {
+        webc::metadata::AtomSignature::Sha256(bytes) => wasmer_types::ModuleHash::from_bytes(bytes),
+    }
+}
 
 #[async_trait::async_trait]
 pub trait PackageLoader: Send + Sync + Debug {
@@ -20,6 +26,7 @@ pub trait PackageLoader: Send + Sync + Debug {
         &self,
         root: &Container,
         resolution: &Resolution,
+        root_is_local_dir: bool,
     ) -> Result<BinaryPackage, Error>;
 }
 
@@ -37,7 +44,10 @@ where
         &self,
         root: &Container,
         resolution: &Resolution,
+        root_is_local_dir: bool,
     ) -> Result<BinaryPackage, Error> {
-        (**self).load_package_tree(root, resolution).await
+        (**self)
+            .load_package_tree(root, resolution, root_is_local_dir)
+            .await
     }
 }

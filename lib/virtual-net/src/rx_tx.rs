@@ -1,25 +1,24 @@
 use std::{
-    io,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
 use crate::Result;
-use futures_util::{future::BoxFuture, Future, Sink, SinkExt, Stream};
+use bincode::config;
+use bytes::Bytes;
+use futures_util::{Future, Sink, SinkExt, Stream, future::BoxFuture};
+#[cfg(feature = "hyper")]
+use hyper_util::rt::tokio::TokioIo;
 use serde::Serialize;
 #[cfg(feature = "tokio-tungstenite")]
 use tokio::net::TcpStream;
-use tokio::{
-    io::AsyncWrite,
-    sync::{
-        mpsc::{self, error::TrySendError},
-        oneshot,
-    },
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
 };
-use virtual_mio::InlineWaker;
 
-use crate::{io_err_into_net_error, NetworkError};
+use crate::{NetworkError, io_err_into_net_error};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RemoteTxWakers {
@@ -38,28 +37,9 @@ impl RemoteTxWakers {
     }
 }
 
-#[derive(Debug, Default)]
-struct FailOnWrite {}
-impl AsyncWrite for FailOnWrite {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Err(io::ErrorKind::ConnectionAborted.into()))
-    }
-}
-
 pub(crate) type StreamSink<T> = Pin<Box<dyn Sink<T, Error = std::io::Error> + Send + 'static>>;
 
+#[derive(derive_more::Debug)]
 pub(crate) enum RemoteTx<T>
 where
     T: Serialize,
@@ -70,6 +50,7 @@ where
         wakers: RemoteTxWakers,
     },
     Stream {
+        #[debug(ignore)]
         tx: Arc<tokio::sync::Mutex<StreamSink<T>>>,
         work: mpsc::UnboundedSender<BoxFuture<'static, ()>>,
         wakers: RemoteTxWakers,
@@ -79,7 +60,7 @@ where
         tx: Arc<
             tokio::sync::Mutex<
                 futures_util::stream::SplitSink<
-                    hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>,
+                    hyper_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
                     hyper_tungstenite::tungstenite::Message,
                 >,
             >,
@@ -134,38 +115,44 @@ where
             #[cfg(feature = "hyper")]
             RemoteTx::HyperWebSocket { tx, format, .. } => {
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Err(NetworkError::IOError);
                     }
                 };
                 let mut tx = tx.lock().await;
-                tx.send(hyper_tungstenite::tungstenite::Message::Binary(data))
-                    .await
-                    .map_err(|_| NetworkError::ConnectionAborted)
+                tx.send(hyper_tungstenite::tungstenite::Message::Binary(
+                    Bytes::from_owner(data),
+                ))
+                .await
+                .map_err(|_| NetworkError::ConnectionAborted)
             }
             #[cfg(feature = "tokio-tungstenite")]
             RemoteTx::TokioWebSocket { tx, format, .. } => {
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Err(NetworkError::IOError);
                     }
                 };
                 let mut tx = tx.lock().await;
-                tx.send(tokio_tungstenite::tungstenite::Message::Binary(data))
-                    .await
-                    .map_err(|_| NetworkError::ConnectionAborted)
+                tx.send(tokio_tungstenite::tungstenite::Message::Binary(
+                    Bytes::from_owner(data),
+                ))
+                .await
+                .map_err(|_| NetworkError::ConnectionAborted)
             }
         }
     }
@@ -237,11 +224,12 @@ where
                 }
 
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Poll::Ready(Err(NetworkError::IOError));
@@ -250,7 +238,9 @@ where
 
                 let mut job = Box::pin(async move {
                     if let Err(err) = tx_guard
-                        .send(hyper_tungstenite::tungstenite::Message::Binary(data))
+                        .send(hyper_tungstenite::tungstenite::Message::Binary(
+                            Bytes::from_owner(data),
+                        ))
                         .await
                     {
                         tracing::error!("failed to send remaining bytes for request - {}", err);
@@ -295,11 +285,12 @@ where
                 }
 
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Poll::Ready(Err(NetworkError::IOError));
@@ -308,7 +299,9 @@ where
 
                 let mut job = Box::pin(async move {
                     if let Err(err) = tx_guard
-                        .send(tokio_tungstenite::tungstenite::Message::Binary(data))
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            Bytes::from_owner(data),
+                        ))
                         .await
                     {
                         tracing::error!("failed to send remaining bytes for request - {}", err);
@@ -359,8 +352,7 @@ where
                     }
                 };
 
-                let inline_waker = InlineWaker::new();
-                let waker = inline_waker.as_waker();
+                let waker = NoopWaker::new_waker();
                 let mut cx = Context::from_waker(&waker);
 
                 let mut job = Box::pin(async move {
@@ -387,11 +379,12 @@ where
                 tx, format, work, ..
             } => {
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Err(NetworkError::IOError);
@@ -405,7 +398,9 @@ where
                         work.send(Box::pin(async move {
                             let mut tx_guard = tx.lock().await;
                             tx_guard
-                                .send(hyper_tungstenite::tungstenite::Message::Binary(data))
+                                .send(hyper_tungstenite::tungstenite::Message::Binary(
+                                    Bytes::from_owner(data),
+                                ))
                                 .await
                                 .ok();
                         }))
@@ -414,13 +409,14 @@ where
                     }
                 };
 
-                let inline_waker = InlineWaker::new();
-                let waker = inline_waker.as_waker();
+                let waker = NoopWaker::new_waker();
                 let mut cx = Context::from_waker(&waker);
 
                 let mut job = Box::pin(async move {
                     if let Err(err) = tx_guard
-                        .send(hyper_tungstenite::tungstenite::Message::Binary(data))
+                        .send(hyper_tungstenite::tungstenite::Message::Binary(
+                            Bytes::from_owner(data),
+                        ))
                         .await
                     {
                         tracing::error!("failed to send remaining bytes for request - {}", err);
@@ -445,11 +441,12 @@ where
                 tx, format, work, ..
             } => {
                 let data = match format {
-                    crate::meta::FrameSerializationFormat::Bincode => bincode::serialize(&req)
-                        .map_err(|err| {
+                    crate::meta::FrameSerializationFormat::Bincode => {
+                        bincode::serde::encode_to_vec(&req, config::legacy()).map_err(|err| {
                             tracing::warn!("failed to serialize message - {err}");
                             NetworkError::IOError
-                        })?,
+                        })?
+                    }
                     format => {
                         tracing::warn!("format not currently supported - {format:?}");
                         return Err(NetworkError::IOError);
@@ -463,7 +460,9 @@ where
                         work.send(Box::pin(async move {
                             let mut tx_guard = tx.lock().await;
                             tx_guard
-                                .send(tokio_tungstenite::tungstenite::Message::Binary(data))
+                                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                                    Bytes::from_owner(data),
+                                ))
                                 .await
                                 .ok();
                         }))
@@ -472,13 +471,14 @@ where
                     }
                 };
 
-                let inline_waker = InlineWaker::new();
-                let waker = inline_waker.as_waker();
+                let waker = NoopWaker::new_waker();
                 let mut cx = Context::from_waker(&waker);
 
                 let mut job = Box::pin(async move {
                     if let Err(err) = tx_guard
-                        .send(tokio_tungstenite::tungstenite::Message::Binary(data))
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            Bytes::from_owner(data),
+                        ))
                         .await
                     {
                         tracing::error!("failed to send remaining bytes for request - {}", err);
@@ -502,6 +502,7 @@ where
     }
 }
 
+#[derive(derive_more::Debug)]
 pub(crate) enum RemoteRx<T>
 where
     T: serde::de::DeserializeOwned,
@@ -511,12 +512,13 @@ where
         wakers: RemoteTxWakers,
     },
     Stream {
+        #[debug(ignore)]
         rx: Pin<Box<dyn Stream<Item = std::io::Result<T>> + Send + 'static>>,
     },
     #[cfg(feature = "hyper")]
     HyperWebSocket {
         rx: futures_util::stream::SplitStream<
-            hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>,
+            hyper_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
         >,
         format: crate::meta::FrameSerializationFormat,
     },
@@ -556,13 +558,16 @@ where
                     Poll::Ready(Some(Ok(hyper_tungstenite::tungstenite::Message::Binary(msg)))) => {
                         match format {
                             crate::meta::FrameSerializationFormat::Bincode => {
-                                return match bincode::deserialize(&msg) {
-                                    Ok(msg) => Poll::Ready(Some(msg)),
+                                return match bincode::serde::decode_from_slice(
+                                    &msg,
+                                    config::legacy(),
+                                ) {
+                                    Ok((msg, _)) => Poll::Ready(Some(msg)),
                                     Err(err) => {
                                         tracing::warn!("failed to deserialize message - {}", err);
                                         continue;
                                     }
-                                }
+                                };
                             }
                             format => {
                                 tracing::warn!("format not currently supported - {format:?}");
@@ -586,13 +591,16 @@ where
                     Poll::Ready(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(msg)))) => {
                         match format {
                             crate::meta::FrameSerializationFormat::Bincode => {
-                                return match bincode::deserialize(&msg) {
-                                    Ok(msg) => Poll::Ready(Some(msg)),
+                                return match bincode::serde::decode_from_slice(
+                                    &msg,
+                                    config::legacy(),
+                                ) {
+                                    Ok((msg, _)) => Poll::Ready(Some(msg)),
                                     Err(err) => {
                                         tracing::warn!("failed to deserialize message - {}", err);
                                         continue;
                                     }
-                                }
+                                };
                             }
                             format => {
                                 tracing::warn!("format not currently supported - {format:?}");
@@ -614,4 +622,16 @@ where
             };
         }
     }
+}
+
+struct NoopWaker;
+
+impl NoopWaker {
+    fn new_waker() -> Waker {
+        Waker::from(Arc::new(Self))
+    }
+}
+
+impl std::task::Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
 }

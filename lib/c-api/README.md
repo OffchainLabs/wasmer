@@ -1,4 +1,4 @@
-# `wasmer-c-api` [![Build Status](https://github.com/wasmerio/wasmer/workflows/build/badge.svg?style=flat-square)](https://github.com/wasmerio/wasmer/actions?query=workflow%3Abuild) [![Join Wasmer Slack](https://img.shields.io/static/v1?label=Slack&message=join%20chat&color=brighgreen&style=flat-square)](https://slack.wasmer.io) [![MIT License](https://img.shields.io/github/license/wasmerio/wasmer.svg?style=flat-square)](https://github.com/wasmerio/wasmer/blob/master/LICENSE)
+# `wasmer-c-api` [![Build Status](https://github.com/wasmerio/wasmer/actions/workflows/build.yml/badge.svg?style=flat-square)](https://github.com/wasmerio/wasmer/actions?query=workflow%3Abuild) [![Join Wasmer Slack](https://img.shields.io/static/v1?label=Slack&message=join%20chat&color=brighgreen&style=flat-square)](https://slack.wasmer.io) [![MIT License](https://img.shields.io/github/license/wasmerio/wasmer.svg?style=flat-square)](https://github.com/wasmerio/wasmer/blob/main/LICENSE)
 
 This crate exposes a C and a C++ API for the Wasmer runtime. It also fully supports the [wasm-c-api common API](https://github.com/WebAssembly/wasm-c-api).
 
@@ -14,7 +14,6 @@ $WASMER_DIR/
     wasm.h
     wasmer.h
     wasmer.hh
-    wasmer.h
 ```
 
 Wasmer binary also ships with [`wasmer-config`](#wasmer-config)
@@ -128,7 +127,7 @@ If you want to generate the library and headers in a friendly format as shown in
 make package-capi
 ```
 
-This command will generate a `package` directory, that you can then use easily in the [Wasmer C API examples](https://docs.wasmer.io/integrations/examples).
+This command will generate a `package` directory, that you can then use easily in the [Wasmer C API examples](https://wasmerio.github.io/wasmer/crates/doc/wasmer_c_api/).
 
 
 ## Testing
@@ -202,5 +201,5 @@ license][mit-license] ([LICENSE][license]).
 [wasmer_h]: ./wasmer.h
 [wasmer_hh]: ./wasmer.hh
 [mit-license]: http://opensource.org/licenses/MIT
-[license]: https://github.com/wasmerio/wasmer/blob/master/LICENSE
+[license]: https://github.com/wasmerio/wasmer/blob/main/LICENSE
 [Wasmer release page]: https://github.com/wasmerio/wasmer/releases

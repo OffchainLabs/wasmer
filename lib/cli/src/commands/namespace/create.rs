@@ -1,15 +1,13 @@
-use crate::{
-    commands::AsyncCliCommand,
-    opts::{ApiOpts, ItemFormatOpts},
-};
+use crate::{commands::AsyncCliCommand, config::WasmerEnv, opts::ItemFormatOpts};
 
 /// Create a new namespace.
 #[derive(clap::Parser, Debug)]
 pub struct CmdNamespaceCreate {
     #[clap(flatten)]
     fmt: ItemFormatOpts,
+
     #[clap(flatten)]
-    api: ApiOpts,
+    env: WasmerEnv,
 
     /// Description of the namespace.
     #[clap(long)]
@@ -24,15 +22,15 @@ impl AsyncCliCommand for CmdNamespaceCreate {
     type Output = ();
 
     async fn run_async(self) -> Result<(), anyhow::Error> {
-        let client = self.api.client()?;
+        let client = self.env.client()?;
 
-        let vars = wasmer_api::types::CreateNamespaceVars {
+        let vars = wasmer_backend_api::types::CreateNamespaceVars {
             name: self.name.clone(),
             description: self.description.clone(),
         };
-        let namespace = wasmer_api::query::create_namespace(&client, vars).await?;
+        let namespace = wasmer_backend_api::query::create_namespace(&client, vars).await?;
 
-        println!("{}", self.fmt.format.render(&namespace));
+        println!("{}", self.fmt.get().render(&namespace));
 
         Ok(())
     }

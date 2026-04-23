@@ -1,10 +1,12 @@
-use std::str::ParseBoolError;
-
+use crate::{
+    VERSION,
+    config::{UpdateRegistry, WasmerConfig, WasmerEnv},
+};
 use anyhow::{Context, Result};
 use clap::Parser;
-use wasmer_registry::{wasmer_env::WasmerEnv, WasmerConfig};
+use std::str::ParseBoolError;
 
-use crate::VERSION;
+use super::AsyncCliCommand;
 
 #[derive(Debug, Parser)]
 /// The options for the `wasmer config` subcommand: `wasmer config get --OPTION` or `wasmer config set [FLAG]`
@@ -162,16 +164,22 @@ pub struct SetProxyUrl {
     pub url: String,
 }
 
-impl Config {
+#[async_trait::async_trait]
+impl AsyncCliCommand for Config {
+    type Output = ();
+
     /// Runs logic for the `config` subcommand
-    pub fn execute(&self) -> Result<()> {
+    async fn run_async(self) -> Result<Self::Output, anyhow::Error> {
         self.inner_execute()
+            .await
             .context("failed to retrieve the wasmer config".to_string())
     }
+}
 
-    fn inner_execute(&self) -> Result<()> {
+impl Config {
+    async fn inner_execute(&self) -> Result<()> {
         if let Some(s) = self.set.as_ref() {
-            return s.execute(&self.env);
+            return s.execute(&self.env).await;
         }
 
         let flags = &self.flags;
@@ -182,40 +190,40 @@ impl Config {
         let bindir = prefix.join("bin").display().to_string();
         let includedir = prefix.join("include").display().to_string();
         let libdir = prefix.join("lib").display().to_string();
-        let cflags = format!("-I{}", includedir);
-        let libs = format!("-L{} -lwasmer", libdir);
+        let cflags = format!("-I{includedir}");
+        let libs = format!("-L{libdir} -lwasmer");
 
         if flags.pkg_config {
-            println!("prefix={}", prefixdir);
-            println!("exec_prefix={}", bindir);
-            println!("includedir={}", includedir);
-            println!("libdir={}", libdir);
+            println!("prefix={prefixdir}");
+            println!("exec_prefix={bindir}");
+            println!("includedir={includedir}");
+            println!("libdir={libdir}");
             println!();
             println!("Name: wasmer");
             println!("Description: The Wasmer library for running WebAssembly");
-            println!("Version: {}", VERSION);
-            println!("Cflags: {}", cflags);
-            println!("Libs: {}", libs);
+            println!("Version: {VERSION}");
+            println!("Cflags: {cflags}");
+            println!("Libs: {libs}");
             return Ok(());
         }
 
         if flags.prefix {
-            println!("{}", prefixdir);
+            println!("{prefixdir}");
         }
         if flags.bindir {
-            println!("{}", bindir);
+            println!("{bindir}");
         }
         if flags.includedir {
-            println!("{}", includedir);
+            println!("{includedir}");
         }
         if flags.libdir {
-            println!("{}", libdir);
+            println!("{libdir}");
         }
         if flags.libs {
-            println!("{}", libs);
+            println!("{libs}");
         }
         if flags.cflags {
-            println!("{}", cflags);
+            println!("{cflags}");
         }
 
         if flags.config_path {
@@ -228,7 +236,7 @@ impl Config {
 }
 
 impl GetOrSet {
-    fn execute(&self, env: &WasmerEnv) -> Result<()> {
+    async fn execute(&self, env: &WasmerEnv) -> Result<()> {
         let config_file = WasmerConfig::get_file_location(env.dir());
         let mut config = env.config()?;
 
@@ -262,11 +270,11 @@ impl GetOrSet {
             GetOrSet::Set(s) => {
                 match s {
                     StorableConfigField::RegistryUrl(s) => {
-                        config.registry.set_current_registry(&s.url);
+                        config.registry.set_current_registry(&s.url).await;
                         let current_registry = config.registry.get_current_registry();
-                        if let Some(u) = wasmer_registry::utils::get_username(&current_registry)
-                            .ok()
-                            .and_then(|o| o)
+                        if let Ok(client) = env.client()
+                            && let Some(u) =
+                                wasmer_backend_api::query::current_user(&client).await?
                         {
                             println!(
                                 "Successfully logged into registry {current_registry:?} as user {u:?}"
@@ -277,7 +285,7 @@ impl GetOrSet {
                         config.registry.set_login_token_for_registry(
                             &config.registry.get_current_registry(),
                             &t.token,
-                            wasmer_registry::config::UpdateRegistry::LeaveAsIs,
+                            UpdateRegistry::LeaveAsIs,
                         );
                     }
                     StorableConfigField::TelemetryEnabled(t) => {

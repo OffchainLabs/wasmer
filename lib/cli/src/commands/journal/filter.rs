@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use clap::Parser;
 use wasmer_wasix::journal::{
-    copy_journal, FilteredJournalBuilder, LogFileJournal, PrintingJournal,
+    FilteredJournalBuilder, LogFileJournal, PrintingJournal, copy_journal,
 };
 
 use crate::commands::CliCommand;
@@ -35,7 +35,7 @@ impl FromStr for FilterOut {
             "core" => Self::Core,
             "snap" | "snapshot" | "snapshots" => Self::Snapshots,
             "net" | "network" | "networking" => Self::Networking,
-            t => return Err(format!("unknown filter type - {}", t)),
+            t => return Err(format!("unknown filter type - {t}")),
         })
     }
 }

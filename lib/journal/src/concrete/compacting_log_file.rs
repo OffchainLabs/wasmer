@@ -180,10 +180,8 @@ impl CompactingLogFileJournalTx {
 impl Drop for CompactingLogFileJournalTx {
     fn drop(&mut self) {
         let triggered = self.state.lock().unwrap().on_drop;
-        if triggered {
-            if let Err(err) = self.compact_now() {
-                tracing::error!("failed to compact log - {}", err);
-            }
+        if triggered && let Err(err) = self.compact_now() {
+            tracing::error!("failed to compact log - {}", err);
         }
     }
 }
@@ -210,15 +208,15 @@ impl WritableJournal for CompactingLogFileJournalTx {
             }
 
             let mut triggered = false;
-            if let Some(on) = state.on_n_records.as_ref() {
-                if state.cnt_records >= *on {
-                    triggered = true;
-                }
+            if let Some(on) = state.on_n_records.as_ref()
+                && state.cnt_records >= *on
+            {
+                triggered = true;
             }
-            if let Some(on) = state.on_n_size.as_ref() {
-                if state.cnt_size >= *on {
-                    triggered = true;
-                }
+            if let Some(on) = state.on_n_size.as_ref()
+                && state.cnt_size >= *on
+            {
+                triggered = true;
             }
 
             if let Some(factor) = state.on_factor_size.as_ref() {
@@ -237,6 +235,18 @@ impl WritableJournal for CompactingLogFileJournalTx {
 
         Ok(res)
     }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        self.inner.flush()
+    }
+
+    fn commit(&self) -> anyhow::Result<usize> {
+        self.inner.commit()
+    }
+
+    fn rollback(&self) -> anyhow::Result<usize> {
+        self.inner.rollback()
+    }
 }
 
 impl ReadableJournal for CompactingLogFileJournal {
@@ -252,6 +262,18 @@ impl ReadableJournal for CompactingLogFileJournal {
 impl WritableJournal for CompactingLogFileJournal {
     fn write<'a>(&'a self, entry: JournalEntry<'a>) -> anyhow::Result<LogWriteResult> {
         self.tx.write(entry)
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        self.tx.flush()
+    }
+
+    fn commit(&self) -> anyhow::Result<usize> {
+        self.tx.commit()
+    }
+
+    fn rollback(&self) -> anyhow::Result<usize> {
+        self.tx.rollback()
     }
 }
 

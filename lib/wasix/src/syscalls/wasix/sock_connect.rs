@@ -13,17 +13,19 @@ use crate::syscalls::*;
 ///
 /// * `fd` - Socket descriptor
 /// * `addr` - Address of the socket to connect to
-#[instrument(level = "debug", skip_all, fields(%sock, addr = field::Empty), ret)]
+#[instrument(level = "trace", skip_all, fields(%sock, addr = field::Empty), ret)]
 pub fn sock_connect<M: MemorySize>(
     mut ctx: FunctionEnvMut<'_, WasiEnv>,
     sock: WasiFd,
     addr: WasmPtr<__wasi_addr_port_t, M>,
 ) -> Result<Errno, WasiError> {
+    WasiEnv::do_pending_operations(&mut ctx)?;
+
     let env = ctx.data();
     let memory = unsafe { env.memory_view(&ctx) };
     let addr = wasi_try_ok!(crate::net::read_ip_port(&memory, addr));
     let peer_addr = SocketAddr::new(addr.0, addr.1);
-    Span::current().record("addr", &format!("{:?}", peer_addr));
+    Span::current().record("addr", format!("{peer_addr:?}"));
 
     wasi_try_ok!(sock_connect_internal(&mut ctx, sock, peer_addr)?);
 
@@ -38,7 +40,7 @@ pub fn sock_connect<M: MemorySize>(
         JournalEffector::save_sock_connect(&mut ctx, sock, local_addr, peer_addr).map_err(
             |err| {
                 tracing::error!("failed to save sock_connected event - {}", err);
-                WasiError::Exit(ExitCode::Errno(Errno::Fault))
+                WasiError::Exit(ExitCode::from(Errno::Fault))
             },
         )?;
     }
@@ -58,7 +60,22 @@ pub(crate) fn sock_connect_internal(
         ctx,
         sock,
         Rights::SOCK_CONNECT,
-        move |mut socket| async move { socket.connect(tasks.deref(), net.deref(), addr, None).await }
+        move |mut socket, flags| async move {
+            // Auto-bind UDP
+            socket = socket
+                .auto_bind_udp(tasks.deref(), net.deref())
+                .await?
+                .unwrap_or(socket);
+            socket
+                .connect(
+                    tasks.deref(),
+                    net.deref(),
+                    addr,
+                    None,
+                    flags.contains(Fdflags::NONBLOCK),
+                )
+                .await
+        }
     ));
 
     Ok(Ok(()))

@@ -8,18 +8,18 @@ use std::{
 };
 
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
-use virtual_fs::{FsError, Pipe as VirtualPipe, VirtualFile};
+use virtual_fs::{FsError, Pipe, PipeRx, PipeTx, VirtualFile};
 use wasmer_wasix_types::{
     types::Eventtype,
     wasi::{self, EpollType},
     wasi::{Errno, EventFdReadwrite, Eventrwflags, Subscription},
 };
 
-use super::{notification::NotificationInner, InodeGuard, Kind};
+use super::{InodeGuard, Kind, notification::NotificationInner};
 use crate::{
     net::socket::{InodeSocketInner, InodeSocketKind},
-    state::{iterate_poll_events, PollEvent, PollEventSet, WasiState},
-    syscalls::{map_io_err, EventResult, EventResultType},
+    state::{PollEvent, PollEventSet, WasiState, iterate_poll_events},
+    syscalls::{EventResult, EventResultType, map_io_err},
     utils::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard},
 };
 
@@ -28,7 +28,9 @@ pub(crate) enum InodeValFilePollGuardMode {
     File(Arc<RwLock<Box<dyn VirtualFile + Send + Sync + 'static>>>),
     EventNotifications(Arc<NotificationInner>),
     Socket { inner: Arc<InodeSocketInner> },
-    Pipe { pipe: Arc<RwLock<Box<VirtualPipe>>> },
+    PipeRx { rx: Arc<RwLock<Box<PipeRx>>> },
+    PipeTx { tx: Arc<RwLock<Box<PipeTx>>> },
+    DuplexPipe { pipe: Arc<RwLock<Box<Pipe>>> },
 }
 
 pub struct InodeValFilePollGuard {
@@ -56,7 +58,13 @@ impl InodeValFilePollGuard {
                 handle: Some(handle),
                 ..
             } => InodeValFilePollGuardMode::File(handle.clone()),
-            Kind::Pipe { pipe, .. } => InodeValFilePollGuardMode::Pipe {
+            Kind::PipeRx { rx } => InodeValFilePollGuardMode::PipeRx {
+                rx: Arc::new(RwLock::new(Box::new(rx.clone()))),
+            },
+            Kind::PipeTx { tx } => InodeValFilePollGuardMode::PipeTx {
+                tx: Arc::new(RwLock::new(Box::new(tx.clone()))),
+            },
+            Kind::DuplexPipe { pipe } => InodeValFilePollGuardMode::DuplexPipe {
                 pipe: Arc::new(RwLock::new(Box::new(pipe.clone()))),
             },
             _ => {
@@ -83,11 +91,11 @@ impl std::fmt::Debug for InodeValFilePollGuard {
             }
             InodeValFilePollGuardMode::Socket { inner } => {
                 let inner = inner.protected.read().unwrap();
-                match inner.kind {
+                match &inner.kind {
                     InodeSocketKind::TcpListener { .. } => {
                         write!(f, "guard-tcp-listener(fd={}, peb={})", self.fd, self.peb)
                     }
-                    InodeSocketKind::TcpStream { ref socket, .. } => {
+                    InodeSocketKind::TcpStream { socket, .. } => {
                         if socket.is_closed() {
                             write!(
                                 f,
@@ -107,8 +115,14 @@ impl std::fmt::Debug for InodeValFilePollGuard {
                     _ => write!(f, "guard-socket(fd={}), peb={})", self.fd, self.peb),
                 }
             }
-            InodeValFilePollGuardMode::Pipe { .. } => {
-                write!(f, "guard-pipe(...)")
+            InodeValFilePollGuardMode::PipeRx { .. } => {
+                write!(f, "guard-pipe-rx(...)")
+            }
+            InodeValFilePollGuardMode::PipeTx { .. } => {
+                write!(f, "guard-pipe-tx(...)")
+            }
+            InodeValFilePollGuardMode::DuplexPipe { .. } => {
+                write!(f, "guard-duplex-pipe(...)")
             }
         }
     }
@@ -120,7 +134,6 @@ pub struct InodeValFilePollGuardJoin {
     fd: u32,
     peb: PollEventSet,
     subscription: Subscription,
-    spent: bool,
 }
 
 impl InodeValFilePollGuardJoin {
@@ -130,7 +143,6 @@ impl InodeValFilePollGuardJoin {
             fd: guard.fd,
             peb: guard.peb,
             subscription: guard.subscription,
-            spent: false,
         }
     }
     pub(crate) fn fd(&self) -> u32 {
@@ -138,20 +150,6 @@ impl InodeValFilePollGuardJoin {
     }
     pub(crate) fn peb(&self) -> PollEventSet {
         self.peb
-    }
-    pub fn is_spent(&self) -> bool {
-        self.spent
-    }
-    pub fn reset(&mut self) {
-        match &self.mode {
-            InodeValFilePollGuardMode::File(_) => {}
-            InodeValFilePollGuardMode::EventNotifications(inner) => {
-                inner.reset();
-            }
-            InodeValFilePollGuardMode::Socket { .. } => {}
-            InodeValFilePollGuardMode::Pipe { .. } => {}
-        }
-        self.spent = false;
     }
 }
 
@@ -196,11 +194,20 @@ impl Future for InodeValFilePollGuardJoin {
                     file.poll_read_ready(cx)
                 }
                 InodeValFilePollGuardMode::EventNotifications(inner) => inner.poll(waker).map(Ok),
-                InodeValFilePollGuardMode::Socket { ref inner } => {
+                InodeValFilePollGuardMode::Socket { inner } => {
                     let mut guard = inner.protected.write().unwrap();
                     guard.poll_read_ready(cx)
                 }
-                InodeValFilePollGuardMode::Pipe { pipe } => {
+                InodeValFilePollGuardMode::PipeRx { rx } => {
+                    let mut guard = rx.write().unwrap();
+                    let rx = Pin::new(guard.as_mut());
+                    rx.poll_read_ready(cx)
+                }
+                InodeValFilePollGuardMode::PipeTx { .. } => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cannot read from a pipe write end",
+                ))),
+                InodeValFilePollGuardMode::DuplexPipe { pipe } => {
                     let mut guard = pipe.write().unwrap();
                     let pipe = Pin::new(guard.as_mut());
                     pipe.poll_read_ready(cx)
@@ -220,7 +227,7 @@ impl Future for InodeValFilePollGuardJoin {
                             }))
                         }
                         Eventtype::Clock => Some(EventResultType::Clock(0)),
-                        Eventtype::Unknown => None,
+                        _ => None,
                     };
                     if let Some(inner) = inner {
                         ret.push((
@@ -256,7 +263,7 @@ impl Future for InodeValFilePollGuardJoin {
                             }))
                         }
                         Eventtype::Clock => Some(EventResultType::Clock(0)),
-                        Eventtype::Unknown => None,
+                        _ => None,
                     };
                     if let Some(inner) = inner {
                         ret.push((
@@ -286,11 +293,20 @@ impl Future for InodeValFilePollGuardJoin {
                     file.poll_write_ready(cx)
                 }
                 InodeValFilePollGuardMode::EventNotifications(inner) => inner.poll(waker).map(Ok),
-                InodeValFilePollGuardMode::Socket { ref inner } => {
+                InodeValFilePollGuardMode::Socket { inner } => {
                     let mut guard = inner.protected.write().unwrap();
                     guard.poll_write_ready(cx)
                 }
-                InodeValFilePollGuardMode::Pipe { pipe } => {
+                InodeValFilePollGuardMode::PipeRx { .. } => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cannot write to a pipe read end",
+                ))),
+                InodeValFilePollGuardMode::PipeTx { tx } => {
+                    let mut guard = tx.write().unwrap();
+                    let tx = Pin::new(guard.as_mut());
+                    tx.poll_write_ready()
+                }
+                InodeValFilePollGuardMode::DuplexPipe { pipe } => {
                     let mut guard = pipe.write().unwrap();
                     let pipe = Pin::new(guard.as_mut());
                     pipe.poll_write_ready(cx)
@@ -310,7 +326,7 @@ impl Future for InodeValFilePollGuardJoin {
                             }))
                         }
                         Eventtype::Clock => Some(EventResultType::Clock(0)),
-                        Eventtype::Unknown => None,
+                        _ => None,
                     };
                     if let Some(inner) = inner {
                         ret.push((
@@ -346,7 +362,7 @@ impl Future for InodeValFilePollGuardJoin {
                             }))
                         }
                         Eventtype::Clock => Some(EventResultType::Clock(0)),
-                        Eventtype::Unknown => None,
+                        _ => None,
                     };
                     if let Some(inner) = inner {
                         ret.push((
@@ -369,7 +385,6 @@ impl Future for InodeValFilePollGuardJoin {
             };
         }
         if !ret.is_empty() {
-            self.spent = true;
             return Poll::Ready(ret);
         }
         Poll::Pending
@@ -452,7 +467,7 @@ pub(crate) struct WasiStateFileGuard {
 impl WasiStateFileGuard {
     pub fn new(state: &WasiState, fd: wasi::Fd) -> Result<Option<Self>, FsError> {
         let fd_map = state.fs.fd_map.read().unwrap();
-        if let Some(fd) = fd_map.get(&fd) {
+        if let Some(fd) = fd_map.get(fd) {
             Ok(Some(Self {
                 inode: fd.inode.clone(),
             }))
@@ -507,6 +522,19 @@ impl VirtualFile for WasiStateFileGuard {
             file.created_time()
         } else {
             0
+        }
+    }
+
+    fn set_times(
+        &mut self,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<(), virtual_fs::FsError> {
+        let mut guard = self.lock_write();
+        if let Some(file) = guard.as_mut() {
+            file.set_times(atime, mtime)
+        } else {
+            Err(crate::FsError::Lock)
         }
     }
 

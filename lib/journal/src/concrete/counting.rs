@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -41,6 +41,10 @@ impl WritableJournal for CountingJournal {
             record_start: offset as u64,
             record_end: offset as u64 + size,
         })
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

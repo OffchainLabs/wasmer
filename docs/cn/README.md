@@ -5,9 +5,9 @@
 
   <p>
     <a href="https://github.com/wasmerio/wasmer/actions?query=workflow%3Abuild">
-      <img src="https://github.com/wasmerio/wasmer/actions/workflows/build.yml/badge.svg?event=push" alt="Build Status">
+      <img src="https://github.com/wasmerio/wasmer/actions/workflows/build.yml/badge.svg?style=flat-square" alt="Build Status">
     </a>
-    <a href="https://github.com/wasmerio/wasmer/blob/master/LICENSE">
+    <a href="https://github.com/wasmerio/wasmer/blob/main/LICENSE">
       <img src="https://img.shields.io/github/license/wasmerio/wasmer.svg" alt="License">
     </a>
     <a href="https://docs.wasmer.io">
@@ -32,7 +32,7 @@
 
 [Wasmer](https://wasmer.io/) 提供基于 [WebAssembly](https://webassembly.org/) 的超轻量级容器，其可以在任何地方运行：从桌面到云、以及 IoT 设备，并且也能嵌入到 [*任何编程语言*](https://github.com/wasmerio/wasmer#language-integrations) 中.
 
-> 其他语言的 Readme: [🇩🇪 Deutsch-德語](https://github.com/wasmerio/wasmer/blob/master/docs/de/README.md) • [🇬🇧 English-英文](https://github.com/wasmerio/wasmer/blob/master/README.md) • [🇪🇸 Español-西班牙语](https://github.com/wasmerio/wasmer/blob/master/docs/es/README.md) • [🇫🇷 Français-法语](https://github.com/wasmerio/wasmer/blob/master/docs/fr/README.md) • [🇯🇵 日本語-日文](https://github.com/wasmerio/wasmer/blob/master/docs/ja/README.md).
+> 其他语言的 Readme: [🇩🇪 Deutsch-德語](https://github.com/wasmerio/wasmer/blob/main/docs/de/README.md) • [🇬🇧 English-英文](https://github.com/wasmerio/wasmer/blob/main/README.md) • [🇪🇸 Español-西班牙语](https://github.com/wasmerio/wasmer/blob/main/docs/es/README.md) • [🇫🇷 Français-法语](https://github.com/wasmerio/wasmer/blob/main/docs/fr/README.md) • [🇯🇵 日本語-日文](https://github.com/wasmerio/wasmer/blob/main/docs/ja/README.md).
 
 ## 特性
 
@@ -113,12 +113,12 @@ hello 3
 [👋 缺少语言？](https://github.com/wasmerio/wasmer/issues/new?assignees=&labels=%F0%9F%8E%89+enhancement&template=---feature-request.md&title=)
 
 [rust logo]: https://raw.githubusercontent.com/wasmerio/wasmer/master/assets/languages/rust.svg
-[rust integration]: https://github.com/wasmerio/wasmer/tree/master/lib/api
+[rust integration]: https://github.com/wasmerio/wasmer/tree/main/lib/api
 [`wasmer` rust crate]: https://crates.io/crates/wasmer/
 [rust docs]: https://docs.rs/wasmer/
 
 [c logo]: https://raw.githubusercontent.com/wasmerio/wasmer/master/assets/languages/c.svg
-[c integration]: https://github.com/wasmerio/wasmer/tree/master/lib/c-api
+[c integration]: https://github.com/wasmerio/wasmer/tree/main/lib/c-api
 [`wasmer.h` headers]: https://wasmerio.github.io/wasmer/c/
 [c docs]: https://docs.rs/wasmer-c-api/*/wasmer/wasm_c_api/index.html
 

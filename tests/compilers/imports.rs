@@ -5,16 +5,19 @@
 use anyhow::Result;
 use std::convert::Infallible;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering::SeqCst},
     Arc,
+    atomic::{AtomicUsize, Ordering::SeqCst},
 };
 use wasmer::FunctionEnv;
 use wasmer::Type as ValueType;
 use wasmer::*;
 
 fn get_module(store: &Store) -> Result<Module> {
+    // Note: this module is also used to test indirect calls to imported
+    // functions, do not remove the call_indirect instruction
     let wat = r#"
-        (import "host" "0" (func))
+        (type (func))
+        (import "host" "0" (func $host_func_0 (type 0)))
         (import "host" "1" (func (param i32) (result i32)))
         (import "host" "2" (func (param i32) (param i64)))
         (import "host" "3" (func (param i32 i64 i32 f32 f64)))
@@ -22,7 +25,9 @@ fn get_module(store: &Store) -> Result<Module> {
         (export "memory" (memory $mem))
 
         (func $foo
-            call 0
+            i32.const 1
+            call_indirect (type 0)
+
             i32.const 0
             call 1
             i32.const 1
@@ -37,6 +42,8 @@ fn get_module(store: &Store) -> Result<Module> {
             f64.const 500
             call 3
         )
+        (table 2 2 funcref)
+        (elem (i32.const 1) func $host_func_0)
         (start $foo)
     "#;
 
@@ -359,7 +366,7 @@ fn static_function_that_fails(config: crate::Config) -> Result<()> {
         Err(InstantiationError::Start(runtime_error)) => {
             assert_eq!(runtime_error.message(), "oops")
         }
-        _ => assert!(false),
+        _ => panic!(),
     }
 
     Ok(())
@@ -412,7 +419,7 @@ fn dynamic_function_with_env_wasmer_env_init_works(config: crate::Config) -> Res
     )?;
     let memory = instance.exports.get_memory("memory")?;
     env.as_mut(&mut store).memory = Some(memory.clone());
-    let f: TypedFunction<(), ()> = instance.exports.get_typed_function(&mut store, "main")?;
+    let f: TypedFunction<(), ()> = instance.exports.get_typed_function(&store, "main")?;
     f.call(&mut store)?;
     Ok(())
 }
@@ -450,14 +457,14 @@ fn multi_use_host_fn_manages_memory_correctly(config: crate::Config) -> Result<(
     let instance1 = Instance::new(&mut store, &module, &imports)?;
     let instance2 = Instance::new(&mut store, &module, &imports)?;
     {
-        let f1: TypedFunction<(), ()> = instance1.exports.get_typed_function(&mut store, "main")?;
+        let f1: TypedFunction<(), ()> = instance1.exports.get_typed_function(&store, "main")?;
         let memory = instance1.exports.get_memory("memory")?;
         env.as_mut(&mut store).memory = Some(memory.clone());
         f1.call(&mut store)?;
     }
     drop(instance1);
     {
-        let f2: TypedFunction<(), ()> = instance2.exports.get_typed_function(&mut store, "main")?;
+        let f2: TypedFunction<(), ()> = instance2.exports.get_typed_function(&store, "main")?;
         let memory = instance2.exports.get_memory("memory")?;
         env.as_mut(&mut store).memory = Some(memory.clone());
         f2.call(&mut store)?;
@@ -499,9 +506,8 @@ fn instance_local_memory_lifetime(config: crate::Config) -> Result<()> {
     };
     let instance = Instance::new(&mut store, &module, &imports)?;
     let set_at: TypedFunction<(i32, i32), ()> =
-        instance.exports.get_typed_function(&mut store, "set_at")?;
-    let get_at: TypedFunction<i32, i32> =
-        instance.exports.get_typed_function(&mut store, "get_at")?;
+        instance.exports.get_typed_function(&store, "set_at")?;
+    let get_at: TypedFunction<i32, i32> = instance.exports.get_typed_function(&store, "get_at")?;
     set_at.call(&mut store, 200, 123)?;
     assert_eq!(get_at.call(&mut store, 200)?, 123);
 

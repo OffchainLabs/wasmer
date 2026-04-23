@@ -1,13 +1,10 @@
 {
-    "[toml]": {
-        "editor.formatOnSave": false,
-        "editor.formatOnPaste": false,
-        "editor.formatOnType": false
-    },
-    "[rust]": {
-        "editor.formatOnSave": true,
-        "editor.formatOnPaste": false,
-        "editor.formatOnType": false
-    },
-    "rust-analyzer.showUnlinkedFileNotification": false
+    "rust-analyzer.check.features": [
+        "llvm",
+        "cranelift",
+        "singlepass",
+        "wasmer-artifact-create",
+        "wasmer-artifact-load",
+        "napi-v8"
+    ]
 }

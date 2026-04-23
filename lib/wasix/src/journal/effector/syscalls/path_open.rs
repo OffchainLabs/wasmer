@@ -12,10 +12,11 @@ impl JournalEffector {
         fs_rights_base: Rights,
         fs_rights_inheriting: Rights,
         fs_flags: Fdflags,
+        fd_flags: Fdflagsext,
     ) -> anyhow::Result<()> {
         Self::save_event(
             ctx,
-            JournalEntry::OpenFileDescriptorV1 {
+            JournalEntry::OpenFileDescriptorV2 {
                 fd,
                 dirfd,
                 dirflags,
@@ -24,6 +25,7 @@ impl JournalEffector {
                 fs_rights_base,
                 fs_rights_inheriting,
                 fs_flags,
+                fd_flags,
             },
         )
     }
@@ -39,9 +41,10 @@ impl JournalEffector {
         fs_rights_base: Rights,
         fs_rights_inheriting: Rights,
         fs_flags: Fdflags,
+        fd_flags: Fdflagsext,
     ) -> anyhow::Result<()> {
         let res = crate::syscalls::path_open_internal(
-            ctx,
+            ctx.data(),
             dirfd,
             dirflags,
             path,
@@ -49,29 +52,17 @@ impl JournalEffector {
             fs_rights_base,
             fs_rights_inheriting,
             fs_flags,
+            fd_flags,
+            Some(fd),
         );
-        let ret_fd = match res? {
+        match res? {
             Ok(fd) => fd,
             Err(err) => {
                 bail!(
-                    "journal restore error: failed to open descriptor (fd={}, path={}) - {}",
-                    fd,
-                    path,
-                    err
+                    "journal restore error: failed to open descriptor (fd={fd}, path={path}) - {err}"
                 );
             }
         };
-
-        let ret = crate::syscalls::fd_renumber_internal(ctx, ret_fd, fd);
-        if ret != Errno::Success {
-            bail!(
-                "journal restore error: failed renumber file descriptor after open (from={}, to={}) - {}",
-                ret_fd,
-                fd,
-                ret
-            );
-        }
-
         Ok(())
     }
 }

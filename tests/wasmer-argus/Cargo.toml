@@ -12,35 +12,36 @@ version.workspace = true
 wasmer_lib = ["dep:wasmer"]
 
 [dependencies]
-indicatif = "0.17.8"
-anyhow = "1.0.80"
-log = "0.4.21"
-cynic = "3.4.3"
-url = "2.5.0"
-futures = "0.3.30"
-tracing = "0.1.40"
-tokio = { version = "1.36.0", features = ["rt-multi-thread", "sync", "time", "fs"] }
-clap = {version = "4.4.11", features = ["derive", "string"]}
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-serde = { version = "1.0.197", features = ["derive"] }
-serde_json = "1.0.114"
-wasmer = { version = "4.2.6", path = "../../lib/api", features = ["engine", "core", "singlepass", "cranelift", "llvm"], optional = true }
-derive_more = "0.99.17"
+wasmer = { version = "7.1.0", path = "../../lib/api", features = ["core", "singlepass", "cranelift", "llvm"], optional = true }
+indicatif.workspace = true
+anyhow.workspace = true
+log.workspace = true
+cynic.workspace = true
+url.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "sync", "time", "fs"] }
+clap = {workspace = true, features = ["derive", "string"]}
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+serde.workspace = true
+serde_json.workspace = true
+derive_more.workspace = true
 webc.workspace = true
-async-trait = "0.1.77"
-wasmer-api = { path = "../../lib/backend-api" }
+async-trait.workspace = true
+wasmer-backend-api = { path = "../../lib/backend-api" }
+shared-buffer.workspace = true
 
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
-reqwest = { version = "^0.11", default-features = false, features = [
-  "rustls-tls",
+reqwest = { workspace = true, default-features = false, features = [
+  "rustls",
   "json",
   "multipart",
   "gzip",
 ] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-reqwest = { version = "^0.11", default-features = false, features = [
+reqwest = { workspace = true, default-features = false, features = [
   "native-tls",
   "json",
   "multipart",

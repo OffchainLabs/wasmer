@@ -8,15 +8,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use derivative::Derivative;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 
 use crate::VirtualFile;
 
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArcBoxFile {
-    #[derivative(Debug = "ignore")]
     inner: Arc<Mutex<Box<dyn VirtualFile + Send + Sync + 'static>>>,
 }
 
@@ -101,6 +98,10 @@ impl VirtualFile for ArcBoxFile {
     fn created_time(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.created_time()
+    }
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> crate::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_times(atime, mtime)
     }
     fn size(&self) -> u64 {
         let inner = self.inner.lock().unwrap();

@@ -1,11 +1,11 @@
 // This file contains code from external sources.
-// Attributions: https://github.com/wasmerio/wasmer/blob/master/ATTRIBUTIONS.md
+// Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
 
 //! Boxed slices for `PrimaryMap`.
 
+use crate::entity::EntityRef;
 use crate::entity::iter::{Iter, IterMut};
 use crate::entity::keys::Keys;
-use crate::entity::EntityRef;
 use crate::lib::std::boxed::Box;
 use crate::lib::std::marker::PhantomData;
 use crate::lib::std::ops::{Index, IndexMut};
@@ -24,6 +24,22 @@ where
     unused: PhantomData<K>,
 }
 
+#[cfg(feature = "artifact-size")]
+impl<K, V> loupe::MemoryUsage for BoxedSlice<K, V>
+where
+    K: EntityRef,
+    V: loupe::MemoryUsage,
+{
+    fn size_of_val(&self, tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        std::mem::size_of_val(self)
+            + self
+                .elems
+                .iter()
+                .map(|value| value.size_of_val(tracker) - std::mem::size_of_val(value))
+                .sum::<usize>()
+    }
+}
+
 impl<K, V> BoxedSlice<K, V>
 where
     K: EntityRef,
@@ -35,9 +51,11 @@ where
     ///
     /// This relies on `raw` pointing to a valid slice of `V`s.
     pub unsafe fn from_raw(raw: *mut [V]) -> Self {
-        Self {
-            elems: Box::from_raw(raw),
-            unused: PhantomData,
+        unsafe {
+            Self {
+                elems: Box::from_raw(raw),
+                unused: PhantomData,
+            }
         }
     }
 
@@ -72,22 +90,22 @@ where
     }
 
     /// Iterate over all the values in this map.
-    pub fn values(&self) -> slice::Iter<V> {
+    pub fn values(&self) -> slice::Iter<'_, V> {
         self.elems.iter()
     }
 
     /// Iterate over all the values in this map, mutable edition.
-    pub fn values_mut(&mut self) -> slice::IterMut<V> {
+    pub fn values_mut(&mut self) -> slice::IterMut<'_, V> {
         self.elems.iter_mut()
     }
 
     /// Iterate over all the keys and values in this map.
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter::new(self.elems.iter())
     }
 
     /// Iterate over all the keys and values in this map, mutable edition.
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut::new(self.elems.iter_mut())
     }
 
