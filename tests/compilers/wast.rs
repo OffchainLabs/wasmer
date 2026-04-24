@@ -61,7 +61,12 @@ pub fn run_wast(mut config: crate::Config, wast_path: &str) -> anyhow::Result<()
     config.set_features(features);
     config.set_nan_canonicalization(try_nan_canonicalization);
 
-    let store = config.store();
+    let mut store = config.store();
+    // When `stylus_version` is set to 0 by default, which enables the
+    // Arbitrum `MemoryFillValueOverflow` trap. The upstream spec tests expect
+    // vanilla WebAssembly semantics (truncate the fill value to 8 bits), which
+    // corresponds to `stylus_version >= 3`.
+    store.set_stylus_version(3);
     let mut wast = Wast::new_with_spectest(store);
     // `bulk-memory-operations/bulk.wast` checks for a message that
     // specifies which element is uninitialized, but our traps don't
