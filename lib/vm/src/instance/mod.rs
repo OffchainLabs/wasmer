@@ -732,8 +732,9 @@ impl Instance {
         len: u32,
     ) -> Result<(), Trap> {
         let memory = self.memory(memory_index);
+        let stylus_version = self.context().stylus_version();
         // The following memory fill is not synchronized and is not atomic:
-        unsafe { memory_fill(&memory, dst, val, len) }
+        unsafe { memory_fill(&memory, dst, val, len, stylus_version) }
     }
 
     /// Perform the `memory.fill` operation on an imported memory.
@@ -750,8 +751,9 @@ impl Instance {
     ) -> Result<(), Trap> {
         let import = self.imported_memory(memory_index);
         let memory = unsafe { import.definition.as_ref() };
+        let stylus_version = self.context().stylus_version();
         // The following memory fill is not synchronized and is not atomic:
-        unsafe { memory_fill(memory, dst, val, len) }
+        unsafe { memory_fill(memory, dst, val, len, stylus_version) }
     }
 
     /// Performs the `memory.init` operation.

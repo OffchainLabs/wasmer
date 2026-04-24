@@ -110,6 +110,18 @@ impl Store {
         }
     }
 
+    #[cfg(feature = "sys")]
+    /// Sets the Stylus version for this store. `stylus_version >= 3` uses
+    /// vanilla WebAssembly semantics for `memory.fill` (truncate value to 8
+    /// bits); `stylus_version < 3` traps with `MemoryFillValueOverflow` when
+    /// the fill value exceeds 8 bits. No-op for non-`sys` backends.
+    pub fn set_stylus_version(&mut self, version: u16) {
+        #[allow(irrefutable_let_patterns)]
+        if let crate::StoreObjects::Sys(objects) = &mut self.inner.objects {
+            objects.set_stylus_version(version);
+        }
+    }
+
     /// Returns the [`Engine`].
     pub fn engine(&self) -> &Engine {
         self.inner.store.engine()

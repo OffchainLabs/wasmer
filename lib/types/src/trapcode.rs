@@ -70,6 +70,10 @@ pub enum TrapCode {
     /// An async imported function tried to yield when not called
     /// via `Function::call_async`.
     YieldOutsideAsyncContext = 13,
+
+    /// A memory.fill instruction was given a value that exceeds 8 bits.
+    /// Assigned 255 to avoid conflicts with upstream wasmer additions.
+    MemoryFillValueOverflow = 255,
 }
 
 impl TrapCode {
@@ -92,6 +96,7 @@ impl TrapCode {
             Self::YieldOutsideAsyncContext => {
                 "async imported function yielded when not called via `Function::call_async`"
             }
+            Self::MemoryFillValueOverflow => "memory.fill value exceeds 8 bits",
         }
     }
 }
@@ -113,6 +118,7 @@ impl Display for TrapCode {
             Self::UncaughtException => "uncaught_exception",
             Self::UninitializedExnRef => "uninitialized_exnref",
             Self::YieldOutsideAsyncContext => "yield_outside_async_context",
+            Self::MemoryFillValueOverflow => "memfill_val_ovf",
         };
         f.write_str(identifier)
     }
@@ -137,6 +143,7 @@ impl FromStr for TrapCode {
             "uncaught_exception" => Ok(Self::UncaughtException),
             "uninitialized_exnref" => Ok(Self::UninitializedExnRef),
             "yield_outside_async_context" => Ok(Self::YieldOutsideAsyncContext),
+            "memfill_val_ovf" => Ok(Self::MemoryFillValueOverflow),
             _ => Err(()),
         }
     }
@@ -160,7 +167,7 @@ mod tests {
     use super::*;
 
     // Everything but user-defined codes.
-    const CODES: [TrapCode; 11] = [
+    const CODES: [TrapCode; 12] = [
         TrapCode::StackOverflow,
         TrapCode::HeapAccessOutOfBounds,
         TrapCode::HeapMisaligned,
@@ -172,6 +179,7 @@ mod tests {
         TrapCode::BadConversionToInteger,
         TrapCode::UnreachableCodeReached,
         TrapCode::UnalignedAtomic,
+        TrapCode::MemoryFillValueOverflow,
     ];
 
     #[test]
