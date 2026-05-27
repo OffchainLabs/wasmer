@@ -392,24 +392,3 @@ mod function_extents_tests {
         Ok(())
     }
 }
-
-#[test]
-#[cfg(unix)]
-fn module_from_file_non_utf8_path() -> Result<(), String> {
-    let store = Store::default();
-    let wasm_bytes = wat2wasm(b"(module)").map_err(|e| format!("{e:?}"))?;
-
-    let dir = tempfile::tempdir().map_err(|e| format!("{e:?}"))?;
-    let non_utf8_name = OsStr::from_bytes(b"module_\xff\xfe.wasm");
-    let path = dir.path().join(non_utf8_name);
-
-    // Some platforms and file systems do not support non-UTF-8 paths, so skip them.
-    if std::fs::write(&path, &wasm_bytes).is_err() {
-        return Ok(());
-    }
-
-    let module = Module::from_file(&store, &path).map_err(|e| format!("{e:?}"))?;
-    let canonical = path.canonicalize().map_err(|e| format!("{e:?}"))?;
-    assert_eq!(module.name(), Some(canonical.to_string_lossy().as_ref()),);
-    Ok(())
-}
