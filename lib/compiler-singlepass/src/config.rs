@@ -16,7 +16,7 @@ use wasmer_compiler::{
     misc::{CompiledKind, function_kind_to_filename, save_assembly_to_file},
 };
 use wasmer_types::{
-    Features,
+    CompileError, Features,
     target::{CpuFeature, Target},
 };
 
@@ -77,6 +77,12 @@ impl SinglepassCallbacks {
 pub struct Singlepass {
     pub(crate) enable_nan_canonicalization: bool,
 
+    /// Maximum number of machine-code bytes this compiler may emit for a module.
+    ///
+    /// This excludes serialization metadata. A caller that persists serialized
+    /// modules should also validate the final artifact length.
+    pub(crate) max_output_size: Option<usize>,
+
     /// The middleware chain.
     pub(crate) middlewares: Vec<Arc<dyn ModuleMiddleware>>,
 
@@ -92,6 +98,7 @@ impl Singlepass {
     pub fn new() -> Self {
         Self {
             enable_nan_canonicalization: true,
+            max_output_size: None,
             middlewares: vec![],
             callbacks: None,
             num_threads: std::thread::available_parallelism().unwrap_or(NonZero::new(1).unwrap()),
@@ -101,6 +108,21 @@ impl Singlepass {
     pub fn canonicalize_nans(&mut self, enable: bool) -> &mut Self {
         self.enable_nan_canonicalization = enable;
         self
+    }
+
+    /// Limits the number of machine-code bytes emitted for a module.
+    pub fn with_max_output_size(mut self, max_output_size: usize) -> Self {
+        self.max_output_size = Some(max_output_size);
+        self
+    }
+
+    pub(crate) fn ensure_output_size_within_limit(&self, size: usize) -> Result<(), CompileError> {
+        if let Some(limit) = self.max_output_size
+            && size > limit
+        {
+            return Err(output_size_limit_error(size, limit));
+        }
+        Ok(())
     }
 
     /// Callbacks that will triggered in the different compilation
@@ -115,6 +137,12 @@ impl Singlepass {
         self.num_threads = num_threads;
         self
     }
+}
+
+pub(crate) fn output_size_limit_error(size: usize, limit: usize) -> CompileError {
+    CompileError::Codegen(format!(
+        "singlepass compiler output exceeds limit: {size} > {limit} bytes"
+    ))
 }
 
 impl CompilerConfig for Singlepass {

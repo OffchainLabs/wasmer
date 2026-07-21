@@ -13,6 +13,7 @@ use crate::machine::{
 use crate::machine_arm64::MachineARM64;
 use crate::machine_riscv::MachineRiscv;
 use crate::machine_x64::MachineX86_64;
+use crate::output_budget::OutputBudget;
 #[cfg(feature = "unwind")]
 use crate::unwind::{UnwindFrame, create_systemv_cie};
 use enumset::EnumSet;
@@ -66,6 +67,10 @@ impl SinglepassCompiler {
         function_body_inputs: PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
         progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Compilation, CompileError> {
+        let output_budget = self
+            .config
+            .max_output_size
+            .map(|limit| Arc::new(OutputBudget::new(limit)));
         let arch = target.triple().architecture;
         match arch {
             Architecture::X86_64 => {}
@@ -137,14 +142,18 @@ impl SinglepassCompiler {
             .map(FunctionIndex::new)
             .collect::<Vec<_>>()
             .into_par_iter_if_rayon()
-            .map(|i| {
-                gen_import_call_trampoline(
+            .map(|i| -> Result<_, CompileError> {
+                let section = gen_import_call_trampoline(
                     &vmoffsets,
                     i,
                     &module.signatures[module.functions[i]],
                     target,
                     calling_convention,
-                )
+                )?;
+                if let Some(output_budget) = output_budget.as_ref() {
+                    output_budget.reserve(section.bytes.len())?;
+                }
+                Ok(section)
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -186,11 +195,13 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            output_budget.as_ref().map(Arc::clone),
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
                             let op = reader.read_operator()?;
                             generator.feed_operator(op)?;
+                            generator.ensure_output_size_within_limit()?;
                         }
 
                         generator.finalize(input, arch)
@@ -207,11 +218,13 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            output_budget.as_ref().map(Arc::clone),
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
                             let op = reader.read_operator()?;
                             generator.feed_operator(op)?;
+                            generator.ensure_output_size_within_limit()?;
                         }
 
                         generator.finalize(input, arch)
@@ -228,11 +241,13 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            output_budget.as_ref().map(Arc::clone),
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
                             let op = reader.read_operator()?;
                             generator.feed_operator(op)?;
+                            generator.ensure_output_size_within_limit()?;
                         }
 
                         generator.finalize(input, arch)
@@ -250,6 +265,18 @@ impl SinglepassCompiler {
             .into_iter()
             .unzip();
 
+        let mut output_size = custom_sections
+            .values()
+            .map(|section| section.bytes.len())
+            .sum::<usize>();
+        output_size = output_size.saturating_add(
+            functions
+                .iter()
+                .map(|function| function.body.body.len())
+                .sum::<usize>(),
+        );
+        self.config.ensure_output_size_within_limit(output_size)?;
+
         let module_hash = module.hash_string();
         let function_call_trampolines = module
             .signatures
@@ -258,6 +285,9 @@ impl SinglepassCompiler {
             .into_par_iter_if_rayon()
             .map(|func_type| -> Result<FunctionBody, CompileError> {
                 let body = gen_std_trampoline(func_type, target, calling_convention)?;
+                if let Some(output_budget) = output_budget.as_ref() {
+                    output_budget.reserve(body.body.len())?;
+                }
                 if let Some(callbacks) = self.config.callbacks.as_ref() {
                     callbacks.obj_memory_buffer(
                         &CompiledKind::FunctionCallTrampoline(func_type.clone()),
@@ -282,6 +312,14 @@ impl SinglepassCompiler {
             .into_iter()
             .collect::<PrimaryMap<_, _>>();
 
+        output_size = output_size.saturating_add(
+            function_call_trampolines
+                .values()
+                .map(|body| body.body.len())
+                .sum::<usize>(),
+        );
+        self.config.ensure_output_size_within_limit(output_size)?;
+
         let dynamic_function_trampolines = module
             .imported_function_types()
             .collect::<Vec<_>>()
@@ -293,6 +331,9 @@ impl SinglepassCompiler {
                     target,
                     calling_convention,
                 )?;
+                if let Some(output_budget) = output_budget.as_ref() {
+                    output_budget.reserve(body.body.len())?;
+                }
                 if let Some(callbacks) = self.config.callbacks.as_ref() {
                     callbacks.obj_memory_buffer(
                         &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
@@ -316,6 +357,14 @@ impl SinglepassCompiler {
             .into_iter()
             .collect::<PrimaryMap<FunctionIndex, FunctionBody>>();
 
+        output_size = output_size.saturating_add(
+            dynamic_function_trampolines
+                .values()
+                .map(|body| body.body.len())
+                .sum::<usize>(),
+        );
+        self.config.ensure_output_size_within_limit(output_size)?;
+
         #[allow(unused_mut)]
         let mut unwind_info = UnwindInfo::default();
 
@@ -331,6 +380,11 @@ impl SinglepassCompiler {
             eh_frame.write(&[0, 0, 0, 0]).unwrap(); // Write a 0 length at the end of the table.
 
             let eh_frame_section = eh_frame.0.into_section();
+            if let Some(output_budget) = output_budget.as_ref() {
+                output_budget.reserve(eh_frame_section.bytes.len())?;
+            }
+            output_size = output_size.saturating_add(eh_frame_section.bytes.len());
+            self.config.ensure_output_size_within_limit(output_size)?;
             custom_sections.push(eh_frame_section);
             unwind_info.eh_frame = Some(SectionIndex::new(custom_sections.len() - 1))
         };
@@ -502,5 +556,16 @@ mod tests {
                 CpuFeature::AVX | CpuFeature::SSE42 | CpuFeature::LZCNT | CpuFeature::BMI1
             )
         );
+    }
+
+    #[test]
+    fn enforces_output_size_limit_at_boundary() {
+        let config = Singlepass::default().with_max_output_size(64);
+        assert!(config.ensure_output_size_within_limit(64).is_ok());
+        assert!(matches!(
+            config.ensure_output_size_within_limit(65),
+            Err(CompileError::Codegen(message))
+                if message == "singlepass compiler output exceeds limit: 65 > 64 bytes"
+        ));
     }
 }
