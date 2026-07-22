@@ -1,5 +1,7 @@
 #[cfg(feature = "unwind")]
 use crate::dwarf::WriterRelocate;
+#[cfg(feature = "unwind")]
+use crate::output_budget::windows_unwind_output_delta;
 
 use crate::{
     address_map::get_function_address_map,
@@ -5845,6 +5847,10 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             CallingConvention::WindowsFastcall => {
                 let unwind = self.machine.gen_windows_unwind_info(body_len);
                 if let Some(unwind) = unwind {
+                    if let Some(output_budget) = self.output_budget.as_ref() {
+                        output_budget
+                            .reserve(windows_unwind_output_delta(body_len, unwind.len()))?;
+                    }
                     unwind_info = Some(CompiledFunctionUnwindInfo::WindowsX64(unwind));
                 }
             }

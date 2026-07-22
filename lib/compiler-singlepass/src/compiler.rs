@@ -13,7 +13,7 @@ use crate::machine::{
 use crate::machine_arm64::MachineARM64;
 use crate::machine_riscv::MachineRiscv;
 use crate::machine_x64::MachineX86_64;
-use crate::output_budget::OutputBudget;
+use crate::output_budget::{OutputBudget, function_output_size};
 #[cfg(feature = "unwind")]
 use crate::unwind::{UnwindFrame, create_systemv_cie};
 use enumset::EnumSet;
@@ -272,7 +272,7 @@ impl SinglepassCompiler {
         output_size = output_size.saturating_add(
             functions
                 .iter()
-                .map(|function| function.body.body.len())
+                .map(|function| function_output_size(&function.body))
                 .sum::<usize>(),
         );
         self.config.ensure_output_size_within_limit(output_size)?;
@@ -286,7 +286,7 @@ impl SinglepassCompiler {
             .map(|func_type| -> Result<FunctionBody, CompileError> {
                 let body = gen_std_trampoline(func_type, target, calling_convention)?;
                 if let Some(output_budget) = output_budget.as_ref() {
-                    output_budget.reserve(body.body.len())?;
+                    output_budget.reserve(function_output_size(&body))?;
                 }
                 if let Some(callbacks) = self.config.callbacks.as_ref() {
                     callbacks.obj_memory_buffer(
@@ -315,7 +315,7 @@ impl SinglepassCompiler {
         output_size = output_size.saturating_add(
             function_call_trampolines
                 .values()
-                .map(|body| body.body.len())
+                .map(function_output_size)
                 .sum::<usize>(),
         );
         self.config.ensure_output_size_within_limit(output_size)?;
@@ -332,7 +332,7 @@ impl SinglepassCompiler {
                     calling_convention,
                 )?;
                 if let Some(output_budget) = output_budget.as_ref() {
-                    output_budget.reserve(body.body.len())?;
+                    output_budget.reserve(function_output_size(&body))?;
                 }
                 if let Some(callbacks) = self.config.callbacks.as_ref() {
                     callbacks.obj_memory_buffer(
@@ -360,7 +360,7 @@ impl SinglepassCompiler {
         output_size = output_size.saturating_add(
             dynamic_function_trampolines
                 .values()
-                .map(|body| body.body.len())
+                .map(function_output_size)
                 .sum::<usize>(),
         );
         self.config.ensure_output_size_within_limit(output_size)?;
