@@ -3515,10 +3515,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 // A constant selector is resolved here rather than by the range
                 // check below: pick targets[idx], or the default when out of range.
                 if let Location::Imm32(idx) = cond {
-                    let resolved = targets
-                        .get(idx as usize)
-                        .copied()
-                        .unwrap_or(default_target);
+                    let resolved = targets.get(idx as usize).copied().unwrap_or(default_target);
                     let frame =
                         &self.control_stack[self.control_stack.len() - 1 - (resolved as usize)];
                     if matches!(frame.state, ControlState::Loop) {
