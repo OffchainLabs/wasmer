@@ -1,5 +1,7 @@
 #[cfg(feature = "unwind")]
 use crate::dwarf::WriterRelocate;
+#[cfg(feature = "unwind")]
+use crate::output_budget::windows_unwind_output_delta;
 
 use crate::{
     address_map::get_function_address_map,
@@ -10,13 +12,14 @@ use crate::{
     machine::{
         AssemblyComment, FinalizedAssembly, Label, Machine, NATIVE_PAGE_SIZE, UnsignedCondition,
     },
+    output_budget::OutputBudget,
     unwind::UnwindFrame,
 };
 #[cfg(feature = "unwind")]
 use gimli::write::Address;
 use itertools::Itertools;
 use smallvec::{SmallVec, smallvec};
-use std::{cmp, collections::HashMap, iter, ops::Neg};
+use std::{cmp, collections::HashMap, iter, ops::Neg, sync::Arc};
 use target_lexicon::Architecture;
 
 use wasmer_compiler::{
@@ -108,6 +111,12 @@ pub struct FuncGen<'a, M: Machine> {
 
     /// Assembly comments.
     assembly_comments: HashMap<usize, AssemblyComment>,
+
+    /// Shared allowance for all machine code emitted by this module compilation.
+    output_budget: Option<Arc<OutputBudget>>,
+
+    /// Assembler offset already charged to the shared output budget.
+    accounted_output_size: usize,
 }
 
 struct SpecialLabelSet {
@@ -237,6 +246,19 @@ enum NativeCallType {
 }
 
 impl<'a, M: Machine> FuncGen<'a, M> {
+    /// Charges newly emitted machine code to the module's shared output budget.
+    pub fn ensure_output_size_within_limit(&mut self) -> Result<(), CompileError> {
+        let Some(output_budget) = self.output_budget.as_ref() else {
+            return Ok(());
+        };
+        let output_size = self.machine.assembler_get_offset().0;
+        debug_assert!(output_size >= self.accounted_output_size);
+        let delta = output_size.saturating_sub(self.accounted_output_size);
+        output_budget.reserve(delta)?;
+        self.accounted_output_size = output_size;
+        Ok(())
+    }
+
     /// Acquires location from the machine state.
     ///
     /// If the returned location is used for stack value, `release_location` needs to be called on it;
@@ -310,6 +332,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 self.stack_offset -= 8;
                 self.machine
                     .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
+                self.ensure_output_size_within_limit()?;
             }
         }
 
@@ -321,14 +344,15 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         stack_depth: usize,
     ) -> Result<(), CompileError> {
         let mut stack_offset = self.stack_offset;
-        let locs = &self.value_stack[stack_depth..];
 
-        for (loc, _) in locs.iter().rev() {
-            if let Location::Memory(..) = *loc {
-                self.check_location_on_stack(loc, stack_offset)?;
+        for index in (stack_depth..self.value_stack.len()).rev() {
+            let loc = self.value_stack[index].0;
+            if let Location::Memory(..) = loc {
+                self.check_location_on_stack(&loc, stack_offset)?;
                 stack_offset -= 8;
                 self.machine
                     .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
+                self.ensure_output_size_within_limit()?;
             }
         }
 
@@ -919,6 +943,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         local_types_excluding_arguments: &[WpType],
         machine: M,
         calling_convention: CallingConvention,
+        output_budget: Option<Arc<OutputBudget>>,
     ) -> Result<FuncGen<'a, M>, CompileError> {
         let func_index = module.func_index(local_func_index);
         let sig_index = module.functions[func_index];
@@ -964,6 +989,8 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             calling_convention,
             function_name,
             assembly_comments: HashMap::new(),
+            output_budget,
+            accounted_output_size: 0,
         };
         fg.emit_head()?;
         Ok(fg)
@@ -1001,6 +1028,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
             }
         }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
@@ -1024,6 +1052,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             self.machine
                 .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
         }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
@@ -3549,6 +3578,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     let label = frame.label;
                     self.release_stack_locations_keep_stack_offset(stack_depth)?;
                     self.machine.jmp_unconditional(label)?;
+                    self.ensure_output_size_within_limit()?;
                 }
                 self.machine.emit_label(default_br)?;
 
@@ -3578,6 +3608,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 self.machine.emit_label(table_label)?;
                 for x in table {
                     self.machine.jmp_unconditional(x)?;
+                    self.ensure_output_size_within_limit()?;
                 }
                 self.unreachable_depth = 1;
             }
@@ -5804,6 +5835,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
 
         // Notify the assembler backend to generate necessary code at end of function.
         self.machine.finalize_function()?;
+        self.ensure_output_size_within_limit()?;
 
         let body_len = self.machine.assembler_get_offset().0;
 
@@ -5826,6 +5858,10 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             CallingConvention::WindowsFastcall => {
                 let unwind = self.machine.gen_windows_unwind_info(body_len);
                 if let Some(unwind) = unwind {
+                    if let Some(output_budget) = self.output_budget.as_ref() {
+                        output_budget
+                            .reserve(windows_unwind_output_delta(body_len, unwind.len()))?;
+                    }
                     unwind_info = Some(CompiledFunctionUnwindInfo::WindowsX64(unwind));
                 }
             }
