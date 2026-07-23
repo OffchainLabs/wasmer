@@ -3541,6 +3541,32 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| CompileError::Codegen(format!("BrTable read_table: {e:?}")))?;
                 let cond = self.pop_value_released()?.0;
+                // A constant selector is resolved here rather than by the range
+                // check below: pick targets[idx], or the default when out of range.
+                if let Location::Imm32(idx) = cond {
+                    let resolved = targets.get(idx as usize).copied().unwrap_or(default_target);
+                    let frame =
+                        &self.control_stack[self.control_stack.len() - 1 - (resolved as usize)];
+                    if matches!(frame.state, ControlState::Loop) {
+                        self.emit_loop_params_store(
+                            frame.value_stack_depth_after(),
+                            frame.param_types.len(),
+                        )?;
+                    } else if !frame.return_types.is_empty() {
+                        self.emit_return_values(
+                            frame.value_stack_depth_after(),
+                            frame.return_types.len(),
+                        )?;
+                    }
+                    let frame =
+                        &self.control_stack[self.control_stack.len() - 1 - (resolved as usize)];
+                    let stack_depth = frame.value_stack_depth_for_release();
+                    let label = frame.label;
+                    self.release_stack_locations_keep_stack_offset(stack_depth)?;
+                    self.machine.jmp_unconditional(label)?;
+                    self.unreachable_depth = 1;
+                    return Ok(());
+                }
                 let table_label = self.machine.get_label();
                 let mut table: Vec<Label> = vec![];
                 let default_br = self.machine.get_label();
