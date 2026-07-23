@@ -1010,20 +1010,25 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         value_stack_depth_after: usize,
         return_values: usize,
     ) -> Result<(), CompileError> {
-        let value_stack_len = self.value_stack.len();
-        for i in 0..return_values {
-            let (stack_value, canonicalize) = self.value_stack[value_stack_len - i - 1];
+        for (i, (stack_value, canonicalize)) in self
+            .value_stack
+            .iter()
+            .rev()
+            .take(return_values)
+            .enumerate()
+        {
             let dst = self.value_stack[value_stack_depth_after - i - 1].0;
             if let Some(canonicalize_size) = canonicalize.to_size()
                 && self.config.enable_nan_canonicalization
             {
                 self.machine
-                    .canonicalize_nan(canonicalize_size, stack_value, dst)?;
+                    .canonicalize_nan(canonicalize_size, *stack_value, dst)?;
             } else {
-                self.machine.emit_relaxed_mov(Size::S64, stack_value, dst)?;
+                self.machine
+                    .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
             }
-            self.ensure_output_size_within_limit()?;
         }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
@@ -1035,13 +1040,19 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         value_stack_depth_after: usize,
         param_count: usize,
     ) -> Result<(), CompileError> {
-        let params_start = self.value_stack.len() - param_count;
-        for i in 0..param_count {
-            let stack_value = self.value_stack[params_start + i].0;
+        for (i, (stack_value, _)) in self
+            .value_stack
+            .iter()
+            .rev()
+            .take(param_count)
+            .rev()
+            .enumerate()
+        {
             let dst = self.value_stack[value_stack_depth_after + i].0;
-            self.machine.emit_relaxed_mov(Size::S64, stack_value, dst)?;
-            self.ensure_output_size_within_limit()?;
+            self.machine
+                .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
         }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
