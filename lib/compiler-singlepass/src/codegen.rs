@@ -326,15 +326,23 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         &mut self,
         locs: &[LocationWithCanonicalization<M>],
     ) -> Result<(), CompileError> {
+        let mut released_stack_slots = 0;
         for (loc, _) in locs.iter().rev() {
             if let Location::Memory(..) = *loc {
                 self.check_location_on_stack(loc, self.stack_offset)?;
                 self.stack_offset -= 8;
-                self.machine
-                    .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
-                self.ensure_output_size_within_limit()?;
+                released_stack_slots += 1;
             }
         }
+
+        // It's important to emit a stack release instruction just once as we might be releasing
+        // potentially a big number of slots.
+        if released_stack_slots > 0 {
+            self.machine.truncate_stack(
+                (released_stack_slots * self.machine.round_stack_adjust(8)) as u32,
+            )?;
+        }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
@@ -344,17 +352,25 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         stack_depth: usize,
     ) -> Result<(), CompileError> {
         let mut stack_offset = self.stack_offset;
+        let mut released_stack_slots = 0;
+        let locs = &self.value_stack[stack_depth..];
 
-        for index in (stack_depth..self.value_stack.len()).rev() {
-            let loc = self.value_stack[index].0;
-            if let Location::Memory(..) = loc {
-                self.check_location_on_stack(&loc, stack_offset)?;
+        for (loc, _) in locs.iter().rev() {
+            if let Location::Memory(..) = *loc {
+                self.check_location_on_stack(loc, stack_offset)?;
                 stack_offset -= 8;
-                self.machine
-                    .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
-                self.ensure_output_size_within_limit()?;
+                released_stack_slots += 1;
             }
         }
+
+        // It's important to emit a stack release instruction just once as we might be releasing
+        // potentially a big number of slots.
+        if released_stack_slots > 0 {
+            self.machine.truncate_stack(
+                (released_stack_slots * self.machine.round_stack_adjust(8)) as u32,
+            )?;
+        }
+        self.ensure_output_size_within_limit()?;
 
         Ok(())
     }
